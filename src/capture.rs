@@ -27,7 +27,6 @@ pub fn enable_dpi_awareness() {
 
 #[derive(Debug, Clone)]
 pub struct MonInfo {
-    pub index: usize,
     /// Physical position in virtual-screen coordinates.
     pub x: i32,
     pub y: i32,
@@ -61,7 +60,6 @@ pub fn monitors() -> Result<Vec<MonInfo>> {
                     dpix = 96;
                 }
                 out.push(MonInfo {
-                    index: out.len(),
                     x: info.rcMonitor.left,
                     y: info.rcMonitor.top,
                     w: (info.rcMonitor.right - info.rcMonitor.left) as u32,

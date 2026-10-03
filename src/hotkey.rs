@@ -66,7 +66,7 @@ fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>
         loop {
             let mut msg = MSG::default();
             let got = GetMessageW(&mut msg, None, 0, 0);
-            if got.as_bool() == false {
+            if !got.as_bool() {
                 break; // 0 = WM_QUIT, negative = error
             }
             if msg.message == WM_HOTKEY {

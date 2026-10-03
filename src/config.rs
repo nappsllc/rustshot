@@ -166,6 +166,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
 }
 
 /// Render the config as the same flat TOML subset.
+#[cfg(test)]
 pub fn to_toml(c: &Config) -> String {
     fn q(s: &str) -> String {
         format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))

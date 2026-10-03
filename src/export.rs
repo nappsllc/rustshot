@@ -1,7 +1,8 @@
 use crate::config::Config;
-use anyhow::{anyhow, Context, Result};
 use crate::pixbuf::PixBuf;
+use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
+use std::mem::size_of;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -132,24 +133,102 @@ fn save_image(img: &PixBuf, path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn copy_to_clipboard(img: &PixBuf) -> Result<()> {
-    let mut cb = arboard::Clipboard::new().context("open clipboard")?;
-    let data = arboard::ImageData {
-        width: img.width() as usize,
-        height: img.height() as usize,
-        bytes: std::borrow::Cow::Owned(img.as_raw().clone()),
-    };
-    cb.set_image(data).context("set clipboard image")?;
-    // Keep the clipboard contents after we exit.
-    std::mem::forget(cb);
+/// Run `f` with the system clipboard open (retries if another process holds it).
+fn with_clipboard<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    use windows::Win32::System::DataExchange::{CloseClipboard, OpenClipboard};
+    let mut last = String::new();
+    for attempt in 0..6 {
+        match unsafe { OpenClipboard(None) } {
+            Ok(()) => {
+                let r = f();
+                let _ = unsafe { CloseClipboard() };
+                return r;
+            }
+            Err(e) => {
+                last = e.to_string();
+                if attempt < 5 {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+    Err(anyhow!("open clipboard: {last}"))
+}
+
+/// Place one buffer on the open clipboard as `format` (the OS takes ownership).
+fn set_clip_data(format: u32, bytes: &[u8]) -> Result<()> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::DataExchange::SetClipboardData;
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    unsafe {
+        let hglb = GlobalAlloc(GMEM_MOVEABLE, bytes.len()).context("GlobalAlloc")?;
+        let ptr = GlobalLock(hglb);
+        if ptr.is_null() {
+            return Err(anyhow!("GlobalLock failed"));
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+        let _ = GlobalUnlock(hglb);
+        SetClipboardData(format, Some(HANDLE(hglb.0))).context("SetClipboardData")?;
+    }
     Ok(())
 }
 
+/// BGRA (bottom-up BGRX) DIB payload for the `CF_DIB` clipboard format.
+fn rgba_to_dib(img: &PixBuf) -> Vec<u8> {
+    use windows::Win32::Graphics::Gdi::{BITMAPINFOHEADER, BI_RGB};
+    let (w, h) = img.dimensions();
+    let stride = w as usize * 4;
+    let mut hdr: BITMAPINFOHEADER = unsafe { std::mem::zeroed() };
+    hdr.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+    hdr.biWidth = w as i32;
+    hdr.biHeight = h as i32; // positive = bottom-up
+    hdr.biPlanes = 1;
+    hdr.biBitCount = 32;
+    hdr.biCompression = BI_RGB.0;
+    let mut out = Vec::with_capacity(size_of::<BITMAPINFOHEADER>() + stride * h as usize);
+    out.extend_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            (&raw const hdr) as *const u8,
+            size_of::<BITMAPINFOHEADER>(),
+        )
+    });
+    let raw = img.as_raw();
+    for y in (0..h).rev() {
+        let row = &raw[y as usize * stride..(y as usize + 1) * stride];
+        for px in row.chunks_exact(4) {
+            out.extend_from_slice(&[px[2], px[1], px[0], 0]);
+        }
+    }
+    out
+}
+
+pub fn copy_to_clipboard(img: &PixBuf) -> Result<()> {
+    use windows::Win32::System::DataExchange::{EmptyClipboard, RegisterClipboardFormatW};
+    use windows::Win32::System::Ole::CF_DIB;
+    use windows::core::w;
+    let png = img.to_png()?;
+    let dib = rgba_to_dib(img);
+    with_clipboard(|| unsafe {
+        EmptyClipboard().context("empty clipboard")?;
+        // "PNG" is the community-standard registered format (CF_PNG).
+        let fmt_png = RegisterClipboardFormatW(w!("PNG"));
+        if fmt_png != 0 {
+            set_clip_data(fmt_png, &png)?;
+        }
+        set_clip_data(CF_DIB.0 as u32, &dib)?;
+        Ok(())
+    })
+}
+
 pub fn copy_text_to_clipboard(text: &str) -> Result<()> {
-    let mut cb = arboard::Clipboard::new().context("open clipboard")?;
-    cb.set_text(text.to_string()).context("set clipboard text")?;
-    std::mem::forget(cb);
-    Ok(())
+    use windows::Win32::System::DataExchange::EmptyClipboard;
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes: Vec<u8> = wide.iter().flat_map(|u| u.to_le_bytes()).collect();
+    with_clipboard(|| unsafe {
+        EmptyClipboard().context("empty clipboard")?;
+        set_clip_data(CF_UNICODETEXT.0 as u32, &bytes)
+    })
 }
 
 pub fn png_bytes(img: &PixBuf) -> Result<Vec<u8>> {
@@ -498,6 +577,40 @@ mod tests {
             // shared anonymous client-id, not that the request failed.
             Err(e) if e.contains("\"code\":\"429\"") => {}
             Err(e) => panic!("upload failed: {e}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "live clipboard access"]
+    fn live_clipboard_roundtrip() {
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+            RegisterClipboardFormatW,
+        };
+        use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+        use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
+        use windows::core::w;
+
+        let img = PixBuf::from_pixel(2, 2, [7, 8, 9, 255]);
+        copy_to_clipboard(&img).unwrap();
+        unsafe {
+            assert!(IsClipboardFormatAvailable(CF_DIB.0 as u32).is_ok());
+            assert!(IsClipboardFormatAvailable(RegisterClipboardFormatW(w!("PNG"))).is_ok());
+        }
+
+        copy_text_to_clipboard("hello rustshot").unwrap();
+        unsafe {
+            OpenClipboard(None).unwrap();
+            let h = GetClipboardData(CF_UNICODETEXT.0 as u32).unwrap();
+            let p = GlobalLock(windows::Win32::Foundation::HGLOBAL(h.0)) as *const u16;
+            assert!(!p.is_null());
+            let mut s = Vec::new();
+            while *p.add(s.len()) != 0 {
+                s.push(*p.add(s.len()));
+            }
+            let _ = GlobalUnlock(windows::Win32::Foundation::HGLOBAL(h.0));
+            CloseClipboard().unwrap();
+            assert_eq!(String::from_utf16(&s).unwrap(), "hello rustshot");
         }
     }
 }

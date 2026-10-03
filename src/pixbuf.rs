@@ -19,6 +19,7 @@ impl PixBuf {
         }
     }
 
+    #[cfg(test)]
     pub fn from_pixel(w: u32, h: u32, px: [u8; 4]) -> Self {
         let mut p = Self::new(w, h);
         for c in p.d.chunks_exact_mut(4) {
@@ -50,6 +51,7 @@ impl PixBuf {
         &self.d
     }
 
+    #[cfg(test)]
     pub fn get_pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let i = (y as usize * self.w as usize + x as usize) * 4;
         [self.d[i], self.d[i + 1], self.d[i + 2], self.d[i + 3]]
