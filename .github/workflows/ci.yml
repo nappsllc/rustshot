@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  push:
+    branches: [main, handroll]
+  pull_request:
+    branches: [main, handroll]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install X11 headers
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev
+      - name: Test
+        run: cargo test
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        run: bash packaging/linux/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustshot-linux-x86_64
+          path: dist/*.tar.gz
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Bundle
+        run: bash packaging/macos/bundle.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustshot-macos-universal
+          path: dist/*.zip
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        # Live/display tests and the message-driven e2e suite stay local
+        # (they need an interactive session): cargo test -- --ignored
+        run: cargo test
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustshot-windows-x86_64
+          path: target/release/rustshot.exe

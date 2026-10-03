@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Bundle the macOS release into Rustshot.app (universal binary) + zip:
+#   dist/rustshot-<version>-macos-universal.zip
+# Usage: packaging/macos/bundle.sh   (run after cargo build --release)
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+
+# Build both architectures when possible; fall back to the host arch.
+rustup target add x86_64-apple-darwin aarch64-apple-darwin >/dev/null 2>&1 || true
+built=()
+for t in x86_64-apple-darwin aarch64-apple-darwin; do
+  if cargo build --release --target "$t"; then
+    built+=("target/$t/release/rustshot")
+  fi
+done
+[ ${#built[@]} -gt 0 ] || { echo "error: no macos binary built" >&2; exit 1; }
+
+bin=""
+if [ ${#built[@]} -eq 2 ]; then
+  bin="dist/rustshot-universal"
+  mkdir -p dist
+  lipo -create "${built[0]}" "${built[1]}" -output "$bin"
+else
+  bin="${built[0]}"
+fi
+
+app="dist/Rustshot.app"
+rm -rf "$app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp "$bin" "$app/Contents/MacOS/rustshot"
+
+cat > "$app/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleExecutable</key><string>rustshot</string>
+  <key>CFBundleIdentifier</key><string>com.nappsllc.rustshot</string>
+  <key>CFBundleName</key><string>rustshot</string>
+  <key>CFBundleDisplayName</key><string>rustshot</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>$version</string>
+  <key>CFBundleVersion</key><string>$version</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>LSHighResolutionCapable</key><true/>
+  <key>LSUIElement</key><true/>
+  <key>NSPrincipalClass</key><string>NSApplication</string>
+  <key>NSHumanReadableCopyright</key><string>GPL-3.0-only</string>
+</dict>
+</plist>
+EOF
+
+mkdir -p dist
+(cd dist && zip -qry "rustshot-$version-macos-universal.zip" Rustshot.app)
+echo "wrote dist/rustshot-$version-macos-universal.zip"

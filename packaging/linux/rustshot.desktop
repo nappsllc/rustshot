@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=rustshot
+GenericName=Screenshot Tool
+Comment=Screenshot capture with annotation, upload and global hotkeys
+Exec=rustshot daemon
+Icon=rustshot
+Terminal=false
+Categories=Utility;Graphics;
+Keywords=screenshot;capture;annotate;share;
+StartupNotify=false
