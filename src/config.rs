@@ -28,8 +28,6 @@ pub struct Config {
     pub upload_client_id: String,
     /// Copy the resulting URL to the clipboard after upload.
     pub copy_url_after_upload: bool,
-    /// JPEG quality used when saving/copying as JPEG.
-    pub jpeg_quality: u8,
     /// If true, GUI captures only the monitor under the cursor even when
     /// all monitors share the same scale factor.
     pub capture_active_monitor: bool,
@@ -59,7 +57,6 @@ impl Default for Config {
             .collect(),
             upload_client_id: "313baf0c7b4d3ff".into(),
             copy_url_after_upload: true,
-            jpeg_quality: 75,
             capture_active_monitor: false,
         }
     }
@@ -143,12 +140,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
                     .try_into()
                     .map_err(|_| bad("number", "out of range"))?
             }
-            "jpeg_quality" => {
-                cfg.jpeg_quality = as_u64(val)
-                    .map_err(|e| bad("number", &e))?
-                    .try_into()
-                    .map_err(|_| bad("number", "out of range"))?
-            }
+            "jpeg_quality" => {} // legacy key, ignored (PNG-only builds)
             "draw_thickness" => cfg.draw_thickness = as_f64(val)? as f32,
             "draw_marker_size" => cfg.draw_marker_size = as_f64(val)? as f32,
             "draw_pixelate_size" => cfg.draw_pixelate_size = as_f64(val)? as f32,
@@ -195,7 +187,6 @@ pub fn to_toml(c: &Config) -> String {
          user_colors = [{}]\n\
          upload_client_id = {}\n\
          copy_url_after_upload = {}\n\
-         jpeg_quality = {}\n\
          capture_active_monitor = {}\n",
         q(&c.save_path),
         q(&c.filename_pattern),
@@ -212,7 +203,6 @@ pub fn to_toml(c: &Config) -> String {
         colors.join(", "),
         q(&c.upload_client_id),
         c.copy_url_after_upload,
-        c.jpeg_quality,
         c.capture_active_monitor,
     )
 }
@@ -395,7 +385,7 @@ mod tests {
     fn rejects_bad_values() {
         assert!(parse_config("draw_thickness = \"x\"").is_err());
         assert!(parse_config("copy_url_after_upload = 1").is_err());
-        assert!(parse_config("jpeg_quality = 999").is_err());
+        assert!(parse_config("contrast_opacity = 999").is_err());
         assert!(parse_config("not a assignment").is_err());
     }
 }

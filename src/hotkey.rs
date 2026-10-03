@@ -1,7 +1,5 @@
 use crate::config::Config;
-use global_hotkey::hotkey::{Code, Modifiers};
-use global_hotkey::hotkey::HotKey;
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
+use std::sync::mpsc::{self, Receiver};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotEvent {
@@ -9,147 +7,153 @@ pub enum HotEvent {
     Quit,
 }
 
+/// Global hotkeys backed by Win32 `RegisterHotKey` (replaces the
+/// `global-hotkey` crate). Registration and the message loop run on a
+/// dedicated thread so we own the queue instead of relying on any toolkit.
 pub struct Hotkeys {
-    mgr: Option<GlobalHotKeyManager>,
-    capture: Option<HotKey>,
-    quit: Option<HotKey>,
+    rx: Receiver<HotEvent>,
 }
 
 impl Hotkeys {
     pub fn new(cfg: &Config) -> Self {
-        let mgr = match GlobalHotKeyManager::new() {
-            Ok(m) => Some(m),
-            Err(e) => {
-                eprintln!("warning: global hotkeys unavailable: {e}");
-                None
-            }
-        };
-        let mut s = Self {
-            mgr,
-            capture: None,
-            quit: None,
-        };
-        s.capture = s.register(&cfg.capture_hotkey, "capture");
-        s.quit = s.register(&cfg.quit_hotkey, "quit");
-        s
-    }
-
-    fn register(&self, spec: &str, what: &str) -> Option<HotKey> {
-        let hk = parse_hotkey(spec)?;
-        let mgr = self.mgr.as_ref()?;
-        match mgr.register(hk) {
-            Ok(()) => Some(hk),
-            Err(e) => {
-                eprintln!("warning: could not register {what} hotkey {spec:?}: {e}");
-                None
-            }
-        }
+        let (tx, rx) = mpsc::channel();
+        let specs = [
+            (1i32, cfg.capture_hotkey.clone(), HotEvent::Capture),
+            (2i32, cfg.quit_hotkey.clone(), HotEvent::Quit),
+        ];
+        std::thread::spawn(move || hotkey_thread(specs, tx));
+        Self { rx }
     }
 
     pub fn poll(&self) -> Option<HotEvent> {
-        let rx = GlobalHotKeyEvent::receiver();
         let mut out = None;
-        while let Ok(ev) = rx.try_recv() {
-            if self.capture.map(|h| h.id()) == Some(ev.id) {
-                out = Some(HotEvent::Capture);
-            } else if self.quit.map(|h| h.id()) == Some(ev.id) {
-                out = Some(HotEvent::Quit);
-            }
+        while let Ok(ev) = self.rx.try_recv() {
+            out = Some(ev);
         }
         out
     }
 }
 
-/// Parse things like `Meta+Shift+X`, `Ctrl+Alt+Shift+Q`, `PrintScreen`.
-/// Tries the crate parser first, then falls back to a small custom parser.
-pub fn parse_hotkey(spec: &str) -> Option<HotKey> {
-    if let Ok(hk) = spec.parse::<HotKey>() {
-        return Some(hk);
+fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetMessageW, PeekMessageW, MSG, PM_NOREMOVE, WM_HOTKEY,
+    };
+
+    unsafe {
+        // Ensure this thread has a message queue before RegisterHotKey.
+        let mut bootstrap = MSG::default();
+        let _ = PeekMessageW(&mut bootstrap, None, 0, 0, PM_NOREMOVE);
+
+        let mut registered = Vec::new();
+        for (id, spec, _) in &specs {
+            match parse_hotkey(spec) {
+                Some((mods, vk)) => {
+                    let flags = HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT;
+                    match RegisterHotKey(None, *id, flags, vk) {
+                        Ok(()) => registered.push(*id),
+                        Err(e) => {
+                            eprintln!("warning: could not register hotkey {spec:?}: {e}")
+                        }
+                    }
+                }
+                None => eprintln!("warning: invalid hotkey {spec:?}"),
+            }
+        }
+
+        loop {
+            let mut msg = MSG::default();
+            let got = GetMessageW(&mut msg, None, 0, 0);
+            if got.as_bool() == false {
+                break; // 0 = WM_QUIT, negative = error
+            }
+            if msg.message == WM_HOTKEY {
+                let which = msg.wParam.0 as i32;
+                if let Some((_, _, ev)) = specs.iter().find(|(id, _, _)| *id == which)
+                    && tx.send(*ev).is_err()
+                {
+                    break; // receiver dropped
+                }
+            }
+        }
+        for id in registered {
+            let _ = UnregisterHotKey(None, id);
+        }
     }
-    let mut mods = Modifiers::empty();
-    let mut code: Option<Code> = None;
+}
+
+/// Parse things like `Meta+Shift+X`, `Ctrl+Alt+Shift+Q`, `PrintScreen`.
+/// Returns `(modifier flags, virtual-key code)` for `RegisterHotKey`.
+pub fn parse_hotkey(spec: &str) -> Option<(u32, u32)> {
+    // Win32 modifier flags: MOD_ALT=1, MOD_CONTROL=2, MOD_SHIFT=4, MOD_WIN=8.
+    let mut mods = 0u32;
+    let mut vk: Option<u32> = None;
     for part in spec.split('+').map(str::trim).filter(|p| !p.is_empty()) {
         let lower = part.to_ascii_lowercase();
         match lower.as_str() {
             "ctrl" | "control" => {
-                mods |= Modifiers::CONTROL;
+                mods |= 0x0002;
                 continue;
             }
             "shift" => {
-                mods |= Modifiers::SHIFT;
+                mods |= 0x0004;
                 continue;
             }
             "alt" => {
-                mods |= Modifiers::ALT;
+                mods |= 0x0001;
                 continue;
             }
             "meta" | "win" | "super" | "cmd" => {
-                mods |= Modifiers::META;
+                mods |= 0x0008;
                 continue;
             }
             _ => {}
         }
-        code = Some(key_code(&lower)?);
+        vk = Some(key_vk(&lower)?);
     }
-    let code = code?;
-    Some(HotKey::new(Some(mods), code))
+    Some((mods, vk?))
 }
 
-fn key_code(lower: &str) -> Option<Code> {
+fn key_vk(lower: &str) -> Option<u32> {
     if lower.len() == 1 {
         let c = lower.chars().next().unwrap();
         if c.is_ascii_lowercase() {
-            // Code::KeyA..KeyZ are contiguous.
-            let idx = (c as u8 - b'a') as usize;
-            const LETTERS: [Code; 26] = [
-                Code::KeyA, Code::KeyB, Code::KeyC, Code::KeyD, Code::KeyE, Code::KeyF, Code::KeyG,
-                Code::KeyH, Code::KeyI, Code::KeyJ, Code::KeyK, Code::KeyL, Code::KeyM, Code::KeyN,
-                Code::KeyO, Code::KeyP, Code::KeyQ, Code::KeyR, Code::KeyS, Code::KeyT, Code::KeyU,
-                Code::KeyV, Code::KeyW, Code::KeyX, Code::KeyY, Code::KeyZ,
-            ];
-            return Some(LETTERS[idx]);
+            // VK_A..VK_Z = 0x41..0x5A.
+            return Some(0x41 + (c as u32 - 'a' as u32));
         }
         if c.is_ascii_digit() {
-            let idx = (c as u8 - b'0') as usize;
-            const DIGITS: [Code; 10] = [
-                Code::Digit0, Code::Digit1, Code::Digit2, Code::Digit3, Code::Digit4, Code::Digit5,
-                Code::Digit6, Code::Digit7, Code::Digit8, Code::Digit9,
-            ];
-            return Some(DIGITS[idx]);
+            // VK_0..VK_9 = 0x30..0x39.
+            return Some(0x30 + (c as u32 - '0' as u32));
         }
     }
-    let code = match lower {
-        "space" => Code::Space,
-        "enter" | "return" => Code::Enter,
-        "esc" | "escape" => Code::Escape,
-        "tab" => Code::Tab,
-        "backspace" => Code::Backspace,
-        "delete" => Code::Delete,
-        "insert" => Code::Insert,
-        "home" => Code::Home,
-        "end" => Code::End,
-        "pageup" => Code::PageUp,
-        "pagedown" => Code::PageDown,
-        "up" => Code::ArrowUp,
-        "down" => Code::ArrowDown,
-        "left" => Code::ArrowLeft,
-        "right" => Code::ArrowRight,
-        "printscreen" | "prtsc" | "print" => Code::PrintScreen,
-        "f1" => Code::F1,
-        "f2" => Code::F2,
-        "f3" => Code::F3,
-        "f4" => Code::F4,
-        "f5" => Code::F5,
-        "f6" => Code::F6,
-        "f7" => Code::F7,
-        "f8" => Code::F8,
-        "f9" => Code::F9,
-        "f10" => Code::F10,
-        "f11" => Code::F11,
-        "f12" => Code::F12,
+    if let Some(rest) = lower.strip_prefix('f')
+        && let Ok(n) = rest.parse::<u32>()
+        && (1..=12).contains(&n)
+    {
+        return Some(0x70 + n - 1); // VK_F1..VK_F12
+    }
+    let vk = match lower {
+        "space" => 0x20,
+        "enter" | "return" => 0x0D,
+        "esc" | "escape" => 0x1B,
+        "tab" => 0x09,
+        "backspace" => 0x08,
+        "delete" => 0x2E,
+        "insert" => 0x2D,
+        "home" => 0x24,
+        "end" => 0x23,
+        "pageup" => 0x21,
+        "pagedown" => 0x22,
+        "up" => 0x26,
+        "down" => 0x28,
+        "left" => 0x25,
+        "right" => 0x27,
+        "printscreen" | "prtsc" | "print" => 0x2C,
         _ => return None,
     };
-    Some(code)
+    Some(vk)
 }
 
 #[cfg(test)]
@@ -158,10 +162,14 @@ mod tests {
 
     #[test]
     fn parses_custom_specs() {
-        assert!(parse_hotkey("Meta+Shift+X").is_some());
-        assert!(parse_hotkey("Ctrl+Alt+Shift+Q").is_some());
-        assert!(parse_hotkey("PrintScreen").is_some());
-        assert!(parse_hotkey("F5").is_some());
-        assert!(parse_hotkey("bogus+key").is_none());
+        assert_eq!(parse_hotkey("Meta+Shift+X"), Some((0x0008 | 0x0004, 0x58)));
+        assert_eq!(
+            parse_hotkey("Ctrl+Alt+Shift+Q"),
+            Some((0x0002 | 0x0001 | 0x0004, 0x51))
+        );
+        assert_eq!(parse_hotkey("PrintScreen"), Some((0, 0x2C)));
+        assert_eq!(parse_hotkey("F5"), Some((0, 0x74)));
+        assert_eq!(parse_hotkey("bogus+key"), None);
+        assert_eq!(parse_hotkey(""), None);
     }
 }

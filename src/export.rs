@@ -113,7 +113,7 @@ pub fn unique_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn save_image(img: &RgbaImage, path: &Path, jpeg_quality: u8) -> Result<()> {
+fn save_image(img: &RgbaImage, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).context("create save directory")?;
@@ -122,27 +122,13 @@ fn save_image(img: &RgbaImage, path: &Path, jpeg_quality: u8) -> Result<()> {
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    match ext.as_str() {
-        "jpg" | "jpeg" => {
-            let file = std::fs::File::create(path).context("create file")?;
-            let mut writer = std::io::BufWriter::new(file);
-            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(
-                &mut writer,
-                jpeg_quality.clamp(1, 100),
-            );
-            // JPEG has no alpha; flatten onto white.
-            let rgb: image::RgbImage = image::ImageBuffer::from_fn(img.width(), img.height(), |x, y| {
-                let p = img.get_pixel(x, y).0;
-                let a = p[3] as u32;
-                let blend = |c: u8| ((c as u32 * a + 255 * (255 - a)) / 255) as u8;
-                image::Rgb([blend(p[0]), blend(p[1]), blend(p[2])])
-            });
-            enc.encode_image(&rgb).context("encode jpeg")?;
-        }
-        _ => {
-            img.save(path).context("write png")?;
-        }
+    if ext == "jpg" || ext == "jpeg" {
+        return Err(anyhow!(
+            "JPEG output is not supported (PNG only); use a .png path: {}",
+            path.display()
+        ));
     }
+    img.save(path).context("write png")?;
     Ok(())
 }
 
@@ -229,7 +215,7 @@ pub fn run_export(
             Task::Save { path } => match resolve_save_path(path, cfg) {
                 Ok(p) => {
                     let target = unique_path(&p);
-                    match save_image(img, &target, cfg.jpeg_quality) {
+                    match save_image(img, &target) {
                         Ok(()) => messages.push(format!("saved: {}", target.display())),
                         Err(e) => {
                             messages.push(format!("error: save: {e:#}"));
@@ -281,15 +267,48 @@ fn resolve_save_path(path: &Option<PathBuf>, cfg: &Config) -> Result<PathBuf> {
         None => {
             let dir = default_save_dir(cfg);
             let suggested = format!("{}.png", format_filename(&cfg.filename_pattern));
-            let picked = rfd::FileDialog::new()
-                .set_directory(&dir)
-                .set_file_name(&suggested)
-                .add_filter("PNG image", &["png"])
-                .add_filter("JPEG image", &["jpg", "jpeg"])
-                .save_file();
-            picked.ok_or_else(|| anyhow!("save dialog cancelled"))
+            save_dialog(&dir, &suggested).ok_or_else(|| anyhow!("save dialog cancelled"))
         }
     }
+}
+
+/// Native save dialog via the classic GetSaveFileNameW (replaces rfd).
+fn save_dialog(dir: &Path, suggested: &str) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    let mut file = vec![0u16; 1024];
+    let name: Vec<u16> = suggested.encode_utf16().collect();
+    let n = name.len().min(file.len());
+    file[..n].copy_from_slice(&name[..n]);
+    let dir_w: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let filters: Vec<u16> = "PNG image\0*.png\0\0".encode_utf16().collect();
+    unsafe {
+        let mut ofn: OPENFILENAMEW = std::mem::zeroed();
+        ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+        ofn.lpstrFilter = PCWSTR(filters.as_ptr());
+        ofn.nFilterIndex = 1;
+        ofn.lpstrFile = PWSTR(file.as_mut_ptr());
+        ofn.nMaxFile = file.len() as u32;
+        ofn.lpstrInitialDir = PCWSTR(dir_w.as_ptr());
+        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST;
+        if !GetSaveFileNameW(&mut ofn).as_bool() {
+            return None;
+        }
+    }
+    let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
+    let mut p = PathBuf::from(String::from_utf16_lossy(&file[..len]));
+    if p.extension().is_none() {
+        p.set_extension("png");
+    }
+    Some(p)
 }
 
 /// Blocking wait used after the UI has exited (one-shot processes).
