@@ -1,0 +1,37 @@
+[package]
+name = "rustshot"
+version = "0.1.0"
+edition = "2024"
+# Derivative of Flameshot (GPL-3.0): behavior and UI modeled on it.
+license = "GPL-3.0-only"
+description = "Screenshot and annotation tool (Flameshot-style, written in Rust)"
+
+[dependencies]
+ab_glyph = "0.2"
+anyhow = "1"
+arboard = "3"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+eframe = { version = "0.27", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.27"
+global-hotkey = "0.6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_System_Threading",
+] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+tiny-skia = "0.11"
+toml = "0.8"
+ureq = "2"
+xcap = "0.9.8"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "z"
+panic = "abort"
