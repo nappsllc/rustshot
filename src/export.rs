@@ -307,14 +307,112 @@ fn spawn_upload(png: Vec<u8>, client_id: String) -> Receiver<Result<String, Stri
 }
 
 fn do_upload(png: &[u8], client_id: &str) -> Result<String, String> {
-    let resp = ureq::post("https://api.imgur.com/3/image")
-        .set("Authorization", &format!("Client-ID {client_id}"))
-        .query("title", "rustshot")
-        .query("description", "rustshot capture")
-        .send_bytes(png)
-        .map_err(|e| e.to_string())?;
-    let body = resp.into_string().map_err(|e| e.to_string())?;
-    extract_json_string(&body, "link").ok_or_else(|| format!("no link in response: {body}"))
+    upload_winhttp(png, client_id)
+}
+
+/// Imgur upload over WinHTTP: the OS TLS stack, no Rust HTTP/TLS dependency.
+fn upload_winhttp(png: &[u8], client_id: &str) -> Result<String, String> {
+    use std::ptr;
+    use windows::Win32::Networking::WinHttp::{
+        WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
+        WinHttpQueryDataAvailable, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
+        WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE,
+    };
+    use windows::core::{PCWSTR, w};
+
+    struct Handle(*mut std::ffi::c_void);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    let _ = WinHttpCloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    /// Null-terminated UTF-16, for PCWSTR parameters.
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let err = |step: &str| format!("{step}: {}", std::io::Error::last_os_error());
+
+    unsafe {
+        let agent = wide("rustshot/0.1");
+        let session = Handle(WinHttpOpen(
+            PCWSTR(agent.as_ptr()),
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            0,
+        ));
+        if session.0.is_null() {
+            return Err(err("WinHttpOpen"));
+        }
+        let _ = WinHttpSetTimeouts(session.0, 10_000, 10_000, 30_000, 30_000);
+
+        let host = wide("api.imgur.com");
+        let conn = Handle(WinHttpConnect(session.0, PCWSTR(host.as_ptr()), 443, 0));
+        if conn.0.is_null() {
+            return Err(err("WinHttpConnect"));
+        }
+
+        let object = wide("/3/image?title=rustshot&description=rustshot%20capture");
+        let request = Handle(WinHttpOpenRequest(
+            conn.0,
+            PCWSTR(w!("POST").as_ptr()),
+            PCWSTR(object.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            ptr::null(),
+            WINHTTP_FLAG_SECURE,
+        ));
+        if request.0.is_null() {
+            return Err(err("WinHttpOpenRequest"));
+        }
+
+        // Counted (not NUL-terminated): windows-rs passes slice.len() as the
+        // header block length.
+        let headers: Vec<u16> = format!(
+            "Authorization: Client-ID {client_id}\r\nContent-Type: application/octet-stream"
+        )
+        .encode_utf16()
+        .collect();
+        WinHttpSendRequest(
+            request.0,
+            Some(&headers),
+            Some(png.as_ptr() as *const _),
+            png.len() as u32,
+            png.len() as u32,
+            0,
+        )
+        .map_err(|e| format!("WinHttpSendRequest: {e}"))?;
+        WinHttpReceiveResponse(request.0, ptr::null_mut())
+            .map_err(|e| format!("WinHttpReceiveResponse: {e}"))?;
+
+        let mut body: Vec<u8> = Vec::new();
+        loop {
+            let mut avail = 0u32;
+            WinHttpQueryDataAvailable(request.0, &mut avail)
+                .map_err(|e| format!("WinHttpQueryDataAvailable: {e}"))?;
+            if avail == 0 {
+                break;
+            }
+            let mut buf = vec![0u8; avail as usize];
+            let mut read = 0u32;
+            WinHttpReadData(request.0, buf.as_mut_ptr() as _, avail, &mut read)
+                .map_err(|e| format!("WinHttpReadData: {e}"))?;
+            buf.truncate(read as usize);
+            if buf.is_empty() {
+                break;
+            }
+            body.extend_from_slice(&buf);
+        }
+
+        let text = String::from_utf8_lossy(&body);
+        extract_json_string(&text, "link").ok_or_else(|| format!("no link in response: {text}"))
+    }
 }
 
 /// Minimal `"key": "value"` extraction; avoids pulling in a JSON crate.
@@ -361,5 +459,19 @@ mod tests {
             extract_json_string(body, "link").as_deref(),
             Some("https://i.imgur.com/abc.png")
         );
+    }
+
+    #[test]
+    #[ignore = "live network upload to imgur"]
+    fn live_imgur_upload() {
+        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]));
+        let png = png_bytes(&img).unwrap();
+        match do_upload(&png, "313baf0c7b4d3ff") {
+            Ok(link) => assert!(link.starts_with("https://i.imgur.com/"), "{link}"),
+            // Transport verified either way; 429 means imgur rate-limits the
+            // shared anonymous client-id, not that the request failed.
+            Err(e) if e.contains("\"code\":\"429\"") => {}
+            Err(e) => panic!("upload failed: {e}"),
+        }
     }
 }

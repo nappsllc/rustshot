@@ -21,12 +21,12 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_HiDpi",
     "Win32_System_Threading",
+    "Win32_Networking_WinHttp",
 ] }
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 tiny-skia = "0.11"
 toml = "0.8"
-ureq = "2"
 xcap = "0.9.8"
 
 [profile.release]
