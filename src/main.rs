@@ -7,6 +7,7 @@ mod icons;
 mod objects;
 mod pixbuf;
 mod uifb;
+mod wind;
 
 use anyhow::{anyhow, Result};
 use capture::Shot;
