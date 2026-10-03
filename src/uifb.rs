@@ -30,30 +30,8 @@ impl C4 {
         }
     }
 
-    pub const fn from_rgba8(c: [u8; 4]) -> Self {
-        C4 {
-            r: c[0],
-            g: c[1],
-            b: c[2],
-            a: c[3],
-        }
-    }
-
-    pub fn to_rgba8(self) -> [u8; 4] {
-        [self.r, self.g, self.b, self.a]
-    }
-
     pub fn with_alpha(self, a: u8) -> Self {
         C4 { a, ..self }
-    }
-
-    pub fn lighten(self, amt: u8) -> Self {
-        C4 {
-            r: self.r.saturating_add(amt),
-            g: self.g.saturating_add(amt),
-            b: self.b.saturating_add(amt),
-            ..self
-        }
     }
 }
 

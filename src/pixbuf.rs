@@ -51,6 +51,10 @@ impl PixBuf {
         &self.d
     }
 
+    pub fn as_raw_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.d
+    }
+
     #[cfg(test)]
     pub fn get_pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let i = (y as usize * self.w as usize + x as usize) * 4;

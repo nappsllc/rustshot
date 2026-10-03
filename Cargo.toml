@@ -9,8 +9,6 @@ description = "Screenshot and annotation tool (Flameshot-style, written in Rust)
 [dependencies]
 ab_glyph = "0.2"
 anyhow = "1"
-eframe = { version = "0.27", default-features = false, features = ["glow"] }
-egui = { version = "0.27", default-features = false }
 png = "0.17"
 windows = { version = "0.62", features = [
     "Win32_Foundation",

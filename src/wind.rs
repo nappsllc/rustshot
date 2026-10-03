@@ -36,8 +36,8 @@ impl Mods {
 #[derive(Clone, Copy, Debug)]
 pub enum Ev {
     Move { x: i32, y: i32 },
-    Down { x: i32, y: i32, mods: Mods },
-    Up { x: i32, y: i32, mods: Mods },
+    Down { x: i32, y: i32 },
+    Up { x: i32, y: i32 },
     Wheel { delta: i32, x: i32, y: i32 },
     Key { vk: u32, up: bool, repeat: bool, mods: Mods },
     Char(u16),
@@ -48,6 +48,7 @@ pub enum Ev {
 pub enum Cursor {
     Arrow,
     Cross,
+    IBeam,
     SizeNS,
     SizeWE,
     SizeNWSE,
@@ -59,6 +60,7 @@ fn cursor_id(c: Cursor) -> PCWSTR {
     match c {
         Cursor::Arrow => IDC_ARROW,
         Cursor::Cross => IDC_CROSS,
+        Cursor::IBeam => IDC_IBEAM,
         Cursor::SizeNS => IDC_SIZENS,
         Cursor::SizeWE => IDC_SIZEWE,
         Cursor::SizeNWSE => IDC_SIZENWSE,
@@ -114,7 +116,8 @@ unsafe fn y_of(lp: LPARAM) -> i32 {
     ((lp.0 >> 16) & 0xffff) as u16 as i16 as i32
 }
 
-unsafe fn invalidate(hwnd: HWND) {
+/// Ask for a repaint of the window's client area.
+pub fn invalidate(hwnd: HWND) {
     unsafe {
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
@@ -139,11 +142,12 @@ unsafe extern "system" fn wndproc(
         let drv = &mut **slot;
         match msg {
             WM_MOUSEMOVE => {
+                // No automatic repaint: the driver calls `invalidate` itself
+                // when a move actually changes what should be on screen.
                 drv.on_event(Ev::Move {
                     x: x_of(lp),
                     y: y_of(lp),
                 });
-                invalidate(hwnd);
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
@@ -151,7 +155,6 @@ unsafe extern "system" fn wndproc(
                 drv.on_event(Ev::Down {
                     x: x_of(lp),
                     y: y_of(lp),
-                    mods: Mods::current(),
                 });
                 invalidate(hwnd);
                 LRESULT(0)
@@ -161,7 +164,6 @@ unsafe extern "system" fn wndproc(
                 drv.on_event(Ev::Up {
                     x: x_of(lp),
                     y: y_of(lp),
-                    mods: Mods::current(),
                 });
                 invalidate(hwnd);
                 LRESULT(0)

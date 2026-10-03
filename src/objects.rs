@@ -1,5 +1,5 @@
-use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
-use egui::{Color32, Pos2, Rect, Shape, Stroke, Vec2};
+﻿use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
+use crate::uifb::C4;
 use tiny_skia::{
     BlendMode, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, Shader, Stroke as
     TStroke, Transform,
@@ -58,40 +58,40 @@ pub enum Obj {
     Line {
         a: Pt,
         b: Pt,
-        color: Color32,
+        color: C4,
         width: f32,
     },
     Arrow {
         a: Pt,
         b: Pt,
-        color: Color32,
+        color: C4,
         width: f32,
     },
     Rect {
         r: FRect,
-        color: Color32,
+        color: C4,
         width: f32,
     },
     Ellipse {
         r: FRect,
-        color: Color32,
+        color: C4,
         width: f32,
     },
     Path {
         pts: Vec<Pt>,
-        color: Color32,
+        color: C4,
         width: f32,
     },
     Marker {
         a: Pt,
         b: Pt,
-        color: Color32,
+        color: C4,
         width: f32,
     },
     Text {
         pos: Pt,
         text: String,
-        color: Color32,
+        color: C4,
         size: f32,
     },
     Pixelate {
@@ -105,17 +105,11 @@ pub enum Obj {
 
 const KAPPA: f32 = 0.552_284_8;
 
-fn to_tiny_color(c: Color32) -> tiny_skia::Color {
-    let [r, g, b, a] = c.to_array(); // premultiplied
-    let a = a as u16;
-    if a == 0 {
-        return tiny_skia::Color::from_rgba8(0, 0, 0, 0);
-    }
-    let un = |v: u8| ((v as u16 * 255) / a) as u8;
-    tiny_skia::Color::from_rgba8(un(r), un(g), un(b), a as u8)
+fn to_tiny_color(c: C4) -> tiny_skia::Color {
+    tiny_skia::Color::from_rgba8(c.r, c.g, c.b, c.a)
 }
 
-fn paint(c: Color32) -> Paint<'static> {
+fn paint(c: C4) -> Paint<'static> {
     Paint {
         shader: Shader::SolidColor(to_tiny_color(c)),
         anti_alias: true,
@@ -203,7 +197,7 @@ fn arrow_head(a: Pt, b: Pt, width: f32) -> Option<(Path, Path)> {
     Some((line_path(a, base)?, head))
 }
 
-fn blend_px(data: &mut [u8], width: u32, x: i32, y: i32, h: u32, color: Color32, cov: f32) {
+fn blend_px(data: &mut [u8], width: u32, x: i32, y: i32, h: u32, color: C4, cov: f32) {
     if x < 0 || y < 0 || x >= width as i32 || y >= h as i32 {
         return;
     }
@@ -211,18 +205,23 @@ fn blend_px(data: &mut [u8], width: u32, x: i32, y: i32, h: u32, color: Color32,
     if idx + 3 >= data.len() {
         return;
     }
-    let [sr, sg, sb, sa] = color.to_array(); // premultiplied
-    let c = cov.clamp(0.0, 1.0);
-    let s = [sr as f32 * c, sg as f32 * c, sb as f32 * c, sa as f32 * c];
-    let a = s[3] / 255.0;
-    let inv = 1.0 - a;
-    for (i, sv) in s.iter().enumerate() {
-        let dv = data[idx + i] as f32;
-        data[idx + i] = (sv + dv * inv).round().clamp(0.0, 255.0) as u8;
+    // Straight-alpha source blended over the (opaque) premultiplied target.
+    let a = (color.a as f32 * cov.clamp(0.0, 1.0)) / 255.0;
+    if a <= 0.0 {
+        return;
     }
+    let inv = 1.0 - a;
+    let mut put = |i: usize, sv: u8| {
+        let dv = data[i] as f32;
+        data[i] = (sv as f32 * a + dv * inv).round().clamp(0.0, 255.0) as u8;
+    };
+    put(idx, color.r);
+    put(idx + 1, color.g);
+    put(idx + 2, color.b);
+    put(idx + 3, 255);
 }
 
-fn draw_text(pm: &mut Pixmap, font: &FontArc, size: f32, text: &str, top: Pt, color: Color32) {
+fn draw_text(pm: &mut Pixmap, font: &FontArc, size: f32, text: &str, top: Pt, color: C4) {
     let scale = PxScale::from(size);
     let sf = font.as_scaled(scale);
     let ascent = sf.ascent();
@@ -387,99 +386,6 @@ impl Obj {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Live preview rendering (egui shapes) while a stroke is being drawn.
-// ---------------------------------------------------------------------------
-
-pub fn to_ui_pt(p: Pt, origin: Pos2, inv_scale: f32) -> Pos2 {
-    origin + Vec2::new(p.x * inv_scale, p.y * inv_scale)
-}
-
-pub fn to_ui_rect(r: FRect, origin: Pos2, inv_scale: f32) -> Rect {
-    Rect::from_min_size(
-        to_ui_pt(Pt::new(r.x, r.y), origin, inv_scale),
-        Vec2::new(r.w * inv_scale, r.h * inv_scale),
-    )
-}
-
-/// Paint a draft object as UI overlay. `inv_scale` = 1/scale (points per px).
-pub fn paint_preview(
-    painter: &egui::Painter,
-    obj: &Obj,
-    origin: Pos2,
-    inv_scale: f32,
-) {
-    let p = |pt: Pt| to_ui_pt(pt, origin, inv_scale);
-    match obj {
-        Obj::Line { a, b, color, width } => {
-            painter.line_segment([p(*a), p(*b)], Stroke::new(width * inv_scale, *color));
-        }
-        Obj::Marker { a, b, color, width } => {
-            painter.line_segment([p(*a), p(*b)], Stroke::new(width * inv_scale, *color));
-        }
-        Obj::Arrow { a, b, color, width } => {
-            let st = Stroke::new(width * inv_scale, *color);
-            if let Some((_, _)) = arrow_head(*a, *b, *width) {
-                let dx = b.x - a.x;
-                let dy = b.y - a.y;
-                let len = (dx * dx + dy * dy).sqrt();
-                if len >= 2.0 {
-                    let ux = dx / len;
-                    let uy = dy / len;
-                    let hl = (width * 3.0).clamp(9.0, 60.0);
-                    let hw = hl * 0.45;
-                    let base = Pt::new(b.x - ux * hl, b.y - uy * hl);
-                    let px = -uy;
-                    let py = ux;
-                    let tri = vec![
-                        p(*b),
-                        p(Pt::new(base.x + px * hw, base.y + py * hw)),
-                        p(Pt::new(base.x - px * hw, base.y - py * hw)),
-                    ];
-                    painter.add(Shape::convex_polygon(tri, *color, Stroke::NONE));
-                    painter.line_segment([p(*a), p(base)], st);
-                }
-            } else {
-                painter.line_segment([p(*a), p(*b)], st);
-            }
-        }
-        Obj::Rect { r, color, width } => {
-            let rounding = width * inv_scale;
-            painter.rect_stroke(to_ui_rect(*r, origin, inv_scale), rounding, Stroke::new(width * inv_scale, *color));
-        }
-        Obj::Ellipse { r, color, width } => {
-            let rect = to_ui_rect(*r, origin, inv_scale);
-            let radius = Vec2::new(rect.width() / 2.0, rect.height() / 2.0);
-            painter.add(Shape::Ellipse(egui::epaint::EllipseShape::stroke(
-                rect.center(),
-                radius,
-                Stroke::new(width * inv_scale, *color),
-            )));
-        }
-        Obj::Path { pts, color, width } => {
-            if pts.len() >= 2 {
-                let points: Vec<Pos2> = pts.iter().map(|q| p(*q)).collect();
-                painter.add(Shape::Path(egui::epaint::PathShape::line(
-                    points,
-                    Stroke::new(width * inv_scale, *color),
-                )));
-            } else if let Some(q) = pts.first() {
-                painter.circle_filled(p(*q), width * inv_scale * 0.5, *color);
-            }
-        }
-        Obj::Text { .. } => {} // edited via TextEdit widget
-        Obj::Pixelate { r, .. } => {
-            let rect = to_ui_rect(*r, origin, inv_scale);
-            painter.rect_filled(rect, 0.0, Color32::from_black_alpha(50));
-            painter.rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_white_alpha(160)));
-        }
-        Obj::Invert { r } => {
-            let rect = to_ui_rect(*r, origin, inv_scale);
-            painter.rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_white_alpha(200)));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,7 +405,7 @@ mod tests {
         Obj::Line {
             a: Pt::new(2.0, 2.0),
             b: Pt::new(18.0, 18.0),
-            color: Color32::RED,
+            color: C4::rgb(255, 0, 0),
             width: 3.0,
         }
         .render(&mut pm, None);
@@ -546,7 +452,7 @@ mod tests {
         Obj::Text {
             pos: Pt::new(1.0, 1.0),
             text: "hi".into(),
-            color: Color32::WHITE,
+            color: C4::rgb(255, 255, 255),
             size: 8.0,
         }
         .render(&mut pm, None);

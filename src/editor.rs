@@ -3,23 +3,20 @@ use crate::config::{self, Config};
 use crate::export::{self, Task};
 use crate::hotkey::{HotEvent, Hotkeys};
 use crate::icons::Icons;
-use crate::objects::{self, FRect, Obj, Pt};
+use crate::objects::{FRect, Obj, Pt};
 use crate::pixbuf::PixBuf;
+use crate::uifb::{text_height, text_width, C4, Fb};
+use crate::wind::{self, Cursor, Driver, Ev, Mods};
 use ab_glyph::FontArc;
-use eframe::egui;
-use egui::epaint::ColorImage;
-use egui::{
-    pos2, vec2, Align2, Color32, CursorIcon, FontFamily, FontId, Id, Key, Margin, Modifiers,
-    Order, PointerButton, Pos2, Rect, Rounding, Stroke, TextureHandle, TextureOptions,
-    ViewportCommand,
-};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tiny_skia::Pixmap;
-
-use egui::viewport::WindowLevel;
+use tiny_skia::{Color, Paint, Pixmap, Shader, Transform};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
+};
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -55,21 +52,6 @@ impl Pending {
 
 pub type UploadSlot = Arc<Mutex<Option<Receiver<Result<String, String>>>>>;
 
-pub fn native_options() -> eframe::NativeOptions {
-    eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_decorations(false)
-            .with_visible(false)
-            .with_taskbar(false)
-            .with_resizable(false)
-            .with_maximized(false)
-            .with_inner_size([400.0, 300.0])
-            .with_position([-16000.0, -16000.0]),
-        renderer: eframe::Renderer::Glow,
-        ..Default::default()
-    }
-}
-
 pub fn run(
     cfg: Config,
     kind: RunKind,
@@ -81,76 +63,45 @@ pub fn run(
         RunKind::Daemon => Some(Hotkeys::new(&cfg)),
         RunKind::OneShot => None,
     };
-    let opts = native_options();
-    let creator_cfg = cfg.clone();
-    let code_arc = Arc::clone(&exit_code);
-    let res = eframe::run_native(
-        "rustshot",
-        opts,
-        Box::new(move |cc| {
-            let font = load_fonts(&cc.egui_ctx);
-            let icons = Icons::load(&cc.egui_ctx);
-            Box::new(App {
-                cfg: creator_cfg,
-                kind,
-                hot,
-                pending,
-                st: State::Hidden,
-                exit_code: code_arc,
-                upload_slot,
-                font,
-                icons,
-                notice: None,
-            })
-        }),
-    );
-    match res {
-        Ok(()) => exit_code.load(Ordering::SeqCst),
-        Err(e) => {
-            eprintln!("error: ui failed: {e}");
-            1
-        }
+    let font = load_font();
+    let icons = Icons::load();
+    let mut app = App {
+        cfg,
+        kind,
+        hot,
+        pending,
+        st: State::Hidden,
+        exit_code,
+        upload_slot,
+        font,
+        icons,
+        notice: None,
+        hwnd: HWND(std::ptr::null_mut()),
+        mouse: (0, 0),
+        focus_tries: 0,
+    };
+    if wind::run(&mut app) != 0 {
+        return 1;
     }
+    app.exit_code.load(Ordering::SeqCst)
 }
 
-/// Load a Windows system font for both the UI and baked text annotations.
-/// Deliberately avoids `FontDefinitions::default()`: those fonts are embedded
-/// in the binary (~1.4 MB of TTFs) and we render everything with system fonts.
-fn load_fonts(ctx: &egui::Context) -> Option<FontArc> {
+/// Load a Windows system font. Deliberately avoids embedding TTFs (~1.4 MB):
+/// we render UI and baked text annotations with system fonts.
+fn load_font() -> Option<FontArc> {
     const CANDIDATES: [&str; 4] = [
         "C:\\Windows\\Fonts\\segoeui.ttf",
         "C:\\Windows\\Fonts\\arial.ttf",
         "C:\\Windows\\Fonts\\tahoma.ttf",
         "C:\\Windows\\Fonts\\verdana.ttf",
     ];
-    let mut bytes = None;
     for c in CANDIDATES {
-        if let Ok(b) = std::fs::read(c) {
-            bytes = Some(b);
-            break;
-        }
+        if let Ok(b) = std::fs::read(c)
+            && let Ok(f) = FontArc::try_from_vec(b) {
+                return Some(f);
+            }
     }
-    let bytes = bytes?;
-    let mut fonts = egui::FontDefinitions {
-        font_data: Default::default(),
-        families: Default::default(),
-    };
-    fonts
-        .font_data
-        .insert("ui".to_owned(), egui::FontData::from_owned(bytes.clone()));
-    let mut chain = vec!["ui".to_owned()];
-    if let Ok(sym) = std::fs::read("C:\\Windows\\Fonts\\seguisym.ttf") {
-        fonts
-            .font_data
-            .insert("sym".to_owned(), egui::FontData::from_owned(sym));
-        chain.push("sym".to_owned());
-    }
-    fonts
-        .families
-        .insert(FontFamily::Proportional, chain.clone());
-    fonts.families.insert(FontFamily::Monospace, chain);
-    ctx.set_fonts(fonts);
-    FontArc::try_from_vec(bytes).ok()
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -160,12 +111,10 @@ fn load_fonts(ctx: &egui::Context) -> Option<FontArc> {
 enum State {
     /// Waiting for a hotkey (daemon) or about to close (one-shot).
     Hidden,
-    /// Window is being moved/sized onto the capture target.
-    Show(ShowStage),
     /// Interactive editor is up.
     Edit(Box<Edit>),
     /// Window is hidden; running export tasks (may show a file dialog).
-    Finish(FinishJob),
+    Finish(Box<FinishJob>),
 }
 
 /// Work to do after the overlay has been hidden again.
@@ -174,15 +123,6 @@ struct FinishJob {
     sel_global: (i32, i32),
     tasks: Vec<Task>,
     cfg: Config,
-}
-
-struct ShowStage {
-    shot: Shot,
-    tasks: Vec<Task>,
-    initial_sel: Option<FRect>,
-    accept_on_select: bool,
-    cfg: Config,
-    frames: u32,
 }
 
 struct App {
@@ -196,6 +136,10 @@ struct App {
     font: Option<FontArc>,
     icons: Icons,
     notice: Option<(String, Instant)>,
+    hwnd: HWND,
+    /// Last known mouse position (client == image coordinates).
+    mouse: (i32, i32),
+    focus_tries: u8,
 }
 
 impl App {
@@ -203,12 +147,83 @@ impl App {
         self.kind == RunKind::OneShot
     }
 
-    fn request_exit(&mut self, ctx: &egui::Context, code: i32) {
+    fn request_exit(&mut self, code: i32) {
         self.exit_code.store(code, Ordering::SeqCst);
-        ctx.send_viewport_cmd(ViewportCommand::Close);
+        wind::close(self.hwnd);
     }
 
-    fn begin_capture(&mut self, ctx: &egui::Context, mut pending: Pending) {
+    /// Run hotkey/upload polling and advance the state machine until stable.
+    fn pump(&mut self) {
+        let ev = self.hot.as_ref().and_then(|h| h.poll());
+        match ev {
+            Some(HotEvent::Quit) => {
+                self.request_exit(0);
+                return;
+            }
+            Some(HotEvent::Capture) if matches!(self.st, State::Hidden) => {
+                self.pending = Some(Pending::editor());
+            }
+            _ => {}
+        }
+        self.poll_upload();
+        if let Some((_, at)) = &self.notice
+            && at.elapsed() > Duration::from_millis(1500) {
+                self.notice = None;
+            }
+
+        for _ in 0..16 {
+            match std::mem::replace(&mut self.st, State::Hidden) {
+                State::Hidden => {
+                    if let Some(pending) = self.pending.take() {
+                        self.begin_capture(pending);
+                        continue;
+                    }
+                    break;
+                }
+                State::Finish(job) => self.run_finish(*job),
+                State::Edit(edit) => {
+                    let mut edit = *edit;
+                    // Windows only delivers keys to the foreground window;
+                    // retry focus for a few events after the overlay shows.
+                    if self.focus_tries < 5 {
+                        self.focus_tries += 1;
+                        capture::focus_our_window();
+                    }
+                    let had = edit.notice.is_some();
+                    if let Some((_, at)) = &edit.notice
+                        && at.elapsed() > Duration::from_millis(1500) {
+                            edit.notice = None;
+                        }
+                    if had && edit.notice.is_none() {
+                        wind::invalidate(self.hwnd);
+                    }
+                    self.st = State::Edit(Box::new(edit));
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Take the edit state out of `self`, hand it to `f`, then finish or
+    /// put it back.
+    fn edit_tx<F: FnOnce(&mut Self, &mut Edit)>(&mut self, f: F) {
+        if !matches!(self.st, State::Edit(_)) {
+            return;
+        }
+        let State::Edit(edit) = std::mem::replace(&mut self.st, State::Hidden) else {
+            unreachable!("guarded by matches! above");
+        };
+        let mut edit = *edit;
+        f(self, &mut edit);
+        if edit.done {
+            let cancelled = edit.cancelled;
+            self.finish(&mut edit, cancelled);
+        } else {
+            self.st = State::Edit(Box::new(edit));
+        }
+    }
+
+    fn begin_capture(&mut self, mut pending: Pending) {
         let mut cfg = self.cfg.clone();
         if let Some(f) = pending.filename.take() {
             cfg.filename_pattern = f;
@@ -224,7 +239,7 @@ impl App {
                 eprintln!("error: capture failed: {e:#}");
                 if self.one_shot() {
                     self.exit_code.store(1, Ordering::SeqCst);
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                    wind::close(self.hwnd);
                 }
                 return;
             }
@@ -240,88 +255,21 @@ impl App {
             r.clamp_to(shot.size.0 as f32, shot.size.1 as f32);
             r
         });
-        self.st = State::Show(ShowStage {
-            shot,
-            tasks,
-            initial_sel,
-            accept_on_select,
-            cfg,
-            frames: 0,
-        });
-        ctx.request_repaint();
-    }
-
-    fn tick_show(&mut self, ctx: &egui::Context, mut stage: ShowStage) {
-        stage.frames += 1;
-        let ppp = ctx.pixels_per_point();
-        let (ow, oh) = (stage.shot.size.0 as f32, stage.shot.size.1 as f32);
-        let (ox, oy) = (stage.shot.origin.0 as f32, stage.shot.origin.1 as f32);
-
-        let (outer, inner) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
-        let scale_ok = (ppp - stage.shot.scale).abs() < 0.02;
-        let outer_ok = outer
-            .map(|r| (r.min.x * ppp - ox).abs() < 2.0 && (r.min.y * ppp - oy).abs() < 2.0)
-            .unwrap_or(false);
-        let inner_ok = inner
-            .map(|r| (r.width() * ppp - ow).abs() < 2.0 && (r.height() * ppp - oh).abs() < 2.0)
-            .unwrap_or(false);
-
-        if !(scale_ok && outer_ok && inner_ok) && stage.frames < 90 {
-            ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
-            ctx.send_viewport_cmd(ViewportCommand::Decorations(false));
-            // Logical position is derived from the *current* scale; repeating
-            // every frame converges even across monitors with different DPI.
-            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos2(ox / ppp, oy / ppp)));
-            if scale_ok {
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(ow / ppp, oh / ppp)));
-            }
-            ctx.request_repaint();
-            self.st = State::Show(stage);
-            return;
-        }
-
-        // Geometry settled: show and focus the window.
-        ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(ow / ppp, oh / ppp)));
-        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::AlwaysOnTop));
-        ctx.send_viewport_cmd(ViewportCommand::Focus);
-        ctx.request_repaint();
-
-        let shot = stage.shot;
         let Some(base) = image_to_pixmap(&shot.image) else {
             eprintln!("error: could not allocate annotation surface");
-            self.exit_code.store(1, Ordering::SeqCst);
             if self.one_shot() {
-                ctx.send_viewport_cmd(ViewportCommand::Close);
-            } else {
-                self.hide_window(ctx);
-                self.st = State::Hidden;
+                self.exit_code.store(1, Ordering::SeqCst);
+                wind::close(self.hwnd);
             }
             return;
         };
         let composed = base.clone();
-        let tex = ctx.load_texture(
-            "composed",
-            ColorImage::from_rgba_premultiplied(
-                [composed.width() as usize, composed.height() as usize],
-                composed.data(),
-            ),
-            TextureOptions::LINEAR,
-        );
-        let (tw, th) = (shot.size.0 as f32, shot.size.1 as f32);
-        let full = FRect {
-            x: 0.0,
-            y: 0.0,
-            w: tw,
-            h: th,
-        };
-        let sel = stage.initial_sel.filter(|r| !r.is_trivial());
-        let accept_now = stage.accept_on_select && sel.is_some();
+        let sel = initial_sel.filter(|r| !r.is_trivial());
+        let accept_now = accept_on_select && sel.is_some();
         let mut edit = Edit {
             shot,
             base,
             composed,
-            tex,
             objects: Vec::new(),
             hist: vec![Vec::new()],
             hi: 0,
@@ -331,14 +279,14 @@ impl App {
             stroke_pts: Vec::new(),
             interact: Interact::None,
             color: config::parse_color(&self.cfg.draw_color)
-                .map(|(r, g, b, _)| Color32::from_rgb(r, g, b))
-                .unwrap_or(Color32::RED),
-            sizes: Sizes::from_cfg(&stage.cfg),
+                .map(|(r, g, b, _)| C4::rgb(r, g, b))
+                .unwrap_or(C4::rgb(255, 0, 0)),
+            sizes: Sizes::from_cfg(&cfg),
             text: None,
-            tasks: stage.tasks,
-            accept_on_select: stage.accept_on_select,
-            cfg: stage.cfg,
-            toolbar_rect: None,
+            tasks,
+            accept_on_select,
+            cfg,
+            toolbar: None,
             palette_open: false,
             done: false,
             cancelled: false,
@@ -346,41 +294,44 @@ impl App {
             notice: None,
             last_wheel: Instant::now(),
             font: self.font.clone(),
-            focus_tries: 0,
-            _full: full,
         };
         if accept_now {
             edit.done = true;
             edit.cancelled = false;
         }
+        // Place the overlay at the exact physical rect of the shot (the
+        // window is DPI-aware and borderless, so outer == inner).
+        wind::show_at(
+            self.hwnd,
+            edit.shot.origin.0,
+            edit.shot.origin.1,
+            edit.shot.size.0 as i32,
+            edit.shot.size.1 as i32,
+        );
+        self.focus_tries = 0;
         if edit.done {
             let cancelled = edit.cancelled;
-            self.finish(ctx, &mut edit, cancelled);
+            self.finish(&mut edit, cancelled);
         } else {
             self.st = State::Edit(Box::new(edit));
         }
     }
 
-    fn hide_window(&self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(WindowLevel::Normal));
-    }
-
-    /// Start the finish sequence: crop now, hide the window, export next frame
-    /// (so a native save dialog is never covered by the always-on-top overlay).
-    fn finish(&mut self, ctx: &egui::Context, edit: &mut Edit, cancelled: bool) {
+    /// Start the finish sequence: crop now, hide the window, export next
+    /// (so a native save dialog is never covered by the overlay).
+    fn finish(&mut self, edit: &mut Edit, cancelled: bool) {
         if cancelled {
             if self.one_shot() {
                 self.exit_code.store(2, Ordering::SeqCst);
-                ctx.send_viewport_cmd(ViewportCommand::Close);
+                wind::close(self.hwnd);
             } else {
-                self.hide_window(ctx);
+                wind::hide(self.hwnd);
                 self.st = State::Hidden;
             }
             return;
         }
         if edit.dirty {
-            edit.rebuild(ctx);
+            edit.rebuild();
         }
         let sel = edit.sel.unwrap_or(FRect {
             x: 0.0,
@@ -393,16 +344,16 @@ impl App {
             (sel.x.round() as i32) + edit.shot.origin.0,
             (sel.y.round() as i32) + edit.shot.origin.1,
         );
-        self.hide_window(ctx);
-        self.st = State::Finish(FinishJob {
+        wind::hide(self.hwnd);
+        self.st = State::Finish(Box::new(FinishJob {
             img,
             sel_global: g,
             tasks: std::mem::take(&mut edit.tasks),
             cfg: edit.cfg.clone(),
-        });
+        }));
     }
 
-    fn run_finish(&mut self, ctx: &egui::Context, job: FinishJob) {
+    fn run_finish(&mut self, job: FinishJob) {
         let res = export::run_export(&job.img, job.sel_global, &job.tasks, &job.cfg);
         for m in &res.messages {
             println!("{m}");
@@ -411,12 +362,10 @@ impl App {
             self.exit_code.store(1, Ordering::SeqCst);
         }
         *self.upload_slot.lock().unwrap() = res.upload;
-        self.hide_window(ctx);
+        wind::hide(self.hwnd);
         match self.kind {
             RunKind::Daemon => self.st = State::Hidden,
-            RunKind::OneShot => {
-                ctx.send_viewport_cmd(ViewportCommand::Close);
-            }
+            RunKind::OneShot => wind::close(self.hwnd),
         }
     }
 
@@ -438,49 +387,707 @@ impl App {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
         }
     }
+
+    // --- input ------------------------------------------------------------
+
+    fn key(&mut self, vk: u32, repeat: bool, mods: Mods) {
+        self.edit_tx(|this, edit| this.handle_key(edit, vk, repeat, mods));
+    }
+
+    fn handle_key(&mut self, edit: &mut Edit, vk: u32, repeat: bool, mods: Mods) {
+        let left = vk == VK_LEFT.0 as u32;
+        let right = vk == VK_RIGHT.0 as u32;
+        let up = vk == VK_UP.0 as u32;
+        let down = vk == VK_DOWN.0 as u32;
+        let arrows = [left, right, up, down];
+        let is_arrow = arrows.iter().any(|a| *a);
+        let escape = vk == VK_ESCAPE.0 as u32;
+        let enter = vk == VK_RETURN.0 as u32;
+        let editing = vk == VK_BACK.0 as u32 || vk == VK_DELETE.0 as u32;
+        // Auto-repeat: selection nudges and text editing keys repeat,
+        // everything else is edge-triggered.
+        if repeat && !is_arrow && !editing {
+            return;
+        }
+
+        // Text editing mode consumes keys.
+        if edit.text.is_some() {
+            if escape {
+                edit.text = None;
+                return;
+            }
+            if enter && !mods.shift {
+                self.commit_text(edit);
+                return;
+            }
+            let td = edit.text.as_mut().expect("text draft");
+            if left {
+                td.caret = prev_boundary(&td.text, td.caret);
+            } else if right {
+                td.caret = next_boundary(&td.text, td.caret);
+            } else if vk == VK_HOME.0 as u32 {
+                td.caret = 0;
+            } else if vk == VK_END.0 as u32 {
+                td.caret = td.text.len();
+            } else if vk == VK_BACK.0 as u32 && td.caret > 0 {
+                let p = prev_boundary(&td.text, td.caret);
+                td.text.replace_range(p..td.caret, "");
+                td.caret = p;
+            } else if vk == VK_DELETE.0 as u32 {
+                let n = next_boundary(&td.text, td.caret);
+                td.text.replace_range(td.caret..n, "");
+            }
+            return;
+        }
+
+        if escape {
+            if matches!(edit.interact, Interact::None)
+                && edit.draft.is_none()
+                && !edit.palette_open
+                && edit.tool.is_none()
+            {
+                edit.cancelled = true;
+                edit.done = true;
+            } else {
+                edit.interact = Interact::None;
+                edit.draft = None;
+                edit.stroke_pts.clear();
+                edit.palette_open = false;
+                edit.tool = None;
+            }
+            return;
+        }
+
+        if mods.ctrl && !mods.alt {
+            if vk == 'Z' as u32 {
+                if mods.shift {
+                    edit.redo();
+                } else {
+                    edit.undo();
+                }
+                return;
+            }
+            if vk == 'Y' as u32 {
+                edit.redo();
+                return;
+            }
+            if vk == 'C' as u32 {
+                self.apply_act(edit, Act::Copy);
+                return;
+            }
+            if vk == 'S' as u32 {
+                self.apply_act(edit, Act::Save);
+                return;
+            }
+        }
+
+        // Arrow keys nudge / resize the selection.
+        if is_arrow && edit.sel.is_some() && !mods.ctrl && !mods.alt {
+            let step = edit.shot.scale.round().max(1.0);
+            let dir = if left {
+                (-1.0, 0.0)
+            } else if right {
+                (1.0, 0.0)
+            } else if up {
+                (0.0, -1.0)
+            } else {
+                (0.0, 1.0)
+            };
+            let mut r = edit.sel.unwrap();
+            if mods.shift {
+                if dir.0 < 0.0 {
+                    r.x -= step;
+                    r.w += step;
+                } else if dir.0 > 0.0 {
+                    r.w += step;
+                }
+                if dir.1 < 0.0 {
+                    r.y -= step;
+                    r.h += step;
+                } else if dir.1 > 0.0 {
+                    r.h += step;
+                }
+                r.clamp_to(edit.shot.size.0 as f32, edit.shot.size.1 as f32);
+            } else {
+                r.x += dir.0 * step;
+                r.y += dir.1 * step;
+                r.clamp_to(edit.shot.size.0 as f32, edit.shot.size.1 as f32);
+            }
+            edit.sel = Some(r);
+            return;
+        }
+
+        if enter {
+            if edit.sel.is_none() {
+                edit.sel = Some(FRect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: edit.shot.size.0 as f32,
+                    h: edit.shot.size.1 as f32,
+                });
+                if edit.accept_on_select {
+                    edit.done = true;
+                    edit.cancelled = false;
+                    return;
+                }
+            }
+            if edit.tasks.is_empty() {
+                edit.tasks = vec![Task::Save { path: None }];
+            }
+            edit.done = true;
+            edit.cancelled = false;
+            return;
+        }
+
+        // Tool shortcuts (plain letters, Flameshot-style).
+        if !mods.ctrl && !mods.alt && !mods.shift {
+            let tool = match vk {
+                v if v == 'P' as u32 => Some(Tool::Path),
+                v if v == 'D' as u32 || v == 'L' as u32 => Some(Tool::Line),
+                v if v == 'A' as u32 => Some(Tool::Arrow),
+                v if v == 'R' as u32 => Some(Tool::Rect),
+                v if v == 'C' as u32 => Some(Tool::Ellipse),
+                v if v == 'M' as u32 => Some(Tool::Marker),
+                v if v == 'T' as u32 => Some(Tool::Text),
+                v if v == 'B' as u32 => Some(Tool::Pixelate),
+                v if v == 'I' as u32 => Some(Tool::Invert),
+                _ => None,
+            };
+            if let Some(t) = tool {
+                edit.tool = if edit.tool == Some(t) { None } else { Some(t) };
+                edit.draft = None;
+                edit.stroke_pts.clear();
+            }
+        }
+    }
+
+    fn char_input(&mut self, c: u16) {
+        self.edit_tx(|_this, edit| {
+            let Some(td) = edit.text.as_mut() else { return };
+            let Some(ch) = char::from_u32(c as u32) else { return };
+            if ch.is_control() {
+                return;
+            }
+            let mut idx = td.caret.min(td.text.len());
+            while idx > 0 && !td.text.is_char_boundary(idx) {
+                idx -= 1;
+            }
+            td.text.insert(idx, ch);
+            td.caret = idx + ch.len_utf8();
+        });
+    }
+
+    fn wheel(&mut self, delta: i32) {
+        self.edit_tx(|_this, edit| {
+            if edit.text.is_some() {
+                return;
+            }
+            if delta != 0 && edit.last_wheel.elapsed() > Duration::from_millis(160) {
+                edit.last_wheel = Instant::now();
+                let dir = if delta > 0 { 1 } else { -1 };
+                edit.adjust_size(dir);
+            }
+        });
+    }
+
+    fn pointer_down(&mut self, x: i32, y: i32) {
+        self.edit_tx(|this, edit| {
+            let p = Pt::new(x as f32, y as f32);
+            // The toolbar sits on top: it consumes the press.
+            let tb = edit
+                .toolbar
+                .as_ref()
+                .map(|tb| (hit(tb.rect, p), tb.hit(p)));
+            if let Some((true, act)) = tb {
+                if edit.text.is_some() {
+                    this.commit_text(edit);
+                }
+                if let Some(act) = act {
+                    this.apply_act(edit, act);
+                }
+                return;
+            }
+            // Text draft: a click outside commits it.
+            if edit.text.is_some() {
+                let td = edit.text.as_ref().expect("text draft");
+                let r = text_box_rect(edit.shot.size.0 as f32, td, edit.sizes.font);
+                if !hit(r, p) {
+                    let (pos, text) = (td.pos, td.text.clone());
+                    edit.text = None;
+                    this.commit_text_str(edit, pos, text);
+                }
+                return;
+            }
+            if !matches!(edit.interact, Interact::None) {
+                return; // already dragging
+            }
+            if let Some(tool) = edit.tool {
+                if tool == Tool::Text {
+                    edit.text = Some(TextDraft {
+                        pos: p,
+                        text: String::new(),
+                        caret: 0,
+                    });
+                    return;
+                }
+                edit.stroke_pts = vec![p];
+                edit.draft = edit.make_draft(tool, p, p);
+                edit.interact = Interact::Drawing { start: p };
+                return;
+            }
+            if let Some(sr) = edit.sel {
+                for (h, hp) in handle_points(sr) {
+                    if (hp.x - p.x).hypot(hp.y - p.y) <= HANDLE_PX * 1.4 {
+                        let aspect = if sr.h > 0.0 { sr.w / sr.h } else { 1.0 };
+                        edit.interact = Interact::Resize {
+                            handle: h,
+                            orig: sr,
+                            aspect,
+                        };
+                        return;
+                    }
+                }
+                if hit(sr, p) {
+                    edit.interact = Interact::MoveSel {
+                        start: p,
+                        orig: sr,
+                    };
+                    return;
+                }
+            }
+            edit.interact = Interact::NewSel {
+                anchor: p,
+                moved: false,
+            };
+        });
+    }
+
+    fn pointer_move(&mut self, x: i32, y: i32) {
+        self.edit_tx(|_this, edit| {
+            if matches!(edit.interact, Interact::None) {
+                return;
+            }
+            let p = Pt::new(x as f32, y as f32);
+            let mods = Mods::current();
+            let img = (edit.shot.size.0 as f32, edit.shot.size.1 as f32);
+            match &mut edit.interact {
+                Interact::None => {}
+                Interact::NewSel { anchor, moved } => {
+                    let anchor = *anchor;
+                    let dist = (p.x - anchor.x).hypot(p.y - anchor.y);
+                    if dist >= CLICK_PX {
+                        *moved = true;
+                    }
+                    if *moved {
+                        let cur = if mods.shift {
+                            constrain_square(anchor, p)
+                        } else {
+                            p
+                        };
+                        let mut r = FRect::from_pts(anchor, cur);
+                        r.clamp_to(img.0, img.1);
+                        edit.sel = Some(r);
+                    }
+                }
+                Interact::MoveSel { start, orig } => {
+                    let (start, orig) = (*start, *orig);
+                    let mut r = FRect {
+                        x: orig.x + p.x - start.x,
+                        y: orig.y + p.y - start.y,
+                        w: orig.w,
+                        h: orig.h,
+                    };
+                    r.clamp_to(img.0, img.1);
+                    edit.sel = Some(r);
+                }
+                Interact::Resize {
+                    handle,
+                    orig,
+                    aspect,
+                } => {
+                    let (h, o, a) = (*handle, *orig, *aspect);
+                    edit.sel = Some(resize_rect(h, o, p, a, &mods, img));
+                }
+                Interact::Drawing { start } => {
+                    let start = *start;
+                    let tool = edit.tool.unwrap_or(Tool::Line);
+                    // Photoshop-style constraints while Shift is held:
+                    // lines/arrows snap to 45-degree steps, rectangles and
+                    // ellipses become squares and circles.
+                    let cur = match tool {
+                        Tool::Line | Tool::Arrow => {
+                            if mods.shift || mods.ctrl {
+                                edit.snap_point(start, p, true)
+                            } else {
+                                p
+                            }
+                        }
+                        Tool::Rect
+                        | Tool::Ellipse
+                        | Tool::Pixelate
+                        | Tool::Invert
+                            if mods.shift =>
+                        {
+                            constrain_square(start, p)
+                        }
+                        _ => p,
+                    };
+                    if matches!(tool, Tool::Path | Tool::Marker) {
+                        let last = edit.stroke_pts.last().copied();
+                        let need = last
+                            .map(|l| (cur.x - l.x).hypot(cur.y - l.y) >= 2.0)
+                            .unwrap_or(true);
+                        if need {
+                            edit.stroke_pts.push(cur);
+                        }
+                        let pts = edit.stroke_pts.clone();
+                        let color = edit.color;
+                        let width = if tool == Tool::Marker {
+                            edit.sizes.marker
+                        } else {
+                            edit.sizes.line
+                        };
+                        edit.draft = Some(if tool == Tool::Marker {
+                            Obj::Marker {
+                                a: pts.first().copied().unwrap_or(cur),
+                                b: cur,
+                                color: color.with_alpha(90),
+                                width,
+                            }
+                        } else {
+                            Obj::Path { pts, color, width }
+                        });
+                    } else {
+                        edit.draft = edit.make_draft(tool, start, cur);
+                    }
+                }
+            }
+        });
+    }
+
+    fn pointer_up(&mut self) {
+        self.edit_tx(|_this, edit| end_interaction(edit));
+    }
+
+    fn commit_text(&mut self, edit: &mut Edit) {
+        let td = edit.text.take().expect("text draft");
+        self.commit_text_str(edit, td.pos, td.text);
+    }
+
+    fn commit_text_str(&mut self, edit: &mut Edit, pos: Pt, text: String) {
+        let text = text.trim_end_matches('\n').to_string();
+        if text.trim().is_empty() {
+            return;
+        }
+        edit.commit_object(Obj::Text {
+            pos,
+            text,
+            color: edit.color,
+            size: edit.sizes.font,
+        });
+    }
+
+    fn apply_act(&mut self, edit: &mut Edit, act: Act) {
+        match act {
+            Act::Tool(t) => {
+                edit.tool = if edit.tool == Some(t) { None } else { Some(t) };
+                edit.draft = None;
+                edit.stroke_pts.clear();
+            }
+            Act::Undo => edit.undo(),
+            Act::Redo => edit.redo(),
+            Act::Size(d) => edit.adjust_size(d),
+            Act::Color(c) => {
+                edit.color = c;
+                edit.palette_open = false;
+            }
+            Act::Palette => edit.palette_open = !edit.palette_open,
+            Act::Copy => {
+                edit.tasks = vec![Task::Copy];
+                edit.done = true;
+            }
+            Act::Save => {
+                edit.tasks = vec![Task::Save { path: None }];
+                edit.done = true;
+            }
+            Act::Upload => {
+                edit.tasks = vec![Task::Upload];
+                edit.done = true;
+            }
+            Act::Exit => {
+                edit.cancelled = true;
+                edit.done = true;
+            }
+            Act::Accept => edit.done = true,
+        }
+    }
 }
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Global hotkeys (daemon).
-        if let Some(hot) = &self.hot {
-            let ev = hot.poll();
-            if ev == Some(HotEvent::Quit) {
-                self.request_exit(ctx, 0);
-                return;
-            }
-            if ev == Some(HotEvent::Capture) && matches!(self.st, State::Hidden) {
-                self.begin_capture(ctx, Pending::editor());
-                return;
-            }
-        }
-        self.poll_upload();
-        if let Some((_, at)) = &self.notice
-            && at.elapsed() > Duration::from_millis(1500) {
-                self.notice = None;
-            }
+impl Driver for App {
+    fn on_create(&mut self, hwnd: HWND) {
+        self.hwnd = hwnd;
+        self.pump();
+    }
 
-        match std::mem::replace(&mut self.st, State::Hidden) {
-            State::Hidden => {
-                if let Some(pending) = self.pending.take() {
-                    self.begin_capture(ctx, pending);
-                }
-                if matches!(self.st, State::Hidden) {
-                    ctx.request_repaint_after(Duration::from_millis(150));
+    fn on_event(&mut self, ev: Ev) {
+        match ev {
+            Ev::Move { x, y } => {
+                self.mouse = (x, y);
+                let dragging =
+                    matches!(&self.st, State::Edit(e) if !matches!(e.interact, Interact::None));
+                if dragging {
+                    self.pointer_move(x, y);
+                    wind::invalidate(self.hwnd);
                 }
             }
-            State::Show(stage) => self.tick_show(ctx, stage),
-            State::Finish(job) => self.run_finish(ctx, job),
-            State::Edit(mut edit) => {
-                self.tick_edit(ctx, &mut edit);
-                if edit.done {
-                    let cancelled = edit.cancelled;
-                    self.finish(ctx, &mut edit, cancelled);
-                } else {
-                    self.st = State::Edit(edit);
+            Ev::Down { x, y } => {
+                self.mouse = (x, y);
+                self.pointer_down(x, y);
+            }
+            Ev::Up { x, y } => {
+                self.mouse = (x, y);
+                self.pointer_up();
+            }
+            Ev::Wheel { delta, x, y } => {
+                self.mouse = (x, y);
+                self.wheel(delta);
+            }
+            Ev::Key { vk, up, repeat, mods } => {
+                if !up {
+                    self.key(vk, repeat, mods);
+                }
+            }
+            Ev::Char(c) => self.char_input(c),
+            Ev::Timer => {}
+        }
+        self.pump();
+    }
+
+    fn frame(&mut self) -> Option<PixBuf> {
+        let State::Edit(edit) = &mut self.st else { return None };
+        if edit.dirty {
+            edit.rebuild();
+        }
+        layout(edit);
+        let (ww, wh) = (edit.shot.size.0 as f32, edit.shot.size.1 as f32);
+
+        // Compose: base + objects, then dim outside the selection, then
+        // the live draft (painted over the dim, like the old overlay).
+        let mut pm = edit.composed.clone();
+        let dim = edit.cfg.contrast_opacity;
+        match edit.sel {
+            None => dim_rect(&mut pm, 0.0, 0.0, ww, wh, dim),
+            Some(sr) => {
+                dim_rect(&mut pm, 0.0, 0.0, ww, sr.y, dim);
+                dim_rect(&mut pm, 0.0, sr.y1(), ww, wh - sr.y1(), dim);
+                dim_rect(&mut pm, 0.0, sr.y, sr.x, sr.h, dim);
+                dim_rect(&mut pm, sr.x1(), sr.y, ww - sr.x1(), sr.h, dim);
+            }
+        }
+        if let Some(d) = &edit.draft {
+            d.render(&mut pm, edit.font.as_ref());
+        }
+        let mut fb = unpremul_pm(&pm);
+
+        // Chrome, drawn into the display buffer.
+        let stride = fb.width() as usize;
+        let mut f = Fb::new(fb.as_raw_mut(), stride);
+        let accent = edit.accent();
+        let font = edit.font.clone();
+
+        if let Some(sr) = edit.sel {
+            f.stroke_rect(sr.x, sr.y, sr.w, sr.h, 1.4, accent);
+            for (_h, hp) in handle_points(sr) {
+                let hx = (hp.x - HANDLE_PX).round() as i32;
+                let hy = (hp.y - HANDLE_PX).round() as i32;
+                f.fill_rounded(hx, hy, 12, 12, 2.0, accent);
+                f.stroke_rect(
+                    hx as f32,
+                    hy as f32,
+                    HANDLE_PX * 2.0,
+                    HANDLE_PX * 2.0,
+                    1.0,
+                    C4::new(255, 255, 255, 220),
+                );
+            }
+            if let Some(font) = font.as_ref() {
+                let label = format!(
+                    "{}x{}",
+                    sr.w.round() as i32,
+                    sr.h.round() as i32
+                );
+                let tw = text_width(font, 12.0, &label);
+                let th = text_height(font, 12.0);
+                let lx = sr.x;
+                let ly = sr.y1() + 16.0;
+                f.fill_rounded(
+                    (lx - 3.0) as i32,
+                    (ly - th / 2.0 - 3.0) as i32,
+                    (tw + 6.0) as i32,
+                    (th + 6.0) as i32,
+                    2.0,
+                    C4::black_alpha(190),
+                );
+                f.draw_text(
+                    font,
+                    12.0,
+                    &label,
+                    lx,
+                    ly - th / 2.0,
+                    C4::rgb(255, 255, 255),
+                );
+            }
+        }
+
+        // Notice (tool size etc.), bottom center.
+        let notice = edit
+            .notice
+            .as_ref()
+            .map(|(t, _)| t.as_str())
+            .or_else(|| self.notice.as_ref().map(|(t, _)| t.as_str()));
+        if let (Some(font), Some(t)) = (font.as_ref(), notice) {
+            let tw = text_width(font, 14.0, t);
+            let th = text_height(font, 14.0);
+            let cx = ww / 2.0;
+            let cy = wh - 36.0;
+            f.fill_rounded(
+                (cx - tw / 2.0 - 6.0) as i32,
+                (cy - th / 2.0 - 6.0) as i32,
+                (tw + 12.0) as i32,
+                (th + 12.0) as i32,
+                4.0,
+                C4::black_alpha(200),
+            );
+            f.draw_text_centered(
+                font,
+                14.0,
+                t,
+                cx,
+                cy,
+                C4::rgb(255, 255, 255),
+            );
+        }
+
+        // Text draft box.
+        if let Some(td) = &edit.text
+            && let Some(font) = font.as_ref()
+        {
+            let r = text_box_rect(ww, td, edit.sizes.font);
+            f.fill_rounded(
+                r.x as i32,
+                r.y as i32,
+                r.w as i32,
+                r.h as i32,
+                3.0,
+                C4::new(255, 255, 255, 235),
+            );
+            f.stroke_rect(r.x, r.y, r.w, r.h, 1.0, accent);
+            let px = edit.sizes.font;
+            let tx = r.x + 6.0;
+            let ty = r.y + (r.h - text_height(font, px)) / 2.0;
+            let shown = td.text.get(..td.caret).unwrap_or("");
+            f.draw_text(font, px, shown, tx + 1.0, ty + 1.0, C4::black_alpha(140));
+            f.draw_text(font, px, shown, tx, ty, edit.color);
+            let caret_x = tx + text_width(font, px, shown);
+            f.fill_rect(
+                caret_x as i32,
+                (ty + 1.0) as i32,
+                1,
+                text_height(font, px) as i32,
+                C4::rgb(20, 20, 20),
+            );
+        }
+
+        // Toolbar, on top of everything.
+        if let Some(tb) = &edit.toolbar {
+            f.fill_rounded(
+                tb.rect.x as i32,
+                tb.rect.y as i32,
+                tb.rect.w as i32,
+                tb.rect.h as i32,
+                6.0,
+                C4::black_alpha(175),
+            );
+            for (tile, r) in &tb.items {
+                let (cx0, cy0, cw, ch) = (r.x as i32, r.y as i32, r.w as i32, r.h as i32);
+                match tile {
+                    Tile::Btn { icon, label, fill, .. } => {
+                        f.fill_rounded(cx0, cy0, cw, ch, 4.0, *fill);
+                        if !icon.is_empty()
+                            && let Some(ic) = self.icons.get(icon)
+                        {
+                            f.blit(
+                                cx0 + (cw - ICON_PX as i32) / 2,
+                                cy0 + (ch - ICON_PX as i32) / 2,
+                                ic,
+                            );
+                        } else if !label.is_empty()
+                            && let Some(font) = font.as_ref()
+                        {
+                            let tw = text_width(font, 11.0, label);
+                            f.draw_text(
+                                font,
+                                11.0,
+                                label,
+                                r.x + (r.w - tw) / 2.0,
+                                r.y + (r.h - 11.0) / 2.0,
+                                C4::rgb(255, 255, 255),
+                            );
+                        }
+                    }
+                    Tile::Sep => {
+                        f.fill_rect(cx0 + cw / 2, cy0 + 3, 1, (ch - 6).max(1), C4::rgb(80, 80, 80));
+                    }
+                    Tile::Text(s) => {
+                        if let Some(font) = font.as_ref() {
+                            f.draw_text_centered(
+                                font,
+                                12.0,
+                                s,
+                                r.x + r.w / 2.0,
+                                r.y + r.h / 2.0,
+                                C4::rgb(230, 230, 230),
+                            );
+                        }
+                    }
+                    Tile::Swatch(_, c) => {
+                        f.fill_rounded(cx0, cy0, cw, ch, 3.0, *c);
+                        f.stroke_rect(
+                            r.x + 0.5,
+                            r.y + 0.5,
+                            r.w - 1.0,
+                            r.h - 1.0,
+                            1.0,
+                            C4::new(255, 255, 255, 90),
+                        );
+                    }
                 }
             }
         }
+        Some(fb)
+    }
+
+    fn cursor(&self) -> Cursor {
+        let State::Edit(edit) = &self.st else { return Cursor::Arrow };
+        if edit.text.is_some() {
+            return Cursor::IBeam;
+        }
+        if edit.tool.is_some() {
+            return Cursor::Cross;
+        }
+        let p = Pt::new(self.mouse.0 as f32, self.mouse.1 as f32);
+        if let Some(sr) = edit.sel {
+            if let Some((h, _)) = handle_points(sr)
+                .into_iter()
+                .find(|(_, q)| (q.x - p.x).hypot(q.y - p.y) <= HANDLE_PX * 1.4)
+            {
+                return handle_cursor(h);
+            }
+            if hit(sr, p) {
+                return Cursor::Move;
+            }
+        }
+        Cursor::Cross
     }
 }
 
@@ -574,13 +1181,14 @@ impl Sizes {
 struct TextDraft {
     pos: Pt,
     text: String,
+    /// Byte index of the caret inside `text`.
+    caret: usize,
 }
 
 struct Edit {
     shot: Shot,
     base: Pixmap,
     composed: Pixmap,
-    tex: TextureHandle,
     objects: Vec<Obj>,
     hist: Vec<Vec<Obj>>,
     hi: usize,
@@ -589,13 +1197,13 @@ struct Edit {
     draft: Option<Obj>,
     stroke_pts: Vec<Pt>,
     interact: Interact,
-    color: Color32,
+    color: C4,
     sizes: Sizes,
     text: Option<TextDraft>,
     tasks: Vec<Task>,
     accept_on_select: bool,
     cfg: Config,
-    toolbar_rect: Option<Rect>,
+    toolbar: Option<Toolbar>,
     palette_open: bool,
     done: bool,
     cancelled: bool,
@@ -603,24 +1211,21 @@ struct Edit {
     notice: Option<(String, Instant)>,
     last_wheel: Instant,
     font: Option<FontArc>,
-    focus_tries: u8,
-    _full: FRect,
 }
 
 const HANDLE_PX: f32 = 6.0; // half-size of selection handles, in points
 const CLICK_PX: f32 = 2.5; // movement below this counts as a click
+const BTN: f32 = 26.0; // toolbar button size
+const ICON_PX: f32 = 20.0; // toolbar icon size
+const PAD: f32 = 5.0; // toolbar frame padding
+const GAP: f32 = 3.0; // toolbar item gap
 
 impl Edit {
-    fn rebuild(&mut self, ctx: &egui::Context) {
+    fn rebuild(&mut self) {
         let mut pm = self.base.clone();
         for o in &self.objects {
             o.render(&mut pm, self.font.as_ref());
         }
-        let img = ColorImage::from_rgba_premultiplied(
-            [pm.width() as usize, pm.height() as usize],
-            pm.data(),
-        );
-        self.tex = ctx.load_texture("composed", img, TextureOptions::LINEAR);
         self.composed = pm;
         self.dirty = false;
     }
@@ -703,7 +1308,7 @@ impl Edit {
             Tool::Marker => Obj::Marker {
                 a,
                 b,
-                color: Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 90),
+                color: c.with_alpha(90),
                 width: self.sizes.marker,
             },
             Tool::Pixelate => Obj::Pixelate {
@@ -746,766 +1351,25 @@ impl Edit {
         let snapped = ((deg / 45.0).round() * 45.0).to_radians();
         Pt::new(start.x + len * snapped.cos(), start.y + len * snapped.sin())
     }
-}
 
-// ---------------------------------------------------------------------------
-// Editor rendering + input
-// ---------------------------------------------------------------------------
-
-impl App {
-    fn tick_edit(&mut self, ctx: &egui::Context, edit: &mut Edit) {
-        // Windows only delivers key events to the foreground window; retry
-        // for a few frames after the overlay becomes visible.
-        if edit.focus_tries < 5 {
-            edit.focus_tries += 1;
-            capture::focus_our_window();
-        }
-        if edit.dirty {
-            edit.rebuild(ctx);
-        }
-        if let Some((_, at)) = &edit.notice
-            && at.elapsed() > Duration::from_millis(1500) {
-                edit.notice = None;
-            }
-
-        self.handle_keys(ctx, edit);
-        if edit.done {
-            return;
-        }
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none())
-            .show(ctx, |ui| {
-                let full = ui.max_rect();
-                let s = (edit.shot.size.0 as f32 / full.width().max(1.0)).max(0.01);
-                let inv = 1.0 / s;
-                let origin = full.min;
-                let to_img = |p: Pos2| -> Pt {
-                    Pt::new((p.x - origin.x) * s, (p.y - origin.y) * s)
-                };
-                let to_pt = |p: Pt| -> Pos2 {
-                    pos2(origin.x + p.x * inv, origin.y + p.y * inv)
-                };
-
-                let painter = ui.painter();
-                painter.image(
-                    edit.tex.id(),
-                    full,
-                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
-
-                // Selection rect in points.
-                let sel_pt = edit
-                    .sel
-                    .map(|r| Rect::from_min_max(to_pt(Pt::new(r.x, r.y)), to_pt(Pt::new(r.x1(), r.y1()))));
-
-                // Dim everything outside the selection.
-                let dim = Color32::from_black_alpha(edit.cfg.contrast_opacity);
-                match sel_pt {
-                    None => {
-                        painter.rect_filled(full, 0.0, dim);
-                    }
-                    Some(sr) => {
-                        painter.rect_filled(
-                            Rect::from_min_max(full.min, pos2(full.max.x, sr.min.y)),
-                            0.0,
-                            dim,
-                        );
-                        painter.rect_filled(
-                            Rect::from_min_max(pos2(full.min.x, sr.max.y), full.max),
-                            0.0,
-                            dim,
-                        );
-                        painter.rect_filled(
-                            Rect::from_min_max(full.min, pos2(sr.min.x, full.max.y)),
-                            0.0,
-                            dim,
-                        );
-                        painter.rect_filled(
-                            Rect::from_min_max(pos2(sr.max.x, full.min.y), full.max),
-                            0.0,
-                            dim,
-                        );
-                    }
-                }
-
-                // Live draft preview.
-                if let Some(d) = &edit.draft {
-                    objects::paint_preview(painter, d, origin, inv);
-                }
-
-                // Selection border + handles + size label.
-                if let Some(sr) = sel_pt {
-                    let stroke = Stroke::new(1.4, edit.accent());
-                    painter.rect_stroke(sr, 0.0, stroke);
-                    for (h, pos) in handle_points(sr) {
-                        let _ = h;
-                        let r = Rect::from_center_size(pos, vec2(HANDLE_PX * 2.0, HANDLE_PX * 2.0));
-                        painter.rect_filled(r, 2.0, edit.accent());
-                        painter.rect_stroke(r, 2.0, Stroke::new(1.0, Color32::WHITE));
-                    }
-                    let label = format!(
-                        "{}x{}",
-                        (sr.width() * s).round() as i32,
-                        (sr.height() * s).round() as i32
-                    );
-                    let font = FontId::proportional(12.0);
-                    let at = pos2(sr.min.x, sr.max.y + 16.0);
-                    let trect = painter.text(at, Align2::LEFT_CENTER, &label, font.clone(), Color32::TRANSPARENT);
-                    painter.rect_filled(trect.expand(3.0), 2.0, Color32::from_black_alpha(190));
-                    painter.text(at, Align2::LEFT_CENTER, &label, font, Color32::WHITE);
-                }
-
-                // Notice (tool size etc.), bottom center.
-                if let Some((t, _)) = &edit.notice {
-                    let font = FontId::proportional(14.0);
-                    let at = pos2(full.center().x, full.max.y - 36.0);
-                    let trect = painter.text(at, Align2::CENTER_CENTER, t, font.clone(), Color32::TRANSPARENT);
-                    painter.rect_filled(trect.expand(6.0), 4.0, Color32::from_black_alpha(200));
-                    painter.text(at, Align2::CENTER_CENTER, t, font, Color32::WHITE);
-                }
-
-                self.pointer_logic(ui, edit, full, s, inv, origin, &to_img, &to_pt, sel_pt);
-                self.toolbar(ui, ctx, edit, full, s, inv, &to_pt, sel_pt);
-
-                // Cursor.
-                let hover = ui.input(|i| i.pointer.interact_pos());
-                if edit.text.is_none()
-                    && let Some(p) = hover {
-                        if edit.tool.is_some() {
-                            ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
-                        } else if let Some(sr) = sel_pt {
-                            if let Some((h, _)) = handle_points(sr).into_iter().find(|(_, hp)| {
-                                hp.distance(p) <= HANDLE_PX * 1.4
-                            }) {
-                                ui.ctx().set_cursor_icon(handle_cursor(h));
-                            } else if sr.contains(p) {
-                                ui.ctx().set_cursor_icon(CursorIcon::Move);
-                            } else {
-                                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
-                            }
-                        } else {
-                            ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
-                        }
-                    }
-            });
-    }
-
-    fn handle_keys(&mut self, ctx: &egui::Context, edit: &mut Edit) {
-        let (escape, enter, arrows, mods, wheel) = ctx.input(|i| {
-            (
-                i.key_pressed(Key::Escape),
-                i.key_pressed(Key::Enter),
-                [
-                    i.key_pressed(Key::ArrowLeft),
-                    i.key_pressed(Key::ArrowRight),
-                    i.key_pressed(Key::ArrowUp),
-                    i.key_pressed(Key::ArrowDown),
-                ],
-                i.modifiers,
-                i.raw_scroll_delta.y + i.smooth_scroll_delta.y,
-            )
-        });
-
-        // Text editing mode consumes Enter/Escape.
-        if edit.text.is_some() {
-            if enter && !mods.shift {
-                self.commit_text(edit);
-                return;
-            }
-            if escape {
-                edit.text = None;
-                return;
-            }
-            return;
-        }
-
-        if escape {
-            if matches!(edit.interact, Interact::None) && edit.draft.is_none() && !edit.palette_open && edit.tool.is_none() {
-                edit.cancelled = true;
-                edit.done = true;
-            } else {
-                edit.interact = Interact::None;
-                edit.draft = None;
-                edit.stroke_pts.clear();
-                edit.palette_open = false;
-                edit.tool = None;
-            }
-            return;
-        }
-
-        if mods.ctrl && !mods.alt {
-            if ctx.input(|i| i.key_pressed(Key::Z)) {
-                if mods.shift {
-                    edit.redo();
-                } else {
-                    edit.undo();
-                }
-                return;
-            }
-            if ctx.input(|i| i.key_pressed(Key::Y)) {
-                edit.redo();
-                return;
-            }
-            if ctx.input(|i| i.key_pressed(Key::C)) {
-                edit.tasks = vec![Task::Copy];
-                edit.done = true;
-                edit.cancelled = false;
-                return;
-            }
-            if ctx.input(|i| i.key_pressed(Key::S)) {
-                edit.tasks = vec![Task::Save { path: None }];
-                edit.done = true;
-                edit.cancelled = false;
-                return;
-            }
-        }
-
-        // Arrow keys nudge / resize the selection.
-        if arrows.iter().any(|a| *a) && edit.sel.is_some() && !mods.ctrl && !mods.alt {
-            let step = (edit.shot.scale).round().max(1.0);
-            let dir = match (arrows[0], arrows[1], arrows[2], arrows[3]) {
-                (true, ..) => (-1.0, 0.0),
-                (_, true, ..) => (1.0, 0.0),
-                (_, _, true, _) => (0.0, -1.0),
-                _ => (0.0, 1.0),
-            };
-            let mut r = edit.sel.unwrap();
-            if mods.shift {
-                if dir.0 < 0.0 {
-                    r.x -= step;
-                    r.w += step;
-                } else if dir.0 > 0.0 {
-                    r.w += step;
-                }
-                if dir.1 < 0.0 {
-                    r.y -= step;
-                    r.h += step;
-                } else if dir.1 > 0.0 {
-                    r.h += step;
-                }
-                r.clamp_to(edit.shot.size.0 as f32, edit.shot.size.1 as f32);
-            } else {
-                r.x += dir.0 * step;
-                r.y += dir.1 * step;
-                r.clamp_to(edit.shot.size.0 as f32, edit.shot.size.1 as f32);
-            }
-            edit.sel = Some(r);
-            return;
-        }
-
-        if enter {
-            if edit.sel.is_none() {
-                edit.sel = Some(FRect {
-                    x: 0.0,
-                    y: 0.0,
-                    w: edit.shot.size.0 as f32,
-                    h: edit.shot.size.1 as f32,
-                });
-                if edit.accept_on_select {
-                    edit.done = true;
-                    edit.cancelled = false;
-                    return;
-                }
-            }
-            if edit.tasks.is_empty() {
-                edit.tasks = vec![Task::Save { path: None }];
-            }
-            edit.done = true;
-            edit.cancelled = false;
-            return;
-        }
-
-        // Tool shortcuts (plain letters, Flameshot-style).
-        if !mods.ctrl && !mods.alt && !mods.shift {
-            let pressed = |k: Key| ctx.input(|i| i.key_pressed(k));
-            let tool = if pressed(Key::P) {
-                Some(Tool::Path)
-            } else if pressed(Key::D) || pressed(Key::L) {
-                Some(Tool::Line)
-            } else if pressed(Key::A) {
-                Some(Tool::Arrow)
-            } else if pressed(Key::R) {
-                Some(Tool::Rect)
-            } else if pressed(Key::C) {
-                Some(Tool::Ellipse)
-            } else if pressed(Key::M) {
-                Some(Tool::Marker)
-            } else if pressed(Key::T) {
-                Some(Tool::Text)
-            } else if pressed(Key::B) {
-                Some(Tool::Pixelate)
-            } else if pressed(Key::I) {
-                Some(Tool::Invert)
-            } else {
-                None
-            };
-            if let Some(t) = tool {
-                edit.tool = if edit.tool == Some(t) { None } else { Some(t) };
-                edit.draft = None;
-                edit.stroke_pts.clear();
-                return;
-            }
-        }
-
-        // Wheel adjusts the active tool size.
-        if wheel.abs() > 0.5 && edit.last_wheel.elapsed() > Duration::from_millis(160) {
-            edit.last_wheel = Instant::now();
-            let dir = if wheel > 0.0 { 1 } else { -1 };
-            edit.adjust_size(dir);
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn pointer_logic(
-        &mut self,
-        ui: &mut egui::Ui,
-        edit: &mut Edit,
-        full: Rect,
-        s: f32,
-        inv: f32,
-        origin: Pos2,
-        to_img: &dyn Fn(Pos2) -> Pt,
-        _to_pt: &dyn Fn(Pt) -> Pos2,
-        sel_pt: Option<Rect>,
-    ) {
-        let _ = (full, inv, origin);
-        let pressed = ui.input(|i| i.pointer.button_pressed(PointerButton::Primary));
-        let released = ui.input(|i| i.pointer.button_released(PointerButton::Primary));
-        let down = ui.input(|i| i.pointer.button_down(PointerButton::Primary));
-        let pos = ui.input(|i| i.pointer.interact_pos());
-        let mods = ui.input(|i| i.modifiers);
-        let over_toolbar = edit
-            .toolbar_rect
-            .map(|r| pos.map(|p| r.contains(p)).unwrap_or(false))
-            .unwrap_or(false);
-
-        let Some(pos) = pos else {
-            if released {
-                self.end_interaction(edit, to_img(pos2(0.0, 0.0)), false, sel_pt, s);
-            }
-            return;
-        };
-        let img_pos = to_img(pos);
-
-        // --- text draft takes priority -------------------------------------
-        let mut outside_click: Option<(Pt, String)> = None;
-        if let Some(td) = &mut edit.text {
-            let font_pt = edit.sizes.font * inv;
-            let rect = Rect::from_min_size(
-                to_pt_clamped(td.pos, origin, inv, full),
-                vec2(320.0, font_pt * 1.5),
-            );
-            if pressed && !rect.contains(pos) && !over_toolbar {
-                outside_click = Some((td.pos, td.text.clone()));
-            } else {
-                let resp = ui.put(
-                    rect,
-                    egui::TextEdit::singleline(&mut td.text)
-                        .font(FontId::proportional(font_pt))
-                        .desired_width(316.0),
-                );
-                let _ = resp;
-                return;
-            }
-        }
-        if let Some((pos_img, text)) = outside_click {
-            edit.text = None;
-            self.commit_text_str(edit, pos_img, text);
-            return;
-        }
-
-        // --- press ----------------------------------------------------------
-        if pressed && !matches!(edit.interact, Interact::None) {
-            return; // already dragging
-        }
-        if pressed && !over_toolbar {
-            if let Some(tool) = edit.tool {
-                if tool == Tool::Text {
-                    edit.text = Some(TextDraft {
-                        pos: img_pos,
-                        text: String::new(),
-                    });
-                    edit.interact = Interact::None;
-                    return;
-                }
-                edit.stroke_pts = vec![img_pos];
-                edit.draft = edit.make_draft(tool, img_pos, img_pos);
-                edit.interact = Interact::Drawing { start: img_pos };
-                return;
-            }
-            if let Some(sr) = sel_pt {
-                if let Some((h, _)) = handle_points(sr).into_iter().find(|(_, hp)| hp.distance(pos) <= HANDLE_PX * 1.4) {
-                    let orig = edit.sel.unwrap();
-                    let aspect = if orig.h > 0.0 { orig.w / orig.h } else { 1.0 };
-                    edit.interact = Interact::Resize { handle: h, orig, aspect };
-                    return;
-                }
-                if sr.contains(pos) {
-                    edit.interact = Interact::MoveSel {
-                        start: img_pos,
-                        orig: edit.sel.unwrap(),
-                    };
-                    return;
-                }
-            }
-            edit.interact = Interact::NewSel {
-                anchor: img_pos,
-                moved: false,
-            };
-            return;
-        }
-
-        // --- drag -----------------------------------------------------------
-        if down {
-            match &mut edit.interact {
-                Interact::None => {}
-                Interact::NewSel { anchor, moved } => {
-                    let dist = (img_pos.x - anchor.x).hypot(img_pos.y - anchor.y) * inv;
-                    if dist >= CLICK_PX {
-                        *moved = true;
-                    }
-                    if *moved {
-                        let p = if mods.shift {
-                            constrain_square(*anchor, img_pos)
-                        } else {
-                            img_pos
-                        };
-                        let mut r = FRect::from_pts(*anchor, p);
-                        r.clamp_to(edit.shot.size.0 as f32, edit.shot.size.1 as f32);
-                        edit.sel = Some(r);
-                    }
-                }
-                Interact::MoveSel { start, orig } => {
-                    let dx = img_pos.x - start.x;
-                    let dy = img_pos.y - start.y;
-                    let mut r = FRect {
-                        x: orig.x + dx,
-                        y: orig.y + dy,
-                        w: orig.w,
-                        h: orig.h,
-                    };
-                    r.clamp_to(edit.shot.size.0 as f32, edit.shot.size.1 as f32);
-                    edit.sel = Some(r);
-                }
-                Interact::Resize { handle, orig, aspect } => {
-                    let r = resize_rect(
-                        *handle,
-                        *orig,
-                        img_pos,
-                        *aspect,
-                        &mods,
-                        (edit.shot.size.0 as f32, edit.shot.size.1 as f32),
-                    );
-                    edit.sel = Some(r);
-                }
-                Interact::Drawing { start } => {
-                    let start = *start;
-                    let tool = edit.tool.unwrap_or(Tool::Line);
-                    // Photoshop-style constraints while Shift is held:
-                    // lines/arrows snap to 45-degree steps, rectangles and
-                    // ellipses become squares and circles.
-                    let cur = match tool {
-                        Tool::Line | Tool::Arrow => {
-                            if mods.shift || mods.ctrl {
-                                edit.snap_point(start, img_pos, true)
-                            } else {
-                                img_pos
-                            }
-                        }
-                        Tool::Rect
-                        | Tool::Ellipse
-                        | Tool::Pixelate
-                        | Tool::Invert
-                            if mods.shift =>
-                        {
-                            constrain_square(start, img_pos)
-                        }
-                        _ => img_pos,
-                    };
-                    if matches!(tool, Tool::Path | Tool::Marker) {
-                        let last = edit.stroke_pts.last().copied();
-                        let need = match last {
-                            Some(l) => (cur.x - l.x).hypot(cur.y - l.y) >= 2.0,
-                            None => true,
-                        };
-                        if need {
-                            edit.stroke_pts.push(cur);
-                        }
-                        let pts = edit.stroke_pts.clone();
-                        let color = edit.color;
-                        let width = if tool == Tool::Marker {
-                            edit.sizes.marker
-                        } else {
-                            edit.sizes.line
-                        };
-                        edit.draft = Some(if tool == Tool::Marker {
-                            Obj::Marker {
-                                a: pts.first().copied().unwrap_or(cur),
-                                b: cur,
-                                color: Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 90),
-                                width,
-                            }
-                        } else {
-                            Obj::Path { pts, color, width }
-                        });
-                    } else {
-                        edit.draft = edit.make_draft(tool, start, cur);
-                    }
-                }
-            }
-        }
-
-        // --- release --------------------------------------------------------
-        if released {
-            self.end_interaction(edit, img_pos, mods.ctrl, sel_pt, s);
-        }
-    }
-
-    fn end_interaction(
-        &mut self,
-        edit: &mut Edit,
-        _img_pos: Pt,
-        _ctrl: bool,
-        _sel_pt: Option<Rect>,
-        _s: f32,
-    ) {
-        match std::mem::replace(&mut edit.interact, Interact::None) {
-            Interact::Drawing { .. } => {
-                if edit.draft_is_valid() {
-                    let d = edit.draft.take().expect("draft exists");
-                    edit.commit_object(d);
-                }
-                edit.draft = None;
-                edit.stroke_pts.clear();
-            }
-            Interact::NewSel { moved, .. } => {
-                if !moved {
-                    // A plain click selects everything (Flameshot-ish).
-                    edit.sel = Some(FRect {
-                        x: 0.0,
-                        y: 0.0,
-                        w: edit.shot.size.0 as f32,
-                        h: edit.shot.size.1 as f32,
-                    });
-                }
-                if edit.accept_on_select {
-                    edit.done = true;
-                    edit.cancelled = false;
-                }
-            }
-            Interact::MoveSel { .. } | Interact::Resize { .. } | Interact::None => {}
-        }
-    }
-
-    fn commit_text(&mut self, edit: &mut Edit) {
-        let td = edit.text.take().expect("text draft");
-        self.commit_text_str(edit, td.pos, td.text);
-    }
-
-    fn commit_text_str(&mut self, edit: &mut Edit, pos: Pt, text: String) {
-        let text = text.trim_end_matches('\n').to_string();
-        if text.trim().is_empty() {
-            return;
-        }
-        edit.commit_object(Obj::Text {
-            pos,
-            text,
-            color: edit.color,
-            size: edit.sizes.font,
-        });
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn toolbar(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        edit: &mut Edit,
-        full: Rect,
-        s: f32,
-        inv: f32,
-        to_pt: &dyn Fn(Pt) -> Pos2,
-        sel_pt: Option<Rect>,
-    ) {
-        let _ = (s, inv, to_pt);
-        let Some(sr) = sel_pt else {
-            edit.toolbar_rect = None;
-            edit.palette_open = false;
-            return;
-        };
-        let gap = 8.0;
-        let est = edit.toolbar_rect.map(|r| r.size()).unwrap_or(vec2(760.0, 62.0));
-        let mut x = sr.center().x - est.x / 2.0;
-        let mut y = sr.max.y + gap;
-        if y + est.y > full.max.y - 4.0 {
-            y = sr.min.y - gap - est.y;
-        }
-        x = x.clamp(full.min.x + 4.0, (full.max.x - 4.0 - est.x).max(full.min.x + 4.0));
-        y = y.clamp(full.min.y + 4.0, (full.max.y - 4.0 - est.y).max(full.min.y + 4.0));
-        let start = pos2(x, y);
-
-        let accent = edit.accent();
-        let task_mode = !edit.tasks.is_empty();
-        let mut act: Option<Act> = None;
-        let palette_open = edit.palette_open;
-        let color = edit.color;
-        let active_tool = edit.tool;
-        let line_size = edit.sizes.line;
-        let marker_size = edit.sizes.marker;
-        let pixel_size = edit.sizes.pixelate;
-        let font_size = edit.sizes.font;
-        let cfg_colors = edit.cfg.user_colors.clone();
-        let bucket = edit.bucket();
-
-        let mut size = vec2(0.0, 0.0);
-        egui::Area::new(Id::new("rustshot_toolbar"))
-            .fixed_pos(start)
-            .order(Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(Color32::from_black_alpha(175))
-                    .rounding(Rounding::same(6.0))
-                    .inner_margin(Margin::same(5.0))
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
-                        ui.horizontal_wrapped(|ui| {
-                            for (tool, label) in TOOLS {
-                                let on = active_tool == Some(tool);
-                                let fill = if on { accent } else { Color32::from_gray(45) };
-                                let b = icon_button(ui, &self.icons, tool_icon(tool), label, fill);
-                                if b.clicked() {
-                                    act = Some(Act::Tool(tool));
-                                }
-                            }
-                            ui.separator();
-                            if icon_button(ui, &self.icons, "undo-variant", "Undo", Color32::from_gray(45))
-                                .clicked()
-                            {
-                                act = Some(Act::Undo);
-                            }
-                            if icon_button(ui, &self.icons, "redo-variant", "Redo", Color32::from_gray(45))
-                                .clicked()
-                            {
-                                act = Some(Act::Redo);
-                            }
-                            ui.separator();
-                            if icon_button(ui, &self.icons, "minus", "Smaller", Color32::from_gray(45))
-                                .clicked()
-                            {
-                                act = Some(Act::Size(-1));
-                            }
-                            ui.label(format!("{} {bucket}", size_display(bucket, line_size, marker_size, pixel_size, font_size)));
-                            if icon_button(ui, &self.icons, "plus", "Bigger", Color32::from_gray(45))
-                                .clicked()
-                            {
-                                act = Some(Act::Size(1));
-                            }
-                            ui.separator();
-                            let swatch = ui.add(
-                                egui::Button::new("")
-                                    .fill(color)
-                                    .min_size(vec2(26.0, 24.0)),
-                            );
-                            if swatch.clicked() {
-                                act = Some(Act::Palette);
-                            }
-                            ui.separator();
-                            if task_mode {
-                                if icon_button(ui, &self.icons, "accept", "OK", Color32::from_gray(45))
-                                    .clicked()
-                                {
-                                    act = Some(Act::Accept);
-                                }
-                            } else {
-                                if icon_button(ui, &self.icons, "content-copy", "Copy", Color32::from_gray(45))
-                                    .clicked()
-                                {
-                                    act = Some(Act::Copy);
-                                }
-                                if icon_button(ui, &self.icons, "content-save", "Save", Color32::from_gray(45))
-                                    .clicked()
-                                {
-                                    act = Some(Act::Save);
-                                }
-                                if icon_button(ui, &self.icons, "cloud-upload", "Upload", Color32::from_gray(45))
-                                    .clicked()
-                                {
-                                    act = Some(Act::Upload);
-                                }
-                            }
-                            if icon_button(ui, &self.icons, "close", "Exit", Color32::from_gray(45))
-                                .clicked()
-                            {
-                                act = Some(Act::Exit);
-                            }
-                        });
-                        if palette_open {
-                            ui.horizontal_wrapped(|ui| {
-                                for c in &cfg_colors {
-                                    let Some((r, g, b, a)) = config::parse_color(c) else { continue };
-                                    let col = Color32::from_rgba_unmultiplied(r, g, b, a);
-                                    let sw = ui.add(egui::Button::new("").fill(col).min_size(vec2(20.0, 20.0)));
-                                    if sw.clicked() {
-                                        act = Some(Act::Color(col));
-                                    }
-                                }
-                            });
-                        }
-                    });
-                size = ui.min_rect().size();
-            });
-
-        if size.x > 0.0 {
-            edit.toolbar_rect = Some(Rect::from_min_size(start, size));
-        }
-
-        match act {
-            None => {}
-            Some(Act::Tool(t)) => {
-                edit.tool = if edit.tool == Some(t) { None } else { Some(t) };
-                edit.draft = None;
-                edit.stroke_pts.clear();
-            }
-            Some(Act::Undo) => edit.undo(),
-            Some(Act::Redo) => edit.redo(),
-            Some(Act::Size(d)) => edit.adjust_size(d),
-            Some(Act::Color(c)) => {
-                edit.color = c;
-                edit.palette_open = false;
-            }
-            Some(Act::Palette) => edit.palette_open = !edit.palette_open,
-            Some(Act::Copy) => {
-                edit.tasks = vec![Task::Copy];
-                edit.done = true;
-            }
-            Some(Act::Save) => {
-                edit.tasks = vec![Task::Save { path: None }];
-                edit.done = true;
-            }
-            Some(Act::Upload) => {
-                edit.tasks = vec![Task::Upload];
-                edit.done = true;
-            }
-            Some(Act::Exit) => {
-                edit.cancelled = true;
-                edit.done = true;
-            }
-            Some(Act::Accept) => {
-                edit.done = true;
-            }
-        }
-        let _ = ui;
+    fn accent(&self) -> C4 {
+        config::parse_color(&self.cfg.ui_color)
+            .map(|(r, g, b, _)| C4::rgb(r, g, b))
+            .unwrap_or(C4::rgb(0x74, 0x00, 0x96))
     }
 }
 
+// ---------------------------------------------------------------------------
+// Toolbar layout + actions
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
 enum Act {
     Tool(Tool),
     Undo,
     Redo,
     Size(i32),
-    Color(Color32),
+    Color(C4),
     Palette,
     Copy,
     Save,
@@ -1514,17 +1378,293 @@ enum Act {
     Accept,
 }
 
-impl Edit {
-    fn accent(&self) -> Color32 {
-        config::parse_color(&self.cfg.ui_color)
-            .map(|(r, g, b, _)| Color32::from_rgb(r, g, b))
-            .unwrap_or(Color32::from_rgb(0x74, 0x00, 0x96))
+enum Tile {
+    Btn {
+        act: Act,
+        icon: &'static str,
+        label: &'static str,
+        fill: C4,
+    },
+    Sep,
+    Text(String),
+    Swatch(Act, C4),
+}
+
+impl Tile {
+    fn size(&self, font: Option<&FontArc>) -> (f32, f32) {
+        match self {
+            Tile::Btn { .. } => (BTN, BTN),
+            Tile::Sep => (7.0, BTN),
+            Tile::Text(s) => {
+                let w = font
+                    .map(|f| text_width(f, 12.0, s))
+                    .unwrap_or(s.len() as f32 * 7.0);
+                (w + 8.0, BTN)
+            }
+            Tile::Swatch(..) => (20.0, 20.0),
+        }
     }
+}
+
+struct Toolbar {
+    rect: FRect,
+    items: Vec<(Tile, FRect)>,
+}
+
+impl Toolbar {
+    fn hit(&self, p: Pt) -> Option<Act> {
+        for (tile, r) in &self.items {
+            if hit(*r, p) {
+                return match tile {
+                    Tile::Btn { act, .. } => Some(*act),
+                    Tile::Swatch(act, _) => Some(*act),
+                    Tile::Sep | Tile::Text(_) => None,
+                };
+            }
+        }
+        None
+    }
+}
+
+/// Pack `tiles` into rows at the current cursor, wrapping at `maxw`.
+#[allow(clippy::too_many_arguments)]
+fn pack_rows(
+    tiles: Vec<Tile>,
+    font: Option<&FontArc>,
+    maxw: f32,
+    x: &mut f32,
+    y: &mut f32,
+    rowh: &mut f32,
+    maxx: &mut f32,
+    placed: &mut bool,
+    items: &mut Vec<(Tile, FRect)>,
+) {
+    for tile in tiles {
+        let (w, h) = tile.size(font);
+        if *placed && *x + w > maxw {
+            *x = 0.0;
+            *y += *rowh + GAP;
+            *rowh = 0.0;
+        }
+        items.push((
+            tile,
+            FRect {
+                x: *x,
+                y: *y,
+                w,
+                h,
+            },
+        ));
+        *x += w + GAP;
+        *rowh = (*rowh).max(h);
+        *maxx = (*maxx).max(*x - GAP);
+        *placed = true;
+    }
+}
+
+/// (Re)build the toolbar hit-test/layout for the current edit state.
+fn layout(edit: &mut Edit) {
+    let Some(sr) = edit.sel else {
+        edit.toolbar = None;
+        return;
+    };
+    let (ww, wh) = (edit.shot.size.0 as f32, edit.shot.size.1 as f32);
+    let font = edit.font.clone();
+    let accent = edit.accent();
+    let gray = C4::rgb(45, 45, 45);
+
+    let mut tiles: Vec<Tile> = Vec::new();
+    for (tool, label) in TOOLS {
+        tiles.push(Tile::Btn {
+            act: Act::Tool(tool),
+            icon: tool_icon(tool),
+            label,
+            fill: if edit.tool == Some(tool) { accent } else { gray },
+        });
+    }
+    tiles.push(Tile::Sep);
+    tiles.push(Tile::Btn {
+        act: Act::Undo,
+        icon: "undo-variant",
+        label: "Undo",
+        fill: gray,
+    });
+    tiles.push(Tile::Btn {
+        act: Act::Redo,
+        icon: "redo-variant",
+        label: "Redo",
+        fill: gray,
+    });
+    tiles.push(Tile::Sep);
+    tiles.push(Tile::Btn {
+        act: Act::Size(-1),
+        icon: "minus",
+        label: "Smaller",
+        fill: gray,
+    });
+    let bucket = edit.bucket();
+    let (l, m, p, fo) = (
+        edit.sizes.line,
+        edit.sizes.marker,
+        edit.sizes.pixelate,
+        edit.sizes.font,
+    );
+    tiles.push(Tile::Text(format!(
+        "{} {}",
+        size_display(bucket, l, m, p, fo),
+        bucket
+    )));
+    tiles.push(Tile::Btn {
+        act: Act::Size(1),
+        icon: "plus",
+        label: "Bigger",
+        fill: gray,
+    });
+    tiles.push(Tile::Sep);
+    tiles.push(Tile::Btn {
+        act: Act::Palette,
+        icon: "",
+        label: "",
+        fill: edit.color,
+    });
+    tiles.push(Tile::Sep);
+    if edit.tasks.is_empty() {
+        tiles.push(Tile::Btn {
+            act: Act::Copy,
+            icon: "content-copy",
+            label: "Copy",
+            fill: gray,
+        });
+        tiles.push(Tile::Btn {
+            act: Act::Save,
+            icon: "content-save",
+            label: "Save",
+            fill: gray,
+        });
+        tiles.push(Tile::Btn {
+            act: Act::Upload,
+            icon: "cloud-upload",
+            label: "Upload",
+            fill: gray,
+        });
+    } else {
+        tiles.push(Tile::Btn {
+            act: Act::Accept,
+            icon: "accept",
+            label: "OK",
+            fill: gray,
+        });
+    }
+    tiles.push(Tile::Btn {
+        act: Act::Exit,
+        icon: "close",
+        label: "Exit",
+        fill: gray,
+    });
+
+    let maxw = (ww - 8.0 - 2.0 * PAD).max(40.0);
+    let mut items: Vec<(Tile, FRect)> = Vec::new();
+    let (mut x, mut y, mut rowh, mut maxx, mut placed) = (0.0, 0.0, 0.0, 0.0, false);
+    pack_rows(
+        tiles,
+        font.as_ref(),
+        maxw,
+        &mut x,
+        &mut y,
+        &mut rowh,
+        &mut maxx,
+        &mut placed,
+        &mut items,
+    );
+    if edit.palette_open {
+        let colors: Vec<C4> = edit
+            .cfg
+            .user_colors
+            .iter()
+            .filter_map(|c| config::parse_color(c).map(|(r, g, b, a)| C4::new(r, g, b, a)))
+            .collect();
+        x = 0.0;
+        y += rowh + GAP;
+        rowh = 0.0;
+        placed = false;
+        let swatches: Vec<Tile> = colors
+            .into_iter()
+            .map(|c| Tile::Swatch(Act::Color(c), c))
+            .collect();
+        pack_rows(
+            swatches,
+            font.as_ref(),
+            maxw,
+            &mut x,
+            &mut y,
+            &mut rowh,
+            &mut maxx,
+            &mut placed,
+            &mut items,
+        );
+    }
+
+    let total_w = maxx + 2.0 * PAD;
+    let total_h = y + rowh + 2.0 * PAD;
+    // Center under the selection; flip above when it would overflow.
+    let mut tx = sr.x + sr.w / 2.0 - total_w / 2.0;
+    let mut ty = sr.y1() + 8.0;
+    if ty + total_h > wh - 4.0 {
+        ty = sr.y - 8.0 - total_h;
+    }
+    tx = tx.clamp(4.0, (ww - 4.0 - total_w).max(4.0));
+    ty = ty.clamp(4.0, (wh - 4.0 - total_h).max(4.0));
+    for (_, r) in &mut items {
+        r.x += tx + PAD;
+        r.y += ty + PAD;
+    }
+    edit.toolbar = Some(Toolbar {
+        rect: FRect {
+            x: tx,
+            y: ty,
+            w: total_w,
+            h: total_h,
+        },
+        items,
+    });
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn hit(r: FRect, p: Pt) -> bool {
+    p.x >= r.x && p.x < r.x1() && p.y >= r.y && p.y < r.y1()
+}
+
+fn end_interaction(edit: &mut Edit) {
+    match std::mem::replace(&mut edit.interact, Interact::None) {
+        Interact::Drawing { .. } => {
+            if edit.draft_is_valid() {
+                let d = edit.draft.take().expect("draft exists");
+                edit.commit_object(d);
+            }
+            edit.draft = None;
+            edit.stroke_pts.clear();
+        }
+        Interact::NewSel { moved, .. } => {
+            if !moved {
+                // A plain click selects everything (Flameshot-ish).
+                edit.sel = Some(FRect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: edit.shot.size.0 as f32,
+                    h: edit.shot.size.1 as f32,
+                });
+            }
+            if edit.accept_on_select {
+                edit.done = true;
+                edit.cancelled = false;
+            }
+        }
+        Interact::MoveSel { .. } | Interact::Resize { .. } | Interact::None => {}
+    }
+}
 
 fn size_display(bucket: &str, line: f32, marker: f32, pixel: f32, font: f32) -> String {
     let v = match bucket {
@@ -1536,22 +1676,19 @@ fn size_display(bucket: &str, line: f32, marker: f32, pixel: f32, font: f32) -> 
     format!("{}", v as i32)
 }
 
-fn handle_points(sr: Rect) -> [(Handle, Pos2); 8] {
-    let l = sr.min.x;
-    let r = sr.max.x;
-    let t = sr.min.y;
-    let b = sr.max.y;
-    let cx = sr.center().x;
-    let cy = sr.center().y;
+fn handle_points(sr: FRect) -> [(Handle, Pt); 8] {
+    let (l, r) = (sr.x, sr.x1());
+    let (t, b) = (sr.y, sr.y1());
+    let (cx, cy) = (sr.x + sr.w / 2.0, sr.y + sr.h / 2.0);
     [
-        (Handle::NW, pos2(l, t)),
-        (Handle::N, pos2(cx, t)),
-        (Handle::NE, pos2(r, t)),
-        (Handle::E, pos2(r, cy)),
-        (Handle::SE, pos2(r, b)),
-        (Handle::S, pos2(cx, b)),
-        (Handle::SW, pos2(l, b)),
-        (Handle::W, pos2(l, cy)),
+        (Handle::NW, Pt::new(l, t)),
+        (Handle::N, Pt::new(cx, t)),
+        (Handle::NE, Pt::new(r, t)),
+        (Handle::E, Pt::new(r, cy)),
+        (Handle::SE, Pt::new(r, b)),
+        (Handle::S, Pt::new(cx, b)),
+        (Handle::SW, Pt::new(l, b)),
+        (Handle::W, Pt::new(l, cy)),
     ]
 }
 
@@ -1569,32 +1706,12 @@ fn tool_icon(tool: Tool) -> &'static str {
     }
 }
 
-fn icon_button(
-    ui: &mut egui::Ui,
-    icons: &Icons,
-    name: &str,
-    label: &str,
-    fill: Color32,
-) -> egui::Response {
-    match icons.get(name) {
-        Some(t) => ui
-            .add(
-                egui::Button::image((t.id(), vec2(20.0, 20.0)))
-                    .fill(fill)
-                    .min_size(vec2(26.0, 26.0)),
-            )
-            .on_hover_text(label),
-        None => ui
-            .add(egui::Button::new(label).fill(fill).min_size(vec2(0.0, 24.0))),
-    }
-}
-
-fn handle_cursor(h: Handle) -> CursorIcon {
+fn handle_cursor(h: Handle) -> Cursor {
     match h {
-        Handle::NW | Handle::SE => CursorIcon::ResizeNwSe,
-        Handle::NE | Handle::SW => CursorIcon::ResizeNeSw,
-        Handle::N | Handle::S => CursorIcon::ResizeVertical,
-        Handle::E | Handle::W => CursorIcon::ResizeHorizontal,
+        Handle::NW | Handle::SE => Cursor::SizeNWSE,
+        Handle::NE | Handle::SW => Cursor::SizeNESW,
+        Handle::N | Handle::S => Cursor::SizeNS,
+        Handle::E | Handle::W => Cursor::SizeWE,
     }
 }
 
@@ -1616,7 +1733,7 @@ fn resize_rect(
     orig: FRect,
     cur: Pt,
     aspect: f32,
-    mods: &Modifiers,
+    mods: &Mods,
     img: (f32, f32),
 ) -> FRect {
     let cur = Pt {
@@ -1680,11 +1797,62 @@ fn resize_rect(
     r
 }
 
-fn to_pt_clamped(p: Pt, origin: Pos2, inv: f32, full: Rect) -> Pos2 {
-    let mut x = origin.x + p.x * inv;
-    let y = origin.y + p.y * inv;
-    x = x.min(full.max.x - 330.0).max(full.min.x);
-    pos2(x, y)
+fn text_box_rect(win_w: f32, td: &TextDraft, font_px: f32) -> FRect {
+    let w = 320.0;
+    let h = (font_px * 1.5).max(font_px + 6.0);
+    let x = td.pos.x.min((win_w - 330.0).max(0.0));
+    FRect {
+        x,
+        y: td.pos.y,
+        w,
+        h,
+    }
+}
+
+fn prev_boundary(s: &str, i: usize) -> usize {
+    s[..i]
+        .char_indices()
+        .next_back()
+        .map(|(k, _)| k)
+        .unwrap_or(0)
+}
+
+fn next_boundary(s: &str, i: usize) -> usize {
+    s[i..].char_indices().nth(1).map(|(k, _)| i + k).unwrap_or(s.len())
+}
+
+/// Fill a rect of the premultiplied pixmap with translucent black.
+fn dim_rect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, alpha: u8) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let Some(r) = tiny_skia::Rect::from_xywh(x, y, w, h) else { return };
+    let paint = Paint {
+        shader: Shader::SolidColor(Color::from_rgba8(0, 0, 0, alpha)),
+        anti_alias: false,
+        ..Default::default()
+    };
+    pm.fill_rect(r, &paint, Transform::identity(), None);
+}
+
+/// Copy a premultiplied pixmap into an unpremultiplied RGBA buffer.
+fn unpremul_pm(pm: &Pixmap) -> PixBuf {
+    let mut out = PixBuf::new(pm.width(), pm.height());
+    for (s, d) in pm.data().chunks_exact(4).zip(out.as_raw_mut().chunks_exact_mut(4)) {
+        let a = s[3] as u32;
+        if a == 255 {
+            d.copy_from_slice(s);
+        } else if a == 0 {
+            d.fill(0);
+        } else {
+            let un = |v: u8| (((v as u32 * 255) + a / 2) / a).min(255) as u8;
+            d[0] = un(s[0]);
+            d[1] = un(s[1]);
+            d[2] = un(s[2]);
+            d[3] = s[3];
+        }
+    }
+    out
 }
 
 /// Copy an unpremultiplied RGBA image into a tiny-skia pixmap.
@@ -1756,7 +1924,7 @@ mod tests {
             w: 100.0,
             h: 50.0,
         };
-        let mods = Modifiers::default();
+        let mods = Mods::default();
         let r = resize_rect(Handle::SE, orig, Pt::new(210.0, 160.0), 2.0, &mods, (1000.0, 1000.0));
         assert_eq!(r.x, 10.0);
         assert_eq!(r.y, 10.0);
@@ -1772,7 +1940,7 @@ mod tests {
             w: 100.0,
             h: 100.0,
         };
-        let mods = Modifiers {
+        let mods = Mods {
             ctrl: true,
             ..Default::default()
         };
@@ -1811,5 +1979,15 @@ mod tests {
             },
         );
         assert_eq!(img.dimensions(), (10, 10));
+    }
+
+    #[test]
+    fn caret_boundaries_stay_on_chars() {
+        let s = "héllo";
+        assert_eq!(next_boundary(s, 0), 1);
+        assert_eq!(next_boundary(s, 1), 3);
+        assert_eq!(prev_boundary(s, 3), 1);
+        assert_eq!(prev_boundary(s, 0), 0);
+        assert_eq!(next_boundary(s, s.len()), s.len());
     }
 }
