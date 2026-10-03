@@ -22,7 +22,7 @@ impl PixBuf {
     #[cfg(test)]
     pub fn from_pixel(w: u32, h: u32, px: [u8; 4]) -> Self {
         let mut p = Self::new(w, h);
-        for c in p.d.chunks_exact_mut(4) {
+        for c in p.d.as_chunks_mut::<4>().0 {
             c.copy_from_slice(&px);
         }
         p
@@ -101,7 +101,7 @@ impl PixBuf {
             png::ColorType::Rgba => buf,
             png::ColorType::Rgb => {
                 let mut o = Vec::with_capacity((w as usize * h as usize) * 4);
-                for c in buf.chunks_exact(3) {
+                for c in buf.as_chunks::<3>().0 {
                     o.extend_from_slice(c);
                     o.push(255);
                 }

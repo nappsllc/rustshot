@@ -255,8 +255,29 @@ pub fn text_height(font: &FontArc, px: f32) -> f32 {
 mod tests {
     use super::*;
 
-    fn font() -> FontArc {
-        FontArc::try_from_vec(std::fs::read("C:\\Windows\\Fonts\\segoeui.ttf").unwrap()).unwrap()
+    /// Any recognizable system UI font — the test only needs real glyph
+    /// metrics. Candidates cover windows/macos/linux; `None` means the host
+    /// has no font we know and the test skips instead of panicking.
+    fn font() -> Option<FontArc> {
+        const CANDIDATES: &[&str] = &[
+            r"C:\Windows\Fonts\segoeui.ttf",
+            r"C:\Windows\Fonts\arial.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Verdana.ttf",
+            "/Library/Fonts/Arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        ];
+        for path in CANDIDATES {
+            if let Ok(bytes) = std::fs::read(path)
+                && let Ok(f) = FontArc::try_from_vec(bytes)
+            {
+                return Some(f);
+            }
+        }
+        None
     }
 
     #[test]
@@ -282,13 +303,16 @@ mod tests {
             assert_eq!(f.d[(9 * stride + 9) * 4], 0);
             f.stroke_rect(4.0, 4.0, 8.0, 8.0, 1.5, C4::rgb(0, 255, 0));
         }
-        let found = fb.chunks_exact(4).any(|p| p[1] > 100 && p[0] < 100);
+        let found = fb.as_chunks::<4>().0.iter().any(|p| p[1] > 100 && p[0] < 100);
         assert!(found, "stroke produced no green pixels");
     }
 
     #[test]
     fn text_measures_and_draws() {
-        let f = font();
+        let Some(f) = font() else {
+            eprintln!("skipping: no known system font on this host");
+            return;
+        };
         let w = text_width(&f, 14.0, "Hello");
         assert!(w > 20.0 && w < 200.0, "width {w}");
         let stride = 120;
@@ -298,7 +322,7 @@ mod tests {
             fbw.draw_text(&f, 14.0, "Hi", 4.0, 4.0, C4::rgb(255, 255, 255))
         };
         assert!(adv > 5.0);
-        let lit = fb.chunks_exact(4).filter(|p| p[0] > 128).count();
+        let lit = fb.as_chunks::<4>().0.iter().filter(|p| p[0] > 128).count();
         assert!(lit > 20, "only {lit} lit pixels");
     }
 

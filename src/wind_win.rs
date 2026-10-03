@@ -181,7 +181,7 @@ fn present(hdc: windows::Win32::Graphics::Gdi::HDC, fb: &PixBuf) {
         return;
     }
     let mut bgra = fb.as_raw().clone();
-    for c in bgra.chunks_exact_mut(4) {
+    for c in bgra.as_chunks_mut::<4>().0 {
         c.swap(0, 2);
     }
     let mut bmi: BITMAPINFO = unsafe { std::mem::zeroed() };

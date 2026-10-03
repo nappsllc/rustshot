@@ -657,7 +657,7 @@ fn present(dpy: *mut c_void, win: c_ulong, gc: *mut c_void, fb: &PixBuf) {
         return;
     }
     let mut bgrx = fb.as_raw().clone();
-    for px in bgrx.chunks_exact_mut(4) {
+    for px in bgrx.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
         px[3] = 255;
     }

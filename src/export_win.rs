@@ -81,7 +81,7 @@ fn rgba_to_dib(img: &PixBuf) -> Vec<u8> {
     let raw = img.as_raw();
     for y in (0..h).rev() {
         let row = &raw[y as usize * stride..(y as usize + 1) * stride];
-        for px in row.chunks_exact(4) {
+        for px in row.as_chunks::<4>().0 {
             out.extend_from_slice(&[px[2], px[1], px[0], 0]);
         }
     }

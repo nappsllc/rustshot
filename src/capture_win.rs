@@ -108,7 +108,7 @@ pub fn gdi_capture(x: i32, y: i32, w: u32, h: u32) -> Result<PixBuf> {
             return Err(anyhow!("GetDIBits failed"));
         }
         // GDI hands back BGRA with a meaningless alpha channel.
-        for px in buf.chunks_exact_mut(4) {
+        for px in buf.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
             px[3] = 255;
         }

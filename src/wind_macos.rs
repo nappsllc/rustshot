@@ -781,7 +781,7 @@ fn present(window: *mut c_void, fb: &PixBuf) {
     }
     unsafe {
         let mut rgba = fb.as_raw().clone();
-        for px in rgba.chunks_exact_mut(4) {
+        for px in rgba.as_chunks_mut::<4>().0 {
             px[3] = 255; // frames are opaque; be explicit like wind_win
         }
         let (len, cap) = (rgba.len(), rgba.capacity());
