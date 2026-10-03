@@ -6,6 +6,7 @@ mod hotkey;
 mod icons;
 mod objects;
 mod pixbuf;
+mod uifb;
 
 use anyhow::{anyhow, Result};
 use capture::Shot;
