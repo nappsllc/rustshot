@@ -10,6 +10,8 @@ description = "Screenshot and annotation tool (Flameshot-style, written in Rust)
 ab_glyph = "0.2"
 anyhow = "1"
 png = "0.17"
+
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",

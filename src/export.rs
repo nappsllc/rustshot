@@ -2,10 +2,8 @@ use crate::config::Config;
 use crate::pixbuf::PixBuf;
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
-use std::mem::size_of;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use windows::Win32::System::SystemInformation::GetLocalTime;
 
 #[derive(Clone, Debug)]
 pub enum Task {
@@ -29,9 +27,9 @@ fn day_of_year(year: i32, month: u16, day: u16) -> u32 {
 
 /// Format a Flameshot-style filename pattern (`%F`, `%H`, `%M`, ...).
 pub fn format_filename(pattern: &str) -> String {
-    let t = unsafe { GetLocalTime() };
-    let (y, mo, d) = (t.wYear as i64, t.wMonth as i64, t.wDay as i64);
-    let (h, mi, s) = (t.wHour as i64, t.wMinute as i64, t.wSecond as i64);
+    let (ty, tmo, td, th, tmi, ts) = local_ymdhms();
+    let (y, mo, d) = (ty as i64, tmo as i64, td as i64);
+    let (h, mi, s) = (th as i64, tmi as i64, ts as i64);
     let epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -55,7 +53,7 @@ pub fn format_filename(pattern: &str) -> String {
             'y' => format!("{:02}", y.rem_euclid(100)),
             'm' => format!("{mo:02}"),
             'd' => format!("{d:02}"),
-            'j' => format!("{:03}", day_of_year(t.wYear as i32, t.wMonth, t.wDay)),
+            'j' => format!("{:03}", day_of_year(ty, tmo as u16, td as u16)),
             'p' => (if h < 12 { "AM" } else { "PM" }).to_string(),
             'I' => {
                 let h12 = h % 12;
@@ -76,6 +74,45 @@ pub fn format_filename(pattern: &str) -> String {
         out.push_str(&piece);
     }
     out.replace(':', "-").replace('/', "\u{2044}")
+}
+
+/// Local (year, month, day, hour, min, sec) wall-clock time.
+#[cfg(unix)]
+fn local_ymdhms() -> (i32, u32, u32, u32, u32, u32) {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Tm {
+        sec: i32,
+        min: i32,
+        hour: i32,
+        mday: i32,
+        mon: i32,
+        year: i32,
+        wday: i32,
+        yday: i32,
+        isdst: i32,
+        gmtoff: i64,
+        zone: usize,
+    }
+    unsafe extern "C" {
+        fn time(t: *mut i64) -> i64;
+        fn localtime_r(t: *const i64, tm: *mut Tm) -> *mut Tm;
+    }
+    unsafe {
+        let now = time(core::ptr::null_mut());
+        let mut tm = Tm::default();
+        if localtime_r(&now, &mut tm).is_null() {
+            return (1970, 1, 1, 0, 0, 0);
+        }
+        (
+            tm.year + 1900,
+            tm.mon as u32 + 1,
+            tm.mday as u32,
+            tm.hour as u32,
+            tm.min as u32,
+            tm.sec as u32,
+        )
+    }
 }
 
 pub fn default_save_dir(cfg: &Config) -> PathBuf {
@@ -131,104 +168,6 @@ fn save_image(img: &PixBuf, path: &Path) -> Result<()> {
     }
     img.save(path).context("write png")?;
     Ok(())
-}
-
-/// Run `f` with the system clipboard open (retries if another process holds it).
-fn with_clipboard<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
-    use windows::Win32::System::DataExchange::{CloseClipboard, OpenClipboard};
-    let mut last = String::new();
-    for attempt in 0..6 {
-        match unsafe { OpenClipboard(None) } {
-            Ok(()) => {
-                let r = f();
-                let _ = unsafe { CloseClipboard() };
-                return r;
-            }
-            Err(e) => {
-                last = e.to_string();
-                if attempt < 5 {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
-        }
-    }
-    Err(anyhow!("open clipboard: {last}"))
-}
-
-/// Place one buffer on the open clipboard as `format` (the OS takes ownership).
-fn set_clip_data(format: u32, bytes: &[u8]) -> Result<()> {
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::DataExchange::SetClipboardData;
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-    unsafe {
-        let hglb = GlobalAlloc(GMEM_MOVEABLE, bytes.len()).context("GlobalAlloc")?;
-        let ptr = GlobalLock(hglb);
-        if ptr.is_null() {
-            return Err(anyhow!("GlobalLock failed"));
-        }
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-        let _ = GlobalUnlock(hglb);
-        SetClipboardData(format, Some(HANDLE(hglb.0))).context("SetClipboardData")?;
-    }
-    Ok(())
-}
-
-/// BGRA (bottom-up BGRX) DIB payload for the `CF_DIB` clipboard format.
-fn rgba_to_dib(img: &PixBuf) -> Vec<u8> {
-    use windows::Win32::Graphics::Gdi::{BITMAPINFOHEADER, BI_RGB};
-    let (w, h) = img.dimensions();
-    let stride = w as usize * 4;
-    let mut hdr: BITMAPINFOHEADER = unsafe { std::mem::zeroed() };
-    hdr.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-    hdr.biWidth = w as i32;
-    hdr.biHeight = h as i32; // positive = bottom-up
-    hdr.biPlanes = 1;
-    hdr.biBitCount = 32;
-    hdr.biCompression = BI_RGB.0;
-    let mut out = Vec::with_capacity(size_of::<BITMAPINFOHEADER>() + stride * h as usize);
-    out.extend_from_slice(unsafe {
-        std::slice::from_raw_parts(
-            (&raw const hdr) as *const u8,
-            size_of::<BITMAPINFOHEADER>(),
-        )
-    });
-    let raw = img.as_raw();
-    for y in (0..h).rev() {
-        let row = &raw[y as usize * stride..(y as usize + 1) * stride];
-        for px in row.chunks_exact(4) {
-            out.extend_from_slice(&[px[2], px[1], px[0], 0]);
-        }
-    }
-    out
-}
-
-pub fn copy_to_clipboard(img: &PixBuf) -> Result<()> {
-    use windows::Win32::System::DataExchange::{EmptyClipboard, RegisterClipboardFormatW};
-    use windows::Win32::System::Ole::CF_DIB;
-    use windows::core::w;
-    let png = img.to_png()?;
-    let dib = rgba_to_dib(img);
-    with_clipboard(|| unsafe {
-        EmptyClipboard().context("empty clipboard")?;
-        // "PNG" is the community-standard registered format (CF_PNG).
-        let fmt_png = RegisterClipboardFormatW(w!("PNG"));
-        if fmt_png != 0 {
-            set_clip_data(fmt_png, &png)?;
-        }
-        set_clip_data(CF_DIB.0 as u32, &dib)?;
-        Ok(())
-    })
-}
-
-pub fn copy_text_to_clipboard(text: &str) -> Result<()> {
-    use windows::Win32::System::DataExchange::EmptyClipboard;
-    use windows::Win32::System::Ole::CF_UNICODETEXT;
-    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let bytes: Vec<u8> = wide.iter().flat_map(|u| u.to_le_bytes()).collect();
-    with_clipboard(|| unsafe {
-        EmptyClipboard().context("empty clipboard")?;
-        set_clip_data(CF_UNICODETEXT.0 as u32, &bytes)
-    })
 }
 
 pub fn png_bytes(img: &PixBuf) -> Result<Vec<u8>> {
@@ -341,45 +280,6 @@ fn resolve_save_path(path: &Option<PathBuf>, cfg: &Config) -> Result<PathBuf> {
     }
 }
 
-/// Native save dialog via the classic GetSaveFileNameW (replaces rfd).
-fn save_dialog(dir: &Path, suggested: &str) -> Option<PathBuf> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::UI::Controls::Dialogs::{
-        GetSaveFileNameW, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
-    };
-    use windows::core::{PCWSTR, PWSTR};
-
-    let mut file = vec![0u16; 1024];
-    let name: Vec<u16> = suggested.encode_utf16().collect();
-    let n = name.len().min(file.len());
-    file[..n].copy_from_slice(&name[..n]);
-    let dir_w: Vec<u16> = dir
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let filters: Vec<u16> = "PNG image\0*.png\0\0".encode_utf16().collect();
-    unsafe {
-        let mut ofn: OPENFILENAMEW = std::mem::zeroed();
-        ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
-        ofn.lpstrFilter = PCWSTR(filters.as_ptr());
-        ofn.nFilterIndex = 1;
-        ofn.lpstrFile = PWSTR(file.as_mut_ptr());
-        ofn.nMaxFile = file.len() as u32;
-        ofn.lpstrInitialDir = PCWSTR(dir_w.as_ptr());
-        ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST;
-        if !GetSaveFileNameW(&mut ofn).as_bool() {
-            return None;
-        }
-    }
-    let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
-    let mut p = PathBuf::from(String::from_utf16_lossy(&file[..len]));
-    if p.extension().is_none() {
-        p.set_extension("png");
-    }
-    Some(p)
-}
-
 /// Blocking wait used after the UI has exited (one-shot processes).
 pub fn wait_upload(rx: Receiver<Result<String, String>>, copy_url: bool) -> Option<String> {
     match rx.recv_timeout(Duration::from_secs(120)) {
@@ -411,124 +311,19 @@ fn spawn_upload(png: Vec<u8>, client_id: String) -> Receiver<Result<String, Stri
     rx
 }
 
-fn do_upload(png: &[u8], client_id: &str) -> Result<String, String> {
-    upload_winhttp(png, client_id)
-}
+use imp::save_dialog;
 
-/// Imgur upload over WinHTTP: the OS TLS stack, no Rust HTTP/TLS dependency.
-fn upload_winhttp(png: &[u8], client_id: &str) -> Result<String, String> {
-    use std::ptr;
-    use windows::Win32::Networking::WinHttp::{
-        WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
-        WinHttpQueryDataAvailable, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-        WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE,
-    };
-    use windows::core::{PCWSTR, w};
+#[cfg(windows)]
+#[path = "export_win.rs"]
+mod imp;
+#[cfg(target_os = "linux")]
+#[path = "export_linux.rs"]
+mod imp;
+#[cfg(target_os = "macos")]
+#[path = "export_macos.rs"]
+mod imp;
 
-    struct Handle(*mut std::ffi::c_void);
-    impl Drop for Handle {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe {
-                    let _ = WinHttpCloseHandle(self.0);
-                }
-            }
-        }
-    }
-
-    /// Null-terminated UTF-16, for PCWSTR parameters.
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-
-    let err = |step: &str| format!("{step}: {}", std::io::Error::last_os_error());
-
-    unsafe {
-        let agent = wide("rustshot/0.1");
-        let session = Handle(WinHttpOpen(
-            PCWSTR(agent.as_ptr()),
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            PCWSTR::null(),
-            PCWSTR::null(),
-            0,
-        ));
-        if session.0.is_null() {
-            return Err(err("WinHttpOpen"));
-        }
-        let _ = WinHttpSetTimeouts(session.0, 10_000, 10_000, 30_000, 30_000);
-
-        let host = wide("api.imgur.com");
-        let conn = Handle(WinHttpConnect(session.0, PCWSTR(host.as_ptr()), 443, 0));
-        if conn.0.is_null() {
-            return Err(err("WinHttpConnect"));
-        }
-
-        let object = wide("/3/image?title=rustshot&description=rustshot%20capture");
-        let request = Handle(WinHttpOpenRequest(
-            conn.0,
-            PCWSTR(w!("POST").as_ptr()),
-            PCWSTR(object.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            ptr::null(),
-            WINHTTP_FLAG_SECURE,
-        ));
-        if request.0.is_null() {
-            return Err(err("WinHttpOpenRequest"));
-        }
-
-        // Counted (not NUL-terminated): windows-rs passes slice.len() as the
-        // header block length.
-        let headers: Vec<u16> = format!(
-            "Authorization: Client-ID {client_id}\r\nContent-Type: application/octet-stream"
-        )
-        .encode_utf16()
-        .collect();
-        WinHttpSendRequest(
-            request.0,
-            Some(&headers),
-            Some(png.as_ptr() as *const _),
-            png.len() as u32,
-            png.len() as u32,
-            0,
-        )
-        .map_err(|e| format!("WinHttpSendRequest: {e}"))?;
-        WinHttpReceiveResponse(request.0, ptr::null_mut())
-            .map_err(|e| format!("WinHttpReceiveResponse: {e}"))?;
-
-        let mut body: Vec<u8> = Vec::new();
-        loop {
-            let mut avail = 0u32;
-            WinHttpQueryDataAvailable(request.0, &mut avail)
-                .map_err(|e| format!("WinHttpQueryDataAvailable: {e}"))?;
-            if avail == 0 {
-                break;
-            }
-            let mut buf = vec![0u8; avail as usize];
-            let mut read = 0u32;
-            WinHttpReadData(request.0, buf.as_mut_ptr() as _, avail, &mut read)
-                .map_err(|e| format!("WinHttpReadData: {e}"))?;
-            buf.truncate(read as usize);
-            if buf.is_empty() {
-                break;
-            }
-            body.extend_from_slice(&buf);
-        }
-
-        let text = String::from_utf8_lossy(&body);
-        extract_json_string(&text, "link").ok_or_else(|| format!("no link in response: {text}"))
-    }
-}
-
-/// Minimal `"key": "value"` extraction; avoids pulling in a JSON crate.
-fn extract_json_string(body: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let i = body.find(&needle)? + needle.len();
-    let rest = &body[i..];
-    let q1 = rest.find('"')?;
-    let q2 = rest[q1 + 1..].find('"')? + q1 + 1;
-    Some(rest[q1 + 1..q2].to_string())
-}
+pub use imp::*;
 
 #[cfg(test)]
 mod tests {
@@ -558,15 +353,6 @@ mod tests {
     }
 
     #[test]
-    fn json_extract() {
-        let body = r#"{"data":{"link":"https://i.imgur.com/abc.png","id":"abc"}}"#;
-        assert_eq!(
-            extract_json_string(body, "link").as_deref(),
-            Some("https://i.imgur.com/abc.png")
-        );
-    }
-
-    #[test]
     #[ignore = "live network upload to imgur"]
     fn live_imgur_upload() {
         let img = PixBuf::from_pixel(1, 1, [1, 2, 3, 255]);
@@ -577,40 +363,6 @@ mod tests {
             // shared anonymous client-id, not that the request failed.
             Err(e) if e.contains("\"code\":\"429\"") => {}
             Err(e) => panic!("upload failed: {e}"),
-        }
-    }
-
-    #[test]
-    #[ignore = "live clipboard access"]
-    fn live_clipboard_roundtrip() {
-        use windows::Win32::System::DataExchange::{
-            CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
-            RegisterClipboardFormatW,
-        };
-        use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-        use windows::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
-        use windows::core::w;
-
-        let img = PixBuf::from_pixel(2, 2, [7, 8, 9, 255]);
-        copy_to_clipboard(&img).unwrap();
-        unsafe {
-            assert!(IsClipboardFormatAvailable(CF_DIB.0 as u32).is_ok());
-            assert!(IsClipboardFormatAvailable(RegisterClipboardFormatW(w!("PNG"))).is_ok());
-        }
-
-        copy_text_to_clipboard("hello rustshot").unwrap();
-        unsafe {
-            OpenClipboard(None).unwrap();
-            let h = GetClipboardData(CF_UNICODETEXT.0 as u32).unwrap();
-            let p = GlobalLock(windows::Win32::Foundation::HGLOBAL(h.0)) as *const u16;
-            assert!(!p.is_null());
-            let mut s = Vec::new();
-            while *p.add(s.len()) != 0 {
-                s.push(*p.add(s.len()));
-            }
-            let _ = GlobalUnlock(windows::Win32::Foundation::HGLOBAL(h.0));
-            CloseClipboard().unwrap();
-            assert_eq!(String::from_utf16(&s).unwrap(), "hello rustshot");
         }
     }
 }

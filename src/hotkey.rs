@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::wind::key;
 use std::sync::mpsc::{self, Receiver};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,7 +22,7 @@ impl Hotkeys {
             (1i32, cfg.capture_hotkey.clone(), HotEvent::Capture),
             (2i32, cfg.quit_hotkey.clone(), HotEvent::Quit),
         ];
-        std::thread::spawn(move || hotkey_thread(specs, tx));
+        std::thread::spawn(move || imp::hotkey_thread(specs, tx));
         Self { rx }
     }
 
@@ -34,55 +35,15 @@ impl Hotkeys {
     }
 }
 
-fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>) {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetMessageW, PeekMessageW, MSG, PM_NOREMOVE, WM_HOTKEY,
-    };
-
-    unsafe {
-        // Ensure this thread has a message queue before RegisterHotKey.
-        let mut bootstrap = MSG::default();
-        let _ = PeekMessageW(&mut bootstrap, None, 0, 0, PM_NOREMOVE);
-
-        let mut registered = Vec::new();
-        for (id, spec, _) in &specs {
-            match parse_hotkey(spec) {
-                Some((mods, vk)) => {
-                    let flags = HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT;
-                    match RegisterHotKey(None, *id, flags, vk) {
-                        Ok(()) => registered.push(*id),
-                        Err(e) => {
-                            eprintln!("warning: could not register hotkey {spec:?}: {e}")
-                        }
-                    }
-                }
-                None => eprintln!("warning: invalid hotkey {spec:?}"),
-            }
-        }
-
-        loop {
-            let mut msg = MSG::default();
-            let got = GetMessageW(&mut msg, None, 0, 0);
-            if !got.as_bool() {
-                break; // 0 = WM_QUIT, negative = error
-            }
-            if msg.message == WM_HOTKEY {
-                let which = msg.wParam.0 as i32;
-                if let Some((_, _, ev)) = specs.iter().find(|(id, _, _)| *id == which)
-                    && tx.send(*ev).is_err()
-                {
-                    break; // receiver dropped
-                }
-            }
-        }
-        for id in registered {
-            let _ = UnregisterHotKey(None, id);
-        }
-    }
-}
+#[cfg(windows)]
+#[path = "hotkey_win.rs"]
+mod imp;
+#[cfg(target_os = "linux")]
+#[path = "hotkey_linux.rs"]
+mod imp;
+#[cfg(target_os = "macos")]
+#[path = "hotkey_macos.rs"]
+mod imp;
 
 /// Parse things like `Meta+Shift+X`, `Ctrl+Alt+Shift+Q`, `PrintScreen`.
 /// Returns `(modifier flags, virtual-key code)` for `RegisterHotKey`.
@@ -135,22 +96,22 @@ fn key_vk(lower: &str) -> Option<u32> {
         return Some(0x70 + n - 1); // VK_F1..VK_F12
     }
     let vk = match lower {
-        "space" => 0x20,
-        "enter" | "return" => 0x0D,
-        "esc" | "escape" => 0x1B,
-        "tab" => 0x09,
-        "backspace" => 0x08,
-        "delete" => 0x2E,
-        "insert" => 0x2D,
-        "home" => 0x24,
-        "end" => 0x23,
-        "pageup" => 0x21,
-        "pagedown" => 0x22,
-        "up" => 0x26,
-        "down" => 0x28,
-        "left" => 0x25,
-        "right" => 0x27,
-        "printscreen" | "prtsc" | "print" => 0x2C,
+        "space" => key::SPACE,
+        "enter" | "return" => key::RETURN,
+        "esc" | "escape" => key::ESCAPE,
+        "tab" => key::TAB,
+        "backspace" => key::BACK,
+        "delete" => key::DELETE,
+        "insert" => key::INSERT,
+        "home" => key::HOME,
+        "end" => key::END,
+        "pageup" => key::PAGEUP,
+        "pagedown" => key::PAGEDOWN,
+        "up" => key::UP,
+        "down" => key::DOWN,
+        "left" => key::LEFT,
+        "right" => key::RIGHT,
+        "printscreen" | "prtsc" | "print" => key::PRINTSCREEN,
         _ => return None,
     };
     Some(vk)

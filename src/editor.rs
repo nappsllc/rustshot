@@ -6,16 +6,12 @@ use crate::icons::Icons;
 use crate::objects::{FRect, Obj, Pt};
 use crate::pixbuf::PixBuf;
 use crate::uifb::{text_height, text_width, C4, Fb};
-use crate::wind::{self, Cursor, Driver, Ev, Mods};
+use crate::wind::{self, Cursor, Driver, Ev, Hwnd, Mods};
 use ab_glyph::FontArc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
-};
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -75,7 +71,7 @@ pub fn run(
         font,
         icons,
         notice: None,
-        hwnd: HWND(std::ptr::null_mut()),
+        hwnd: Hwnd::default(),
         mouse: (0, 0),
         focus_tries: 0,
     };
@@ -135,7 +131,7 @@ struct App {
     font: Option<FontArc>,
     icons: Icons,
     notice: Option<(String, Instant)>,
-    hwnd: HWND,
+    hwnd: Hwnd,
     /// Last known mouse position (client == image coordinates).
     mouse: (i32, i32),
     focus_tries: u8,
@@ -387,15 +383,15 @@ impl App {
     }
 
     fn handle_key(&mut self, edit: &mut Edit, vk: u32, repeat: bool, mods: Mods) {
-        let left = vk == VK_LEFT.0 as u32;
-        let right = vk == VK_RIGHT.0 as u32;
-        let up = vk == VK_UP.0 as u32;
-        let down = vk == VK_DOWN.0 as u32;
+        let left = vk == wind::key::LEFT;
+        let right = vk == wind::key::RIGHT;
+        let up = vk == wind::key::UP;
+        let down = vk == wind::key::DOWN;
         let arrows = [left, right, up, down];
         let is_arrow = arrows.iter().any(|a| *a);
-        let escape = vk == VK_ESCAPE.0 as u32;
-        let enter = vk == VK_RETURN.0 as u32;
-        let editing = vk == VK_BACK.0 as u32 || vk == VK_DELETE.0 as u32;
+        let escape = vk == wind::key::ESCAPE;
+        let enter = vk == wind::key::RETURN;
+        let editing = vk == wind::key::BACK || vk == wind::key::DELETE;
         // Auto-repeat: selection nudges and text editing keys repeat,
         // everything else is edge-triggered.
         if repeat && !is_arrow && !editing {
@@ -417,15 +413,15 @@ impl App {
                 td.caret = prev_boundary(&td.text, td.caret);
             } else if right {
                 td.caret = next_boundary(&td.text, td.caret);
-            } else if vk == VK_HOME.0 as u32 {
+            } else if vk == wind::key::HOME {
                 td.caret = 0;
-            } else if vk == VK_END.0 as u32 {
+            } else if vk == wind::key::END {
                 td.caret = td.text.len();
-            } else if vk == VK_BACK.0 as u32 && td.caret > 0 {
+            } else if vk == wind::key::BACK && td.caret > 0 {
                 let p = prev_boundary(&td.text, td.caret);
                 td.text.replace_range(p..td.caret, "");
                 td.caret = p;
-            } else if vk == VK_DELETE.0 as u32 {
+            } else if vk == wind::key::DELETE {
                 let n = next_boundary(&td.text, td.caret);
                 td.text.replace_range(td.caret..n, "");
             }
@@ -816,7 +812,7 @@ impl App {
 }
 
 impl Driver for App {
-    fn on_create(&mut self, hwnd: HWND) {
+    fn on_create(&mut self, hwnd: Hwnd) {
         self.hwnd = hwnd;
         self.pump();
     }
