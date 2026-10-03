@@ -1,6 +1,6 @@
 use crate::config::Config;
 use anyhow::{anyhow, Context, Result};
-use image::RgbaImage;
+use crate::pixbuf::PixBuf;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -113,7 +113,7 @@ pub fn unique_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn save_image(img: &RgbaImage, path: &Path) -> Result<()> {
+fn save_image(img: &PixBuf, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).context("create save directory")?;
@@ -132,7 +132,7 @@ fn save_image(img: &RgbaImage, path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn copy_to_clipboard(img: &RgbaImage) -> Result<()> {
+pub fn copy_to_clipboard(img: &PixBuf) -> Result<()> {
     let mut cb = arboard::Clipboard::new().context("open clipboard")?;
     let data = arboard::ImageData {
         width: img.width() as usize,
@@ -152,18 +152,8 @@ pub fn copy_text_to_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn png_bytes(img: &RgbaImage) -> Result<Vec<u8>> {
-    let mut buf = std::io::Cursor::new(Vec::new());
-    let enc = image::codecs::png::PngEncoder::new(&mut buf);
-    image::ImageEncoder::write_image(
-        enc,
-        img.as_raw(),
-        img.width(),
-        img.height(),
-        image::ExtendedColorType::Rgba8,
-    )
-    .context("encode png")?;
-    Ok(buf.into_inner())
+pub fn png_bytes(img: &PixBuf) -> Result<Vec<u8>> {
+    img.to_png()
 }
 
 pub struct ExportResult {
@@ -176,7 +166,7 @@ pub struct ExportResult {
 /// Run the synchronous export tasks against the final (cropped) image.
 /// `sel_global` is the selection rect in virtual-screen physical coords.
 pub fn run_export(
-    img: &RgbaImage,
+    img: &PixBuf,
     sel_global: (i32, i32),
     tasks: &[Task],
     cfg: &Config,
@@ -500,7 +490,7 @@ mod tests {
     #[test]
     #[ignore = "live network upload to imgur"]
     fn live_imgur_upload() {
-        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]));
+        let img = PixBuf::from_pixel(1, 1, [1, 2, 3, 255]);
         let png = png_bytes(&img).unwrap();
         match do_upload(&png, "313baf0c7b4d3ff") {
             Ok(link) => assert!(link.starts_with("https://i.imgur.com/"), "{link}"),

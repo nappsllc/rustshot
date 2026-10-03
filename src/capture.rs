@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use image::RgbaImage;
+use crate::pixbuf::PixBuf;
 use std::mem::size_of;
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
@@ -86,7 +86,7 @@ pub fn monitors() -> Result<Vec<MonInfo>> {
 }
 
 /// Capture a virtual-screen rect with GDI (`BitBlt` from the screen DC).
-fn gdi_capture(x: i32, y: i32, w: u32, h: u32) -> Result<RgbaImage> {
+fn gdi_capture(x: i32, y: i32, w: u32, h: u32) -> Result<PixBuf> {
     if w == 0 || h == 0 {
         return Err(anyhow!("empty capture region"));
     }
@@ -129,7 +129,7 @@ fn gdi_capture(x: i32, y: i32, w: u32, h: u32) -> Result<RgbaImage> {
             px.swap(0, 2);
             px[3] = 255;
         }
-        RgbaImage::from_raw(w, h, buf).ok_or_else(|| anyhow!("bad capture buffer"))
+        PixBuf::from_raw(w, h, buf).ok_or_else(|| anyhow!("bad capture buffer"))
     }
 }
 
@@ -214,7 +214,7 @@ pub struct Shot {
     /// Scale factor that maps physical pixels to logical points for the
     /// window that will display this shot.
     pub scale: f32,
-    pub image: RgbaImage,
+    pub image: PixBuf,
 }
 
 impl Shot {
@@ -349,7 +349,7 @@ fn parse_signed_pair(s: &str) -> Result<(i32, i32)> {
 }
 
 /// Crop a global rect out of a shot, clamped to its bounds.
-pub fn crop_global(shot: &Shot, rect: (i32, i32, u32, u32)) -> Result<RgbaImage> {
+pub fn crop_global(shot: &Shot, rect: (i32, i32, u32, u32)) -> Result<PixBuf> {
     let (lx, ly) = shot.global_to_image((rect.0, rect.1));
     let x = lx.clamp(0, shot.image.width() as i32 - 1) as u32;
     let y = ly.clamp(0, shot.image.height() as i32 - 1) as u32;
@@ -358,7 +358,7 @@ pub fn crop_global(shot: &Shot, rect: (i32, i32, u32, u32)) -> Result<RgbaImage>
     if w == 0 || h == 0 {
         return Err(anyhow!("region is outside the captured screen"));
     }
-    Ok(image::imageops::crop_imm(&shot.image, x, y, w, h).to_image())
+    Ok(shot.image.crop(x, y, w, h))
 }
 
 #[cfg(test)]

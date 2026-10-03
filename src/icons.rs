@@ -1,3 +1,4 @@
+use crate::pixbuf::PixBuf;
 use eframe::egui::{ColorImage, Context, TextureHandle, TextureOptions};
 use std::collections::HashMap;
 
@@ -74,9 +75,9 @@ impl Icons {
     }
 }
 
-fn load_png(ctx: &Context, name: &str, bytes: &[u8]) -> Option<TextureHandle> {
-    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+fn load_png(_ctx: &Context, name: &str, bytes: &[u8]) -> Option<TextureHandle> {
+    let img = PixBuf::from_png(bytes).ok()?;
     let size = [img.width() as usize, img.height() as usize];
     let ci = ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-    Some(ctx.load_texture(format!("icon_{name}"), ci, TextureOptions::LINEAR))
+    Some(_ctx.load_texture(format!("icon_{name}"), ci, TextureOptions::LINEAR))
 }

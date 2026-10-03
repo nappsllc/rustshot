@@ -4,6 +4,7 @@ use crate::export::{self, Task};
 use crate::hotkey::{HotEvent, Hotkeys};
 use crate::icons::Icons;
 use crate::objects::{self, FRect, Obj, Pt};
+use crate::pixbuf::PixBuf;
 use ab_glyph::FontArc;
 use eframe::egui;
 use egui::epaint::ColorImage;
@@ -169,7 +170,7 @@ enum State {
 
 /// Work to do after the overlay has been hidden again.
 struct FinishJob {
-    img: image::RgbaImage,
+    img: PixBuf,
     sel_global: (i32, i32),
     tasks: Vec<Task>,
     cfg: Config,
@@ -1687,7 +1688,7 @@ fn to_pt_clamped(p: Pt, origin: Pos2, inv: f32, full: Rect) -> Pos2 {
 }
 
 /// Copy an unpremultiplied RGBA image into a tiny-skia pixmap.
-fn image_to_pixmap(img: &image::RgbaImage) -> Option<Pixmap> {
+fn image_to_pixmap(img: &PixBuf) -> Option<Pixmap> {
     let mut pm = Pixmap::new(img.width(), img.height())?;
     let src = img.as_raw();
     let dst = pm.data_mut();
@@ -1702,7 +1703,7 @@ fn image_to_pixmap(img: &image::RgbaImage) -> Option<Pixmap> {
 }
 
 /// Crop a rect from a premultiplied pixmap, returning unpremultiplied RGBA.
-fn crop_to_image(pm: &Pixmap, r: FRect) -> image::RgbaImage {
+fn crop_to_image(pm: &Pixmap, r: FRect) -> PixBuf {
     let pw = pm.width() as i32;
     let ph = pm.height() as i32;
     let x0 = r.x.floor().max(0.0) as i32;
@@ -1712,7 +1713,7 @@ fn crop_to_image(pm: &Pixmap, r: FRect) -> image::RgbaImage {
     let w = (x1 - x0).max(1) as u32;
     let h = (y1 - y0).max(1) as u32;
     let data = pm.data();
-    let mut out = image::RgbaImage::new(w, h);
+    let mut out = PixBuf::new(w, h);
     for y in 0..h {
         for x in 0..w {
             let sx = (x0.max(0) as u32 + x).min(pm.width() - 1);
@@ -1728,11 +1729,7 @@ fn crop_to_image(pm: &Pixmap, r: FRect) -> image::RgbaImage {
                     (((v as u32 * 255) + a / 2) / a).min(255) as u8
                 }
             };
-            out.put_pixel(
-                x,
-                y,
-                image::Rgba([un(data[si]), un(data[si + 1]), un(data[si + 2]), data[si + 3]]),
-            );
+            out.put_pixel(x, y, [un(data[si]), un(data[si + 1]), un(data[si + 2]), data[si + 3]]);
         }
     }
     out
@@ -1787,7 +1784,7 @@ mod tests {
 
     #[test]
     fn pixmap_roundtrip_preserves_opaque() {
-        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]));
+        let img = PixBuf::from_pixel(4, 4, [10, 20, 30, 255]);
         let pm = image_to_pixmap(&img).unwrap();
         let back = crop_to_image(
             &pm,
@@ -1798,7 +1795,7 @@ mod tests {
                 h: 4.0,
             },
         );
-        assert_eq!(back.get_pixel(0, 0).0, [10, 20, 30, 255]);
+        assert_eq!(back.get_pixel(0, 0), [10, 20, 30, 255]);
     }
 
     #[test]

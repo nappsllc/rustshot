@@ -5,6 +5,7 @@ mod export;
 mod hotkey;
 mod icons;
 mod objects;
+mod pixbuf;
 
 use anyhow::{anyhow, Result};
 use capture::Shot;
