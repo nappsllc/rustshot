@@ -1,10 +1,10 @@
 use crate::config::Config;
 use anyhow::{anyhow, Context, Result};
-use chrono::Local;
 use image::RgbaImage;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use windows::Win32::System::SystemInformation::GetLocalTime;
 
 #[derive(Clone, Debug)]
 pub enum Task {
@@ -18,9 +18,23 @@ pub enum Task {
     Upload,
 }
 
+/// Day of year (1-366) for a civil date.
+fn day_of_year(year: i32, month: u16, day: u16) -> u32 {
+    const CUM: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let m = month.clamp(1, 12) as usize - 1;
+    CUM[m] + day as u32 + if leap && month > 2 { 1 } else { 0 }
+}
+
 /// Format a Flameshot-style filename pattern (`%F`, `%H`, `%M`, ...).
 pub fn format_filename(pattern: &str) -> String {
-    let now = Local::now();
+    let t = unsafe { GetLocalTime() };
+    let (y, mo, d) = (t.wYear as i64, t.wMonth as i64, t.wDay as i64);
+    let (h, mi, s) = (t.wHour as i64, t.wMinute as i64, t.wSecond as i64);
+    let epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let mut out = String::with_capacity(pattern.len() + 8);
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
@@ -29,21 +43,24 @@ pub fn format_filename(pattern: &str) -> String {
             continue;
         }
         let Some(tok) = chars.next() else { break };
-        let fmt = match tok {
-            'F' => "%Y-%m-%d",
-            'T' => "%H:%M:%S",
-            'R' => "%H:%M",
-            'H' => "%H",
-            'M' => "%M",
-            'S' => "%S",
-            'Y' => "%Y",
-            'y' => "%y",
-            'm' => "%m",
-            'd' => "%d",
-            'j' => "%j",
-            'p' => "%p",
-            'I' => "%I",
-            's' => "%s",
+        let piece = match tok {
+            'F' => format!("{y:04}-{mo:02}-{d:02}"),
+            'T' => format!("{h:02}:{mi:02}:{s:02}"),
+            'R' => format!("{h:02}:{mi:02}"),
+            'H' => format!("{h:02}"),
+            'M' => format!("{mi:02}"),
+            'S' => format!("{s:02}"),
+            'Y' => format!("{y:04}"),
+            'y' => format!("{:02}", y.rem_euclid(100)),
+            'm' => format!("{mo:02}"),
+            'd' => format!("{d:02}"),
+            'j' => format!("{:03}", day_of_year(t.wYear as i32, t.wMonth, t.wDay)),
+            'p' => (if h < 12 { "AM" } else { "PM" }).to_string(),
+            'I' => {
+                let h12 = h % 12;
+                format!("{:02}", if h12 == 0 { 12 } else { h12 })
+            }
+            's' => format!("{epoch}"),
             '%' => {
                 out.push('%');
                 continue;
@@ -55,7 +72,7 @@ pub fn format_filename(pattern: &str) -> String {
                 continue;
             }
         };
-        out.push_str(&now.format(fmt).to_string());
+        out.push_str(&piece);
     }
     out.replace(':', "-").replace('/', "\u{2044}")
 }
