@@ -17,19 +17,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install X11 headers
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev desktop-file-utils
       - name: Test
         run: cargo test
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Build
         run: cargo build --release
-      - name: Package
-        run: bash packaging/linux/package.sh
+      - name: Package (tarball, deb, AppImage)
+        run: |
+          bash packaging/linux/package.sh
+          bash packaging/linux/deb.sh
+          bash packaging/linux/appimage.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: rustshot-linux-x86_64
-          path: dist/*.tar.gz
+          name: rustshot-linux
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.AppImage
 
   macos:
     runs-on: macos-latest
@@ -42,10 +48,49 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Bundle
         run: bash packaging/macos/bundle.sh
+      # Signs + notarizes when Apple secrets are configured in the repo;
+      # without them the build stays unsigned (fine for local use — other
+      # Macs need right-click → Open).
+      - name: Sign and notarize
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERT_P12" ]; then
+            echo "APPLE_CERT_P12 not configured — skipping code signing"
+            exit 0
+          fi
+          set -euo pipefail
+          p12="$RUNNER_TEMP/cert.p12"
+          kc="$RUNNER_TEMP/ci-keychain"
+          echo "$APPLE_CERT_P12" | base64 --decode > "$p12"
+          security create-keychain -p ci "$kc"
+          security set-keychain-settings "$kc"
+          security unlock-keychain -p ci "$kc"
+          security import "$p12" -k "$kc" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci "$kc"
+          security list-keychains -d user -s "$kc"
+          id=$(security find-identity -v -p codesigning "$kc" | sed -n 's/.*"\(.*\)".*/\1/p' | head -n1)
+          echo "signing with: $id"
+          codesign --force --options runtime --timestamp --sign "$id" dist/Rustshot.app
+          ditto -c -k --keepParent dist/Rustshot.app "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple dist/Rustshot.app
+          rm -f "$p12"
+          security delete-keychain "$kc"
+      - name: Package (zip + dmg)
+        run: bash packaging/macos/package.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: rustshot-macos-universal
-          path: dist/*.zip
+          name: rustshot-macos
+          path: |
+            dist/*.zip
+            dist/*.dmg
 
   windows:
     runs-on: windows-latest
@@ -60,7 +105,17 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Build
         run: cargo build --release
+      - name: Installer
+        run: |
+          choco install nsis -y --no-progress
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" /DPRODUCT_VERSION=$v packaging\installer.nsi
       - uses: actions/upload-artifact@v4
         with:
           name: rustshot-windows-x86_64
           path: target/release/rustshot.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustshot-windows-installer
+          path: dist/*-setup.exe

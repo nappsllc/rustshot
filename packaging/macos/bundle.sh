@@ -30,6 +30,8 @@ app="dist/Rustshot.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin" "$app/Contents/MacOS/rustshot"
+sips -s format icns packaging/icons/rustshot-256.png \
+  --out "$app/Contents/Resources/rustshot.icns" >/dev/null
 
 cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -40,6 +42,7 @@ cat > "$app/Contents/Info.plist" <<EOF
   <key>CFBundleIdentifier</key><string>com.nappsllc.rustshot</string>
   <key>CFBundleName</key><string>rustshot</string>
   <key>CFBundleDisplayName</key><string>rustshot</string>
+  <key>CFBundleIconFile</key><string>rustshot</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
   <key>CFBundleVersion</key><string>$version</string>
@@ -52,6 +55,4 @@ cat > "$app/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-mkdir -p dist
-(cd dist && zip -qry "rustshot-$version-macos-universal.zip" Rustshot.app)
-echo "wrote dist/rustshot-$version-macos-universal.zip"
+echo "built $app"
