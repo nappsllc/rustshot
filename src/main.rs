@@ -8,7 +8,6 @@ mod objects;
 
 use anyhow::{anyhow, Result};
 use capture::Shot;
-use clap::{Args, Parser, Subcommand};
 use config::Config;
 use editor::{Pending, RunKind, UploadSlot};
 use export::Task;
@@ -17,18 +16,6 @@ use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[derive(Parser)]
-#[command(
-    name = "rustshot",
-    version,
-    about = "Screenshot and annotation tool (Flameshot-style, written in Rust)"
-)]
-struct Cli {
-    #[command(subcommand)]
-    cmd: Option<Cmd>,
-}
-
-#[derive(Subcommand)]
 enum Cmd {
     /// Interactive capture: select a region, annotate, then export (default).
     Gui(CaptureArgs),
@@ -36,10 +23,7 @@ enum Cmd {
     Full(CaptureArgs),
     /// Capture a single monitor (0 = first) directly (add --edit for the editor).
     Screen {
-        /// Monitor index, 0-based.
-        #[arg(short = 'n', long, default_value_t = 0)]
         number: u32,
-        #[command(flatten)]
         args: CaptureArgs,
     },
     /// Run in the background and wait for the global capture hotkey.
@@ -47,44 +31,246 @@ enum Cmd {
     /// Show or validate the config file.
     Config {
         /// Validate the config file and exit non-zero on errors.
-        #[arg(long)]
         check: bool,
     },
 }
 
-#[derive(Args, Clone, Default)]
+#[derive(Clone, Default)]
 struct CaptureArgs {
-    /// Save to this file or directory.
-    #[arg(short = 'p', long)]
+    /// -p, --path: save to this file or directory.
     path: Option<PathBuf>,
-    /// Copy the capture to the clipboard.
-    #[arg(short = 'c', long)]
+    /// -c, --clip: copy the capture to the clipboard.
     clip: bool,
-    /// Write raw PNG bytes to stdout.
-    #[arg(long)]
+    /// --raw: write raw PNG bytes to stdout.
     raw: bool,
-    /// Print the capture geometry as WxH+X+Y to stdout.
-    #[arg(long)]
+    /// --geometry: print the capture geometry as WxH+X+Y to stdout.
     geometry: bool,
-    /// Upload to Imgur and print the URL.
-    #[arg(long)]
+    /// --upload: upload to Imgur and print the URL.
     upload: bool,
-    /// Delay before capturing, in milliseconds.
-    #[arg(short = 'd', long, default_value_t = 0)]
+    /// -d, --delay: delay before capturing, in milliseconds.
     delay: u32,
-    /// Filename pattern override for saving (e.g. "%F_shot").
-    #[arg(short = 'f', long)]
+    /// -f, --filename: filename pattern override for saving (e.g. "%F_shot").
     filename: Option<String>,
-    /// Region to capture/select: WxH+X+Y (virtual-screen coords), "all",
-    /// or "screenN".
-    #[arg(long)]
+    /// --region: WxH+X+Y (virtual-screen coords), "all", or "screenN".
     region: Option<String>,
-    /// Do the capture without showing the editor.
-    #[arg(long)]
+    /// --noedit: do the capture without showing the editor.
     noedit: bool,
-    /// Show the editor (default for gui, opt-in for full/screen).
-    #[arg(long)]
+    /// --edit: show the editor (default for gui, opt-in for full/screen).
     edit: bool,
+}
+
+enum Parsed {
+    /// None = no subcommand given (run the default `gui`).
+    Cmd(Option<Cmd>),
+    Help(String),
+}
+
+const HELP: &str = "\
+rustshot: screenshot and annotation tool (Flameshot-style, written in Rust)
+
+Usage: rustshot [COMMAND] [OPTIONS]
+
+Commands:
+  gui       Interactive capture: select a region, annotate, then export (default)
+  full      Capture the whole desktop directly (add --edit for the editor)
+  screen    Capture a single monitor (0 = first) directly (add --edit for the editor)
+  daemon    Run in the background and wait for the global capture hotkey
+  config    Show or validate the config file (--check)
+  help      Print this help
+
+Options (gui/full/screen):
+  -p, --path <PATH>      Save to this file or directory
+  -c, --clip             Copy the capture to the clipboard
+      --raw              Write raw PNG bytes to stdout
+      --geometry         Print the capture geometry as WxH+X+Y to stdout
+      --upload           Upload to Imgur and print the URL
+  -d, --delay <MS>       Delay before capturing, in milliseconds (default 0)
+  -f, --filename <PAT>   Filename pattern override (e.g. \"%F_shot\")
+      --region <SPEC>    Region: WxH+X+Y (virtual-screen coords), \"all\", or \"screenN\"
+      --noedit           Capture without showing the editor (gui)
+      --edit             Show the editor (full/screen)
+  -n, --number <N>       Monitor index for screen (0-based, default 0)
+      --check            (config) Validate the config file and exit non-zero on errors
+
+Other:
+  -h, --help             Print this help
+  -V, --version          Print version
+";
+
+/// Hand-rolled argument parser (replaces clap for binary size).
+fn parse_from(args: &[String]) -> Result<Parsed, String> {
+    if args.iter().any(|a| a == "-h" || a == "--help")
+        || args.first().map(String::as_str) == Some("help")
+    {
+        return Ok(Parsed::Help(HELP.to_string()));
+    }
+    if let Some(v) = args.first()
+        && (v == "-V" || v == "--version")
+    {
+        return Ok(Parsed::Help(format!(
+            "rustshot {}\n",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+
+    let (name, rest) = match args.first() {
+        Some(a) if !a.starts_with('-') => (Some(a.as_str()), &args[1..]),
+        Some(a) => return Err(format!("unexpected argument '{a}'")),
+        None => (None, args),
+    };
+
+    let cmd = match name {
+        None => None,
+        Some("gui") => Some(Cmd::Gui(parse_capture(rest)?)),
+        Some("full") => Some(Cmd::Full(parse_capture(rest)?)),
+        Some("screen") => {
+            let (number, capture) = parse_screen(rest)?;
+            Some(Cmd::Screen { number, args: capture })
+        }
+        Some("daemon") => {
+            if let Some(a) = rest.first() {
+                return Err(format!("unexpected argument '{a}'"));
+            }
+            Some(Cmd::Daemon)
+        }
+        Some("config") => {
+            let mut check = false;
+            for a in rest {
+                if a == "--check" {
+                    check = true;
+                } else {
+                    return Err(format!("unexpected argument '{a}'"));
+                }
+            }
+            Some(Cmd::Config { check })
+        }
+        Some(other) => return Err(format!("unrecognized command '{other}'")),
+    };
+    Ok(Parsed::Cmd(cmd))
+}
+
+/// Read the value for a flag: inline (`--flag=v`, `-pv`) or the next argument.
+fn opt_value(
+    args: &[String],
+    i: &mut usize,
+    attached: Option<&str>,
+    flag: &str,
+) -> Result<String, String> {
+    if let Some(v) = attached {
+        let v = v.strip_prefix('=').unwrap_or(v);
+        if !v.is_empty() {
+            return Ok(v.to_string());
+        }
+    }
+    *i += 1;
+    args.get(*i)
+        .cloned()
+        .ok_or_else(|| format!("missing value for {flag}"))
+}
+
+fn parse_capture(args: &[String]) -> Result<CaptureArgs, String> {
+    let mut out = CaptureArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        let tok = &args[i];
+        // Long flags, with optional =value.
+        if tok.starts_with("--") {
+            let (name, attached) = match tok.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (tok.as_str(), None),
+            };
+            match name {
+                "--path" => {
+                    out.path = Some(PathBuf::from(opt_value(args, &mut i, attached, name)?))
+                }
+                "--clip" | "--raw" | "--geometry" | "--upload" | "--noedit" | "--edit" => {
+                    if attached.is_some() {
+                        return Err(format!("unexpected value for {name}"));
+                    }
+                    match name {
+                        "--clip" => out.clip = true,
+                        "--raw" => out.raw = true,
+                        "--geometry" => out.geometry = true,
+                        "--upload" => out.upload = true,
+                        "--noedit" => out.noedit = true,
+                        _ => out.edit = true,
+                    }
+                }
+                "--delay" => {
+                    let v = opt_value(args, &mut i, attached, name)?;
+                    out.delay = v
+                        .parse()
+                        .map_err(|_| format!("invalid value for --delay: '{v}'"))?;
+                }
+                "--filename" => out.filename = Some(opt_value(args, &mut i, attached, name)?),
+                "--region" => out.region = Some(opt_value(args, &mut i, attached, name)?),
+                other => return Err(format!("unexpected argument '{other}'")),
+            }
+            i += 1;
+            continue;
+        }
+        // Short flags, possibly clustered (-cf) with inline values (-d500).
+        if tok.starts_with('-') && tok.len() > 1 {
+            let chars: Vec<char> = tok[1..].chars().collect();
+            let mut ci = 0;
+            while ci < chars.len() {
+                match chars[ci] {
+                    'c' => out.clip = true,
+                    'p' | 'd' | 'f' => {
+                        let inline: String = chars[ci + 1..].iter().collect();
+                        let inline = (!inline.is_empty()).then_some(inline.as_str());
+                        let v = opt_value(args, &mut i, inline, &format!("-{}", chars[ci]))?;
+                        match chars[ci] {
+                            'p' => out.path = Some(PathBuf::from(v)),
+                            'd' => {
+                                out.delay = v
+                                    .parse()
+                                    .map_err(|_| format!("invalid value for --delay: '{v}'"))?
+                            }
+                            _ => out.filename = Some(v),
+                        }
+                        ci = chars.len();
+                    }
+                    other => return Err(format!("unexpected argument '-{other}'")),
+                }
+                ci += 1;
+            }
+            i += 1;
+            continue;
+        }
+        return Err(format!("unexpected argument '{tok}'"));
+    }
+    Ok(out)
+}
+
+fn parse_screen(args: &[String]) -> Result<(u32, CaptureArgs), String> {
+    let mut number = 0u32;
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "-n" || a == "--number" {
+            i += 1;
+            let v = args
+                .get(i)
+                .ok_or_else(|| format!("missing value for {a}"))?;
+            number = v
+                .parse()
+                .map_err(|_| format!("invalid value for --number: '{v}'"))?;
+        } else if let Some(v) = a.strip_prefix("--number=") {
+            number = v
+                .parse()
+                .map_err(|_| format!("invalid value for --number: '{v}'"))?;
+        } else if let Some(v) = a.strip_prefix("-n").filter(|v| !v.is_empty()) {
+            number = v
+                .parse()
+                .map_err(|_| format!("invalid value for -n: '{v}'"))?;
+        } else {
+            rest.push(a.clone());
+        }
+        i += 1;
+    }
+    Ok((number, parse_capture(&rest)?))
 }
 
 fn tasks_from(args: &CaptureArgs) -> Vec<Task> {
@@ -171,10 +357,21 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let cmd = match parse_from(&argv) {
+        Ok(Parsed::Cmd(c)) => c.unwrap_or_else(|| Cmd::Gui(CaptureArgs::default())),
+        Ok(Parsed::Help(h)) => {
+            print!("{h}");
+            return Ok(());
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            eprintln!("\nUsage: rustshot [COMMAND] --help");
+            std::process::exit(2);
+        }
+    };
     capture::enable_dpi_awareness();
 
-    let cmd = cli.cmd.unwrap_or(Cmd::Gui(CaptureArgs::default()));
     match cmd {
         Cmd::Config { check } => {
             if check {
@@ -253,6 +450,103 @@ fn run() -> Result<()> {
             let shot =
                 capture::grab_monitor(number as usize).map_err(|e| anyhow!("{e:#}"))?;
             std::process::exit(run_direct(&cfg, &args, shot, None));
+        }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn p(args: &[&str]) -> Result<Parsed, String> {
+        parse_from(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    fn cmd(args: &[&str]) -> Cmd {
+        match p(args).unwrap() {
+            Parsed::Cmd(c) => c.expect("expected a command"),
+            _ => panic!("expected a command, got help"),
+        }
+    }
+
+    #[test]
+    fn default_is_gui() {
+        assert!(matches!(p(&[]).unwrap(), Parsed::Cmd(None)));
+        assert!(matches!(cmd(&["gui"]), Cmd::Gui(_)));
+    }
+
+    #[test]
+    fn gui_flags() {
+        match cmd(&["gui", "-c", "--region", "100x50+0+0", "--upload", "--noedit"]) {
+            Cmd::Gui(a) => {
+                assert!(a.clip && a.upload && a.noedit);
+                assert_eq!(a.region.as_deref(), Some("100x50+0+0"));
+            }
+            _ => panic!("expected gui"),
+        }
+    }
+
+    #[test]
+    fn inline_and_clustered_values() {
+        match cmd(&["full", "--path=out.png", "-d500", "-fx"]) {
+            Cmd::Full(a) => {
+                assert_eq!(a.delay, 500);
+                assert_eq!(a.path.as_deref(), Some(std::path::Path::new("out.png")));
+                assert_eq!(a.filename.as_deref(), Some("x"));
+            }
+            _ => panic!("expected full"),
+        }
+        match cmd(&["gui", "-cd100"]) {
+            Cmd::Gui(a) => {
+                assert!(a.clip);
+                assert_eq!(a.delay, 100);
+            }
+            _ => panic!("expected gui"),
+        }
+    }
+
+    #[test]
+    fn screen_number() {
+        match cmd(&["screen", "-n", "1", "-c"]) {
+            Cmd::Screen { number, args } => {
+                assert_eq!(number, 1);
+                assert!(args.clip);
+            }
+            _ => panic!("expected screen"),
+        }
+        match cmd(&["screen", "--number=2", "--geometry"]) {
+            Cmd::Screen { number, args } => {
+                assert_eq!(number, 2);
+                assert!(args.geometry);
+            }
+            _ => panic!("expected screen"),
+        }
+        match cmd(&["screen"]) {
+            Cmd::Screen { number, .. } => assert_eq!(number, 0),
+            _ => panic!("expected screen"),
+        }
+    }
+
+    #[test]
+    fn config_and_daemon() {
+        assert!(matches!(cmd(&["config", "--check"]), Cmd::Config { check: true }));
+        assert!(matches!(cmd(&["config"]), Cmd::Config { check: false }));
+        assert!(matches!(cmd(&["daemon"]), Cmd::Daemon));
+    }
+
+    #[test]
+    fn errors_and_help() {
+        assert!(p(&["gui", "--bogus"]).is_err());
+        assert!(p(&["bogus"]).is_err());
+        assert!(p(&["gui", "--delay", "x"]).is_err());
+        assert!(p(&["screen", "-n", "x"]).is_err());
+        assert!(p(&["daemon", "-c"]).is_err());
+        assert!(matches!(p(&["--help"]).unwrap(), Parsed::Help(_)));
+        assert!(matches!(p(&["help"]).unwrap(), Parsed::Help(_)));
+        assert!(matches!(p(&["gui", "-h"]).unwrap(), Parsed::Help(_)));
+        match p(&["--version"]).unwrap() {
+            Parsed::Help(h) => assert!(h.contains(env!("CARGO_PKG_VERSION"))),
+            _ => panic!("expected version"),
         }
     }
 }
