@@ -1,9 +1,7 @@
 ﻿use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
+use crate::pixbuf::PixBuf;
+use crate::raster::{Blend, Surf};
 use crate::uifb::C4;
-use tiny_skia::{
-    BlendMode, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, Shader, Stroke as
-    TStroke, Transform,
-};
 
 /// A point in image (physical pixel) coordinates.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -103,76 +101,8 @@ pub enum Obj {
     },
 }
 
-const KAPPA: f32 = 0.552_284_8;
-
-fn to_tiny_color(c: C4) -> tiny_skia::Color {
-    tiny_skia::Color::from_rgba8(c.r, c.g, c.b, c.a)
-}
-
-fn paint(c: C4) -> Paint<'static> {
-    Paint {
-        shader: Shader::SolidColor(to_tiny_color(c)),
-        anti_alias: true,
-        ..Default::default()
-    }
-}
-
-fn stroke(width: f32) -> TStroke {
-    TStroke {
-        width: width.max(0.5),
-        line_cap: LineCap::Round,
-        line_join: LineJoin::Round,
-        ..Default::default()
-    }
-}
-
-fn line_path(a: Pt, b: Pt) -> Option<Path> {
-    let mut pb = PathBuilder::new();
-    pb.move_to(a.x, a.y);
-    pb.line_to(b.x, b.y);
-    pb.finish()
-}
-
-/// Rounded rectangle; radius 0..=min(w,h)/2.
-fn round_rect_path(r: FRect, radius: f32) -> Option<Path> {
-    let rad = radius.min(r.w / 2.0).min(r.h / 2.0).max(0.0);
-    if rad < 0.6 {
-        let mut pb = PathBuilder::new();
-        pb.push_rect(tiny_skia::Rect::from_xywh(r.x, r.y, r.w.max(1.0), r.h.max(1.0))?);
-        return pb.finish();
-    }
-    let (x0, y0, x1, y1) = (r.x, r.y, r.x1(), r.y1());
-    let k = rad * KAPPA;
-    let mut pb = PathBuilder::new();
-    pb.move_to(x0 + rad, y0);
-    pb.line_to(x1 - rad, y0);
-    pb.cubic_to(x1 - rad + k, y0, x1, y0 + rad - k, x1, y0 + rad);
-    pb.line_to(x1, y1 - rad);
-    pb.cubic_to(x1, y1 - rad + k, x1 - rad + k, y1, x1 - rad, y1);
-    pb.line_to(x0 + rad, y1);
-    pb.cubic_to(x0 + rad - k, y1, x0, y1 - rad + k, x0, y1 - rad);
-    pb.line_to(x0, y0 + rad);
-    pb.cubic_to(x0, y0 + rad - k, x0 + rad - k, y0, x0 + rad, y0);
-    pb.finish()
-}
-
-fn ellipse_path(r: FRect) -> Option<Path> {
-    let cx = r.x + r.w / 2.0;
-    let cy = r.y + r.h / 2.0;
-    let rx = (r.w / 2.0).max(0.5);
-    let ry = (r.h / 2.0).max(0.5);
-    let kx = rx * KAPPA;
-    let ky = ry * KAPPA;
-    let mut pb = PathBuilder::new();
-    pb.move_to(cx, cy - ry);
-    pb.cubic_to(cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy);
-    pb.cubic_to(cx + rx, cy + ky, cx + kx, cy + ry, cx, cy + ry);
-    pb.cubic_to(cx - kx, cy + ry, cx - rx, cy + ky, cx - rx, cy);
-    pb.cubic_to(cx - rx, cy - ky, cx - kx, cy - ry, cx, cy - ry);
-    pb.finish()
-}
-
-fn arrow_head(a: Pt, b: Pt, width: f32) -> Option<(Path, Path)> {
+/// Arrow geometry: shaft endpoints plus the filled head triangle.
+fn arrow_geometry(a: Pt, b: Pt, width: f32) -> Option<([Pt; 2], [Pt; 3])> {
     let dx = b.x - a.x;
     let dy = b.y - a.y;
     let len = (dx * dx + dy * dy).sqrt();
@@ -188,47 +118,24 @@ fn arrow_head(a: Pt, b: Pt, width: f32) -> Option<(Path, Path)> {
     let py = ux;
     let p1 = Pt::new(base.x + px * hw, base.y + py * hw);
     let p2 = Pt::new(base.x - px * hw, base.y - py * hw);
-    let mut pb = PathBuilder::new();
-    pb.move_to(b.x, b.y);
-    pb.line_to(p1.x, p1.y);
-    pb.line_to(p2.x, p2.y);
-    pb.close();
-    let head = pb.finish()?;
-    Some((line_path(a, base)?, head))
+    Some(([a, base], [b, p1, p2]))
 }
 
-fn blend_px(data: &mut [u8], width: u32, x: i32, y: i32, h: u32, color: C4, cov: f32) {
-    if x < 0 || y < 0 || x >= width as i32 || y >= h as i32 {
-        return;
-    }
-    let idx = (y as u32 * width + x as u32) as usize * 4;
-    if idx + 3 >= data.len() {
-        return;
-    }
-    // Straight-alpha source blended over the (opaque) premultiplied target.
-    let a = (color.a as f32 * cov.clamp(0.0, 1.0)) / 255.0;
-    if a <= 0.0 {
-        return;
-    }
-    let inv = 1.0 - a;
-    let mut put = |i: usize, sv: u8| {
-        let dv = data[i] as f32;
-        data[i] = (sv as f32 * a + dv * inv).round().clamp(0.0, 255.0) as u8;
-    };
-    put(idx, color.r);
-    put(idx + 1, color.g);
-    put(idx + 2, color.b);
-    put(idx + 3, 255);
-}
-
-fn draw_text(pm: &mut Pixmap, font: &FontArc, size: f32, text: &str, top: Pt, color: C4) {
+fn draw_text(
+    sf: &mut Surf,
+    font: &FontArc,
+    size: f32,
+    text: &str,
+    top: Pt,
+    color: C4,
+) {
+    let (w, h) = (sf.width(), sf.height());
     let scale = PxScale::from(size);
-    let sf = font.as_scaled(scale);
-    let ascent = sf.ascent();
-    let descent = sf.descent(); // negative
-    let gap = sf.line_gap();
+    let sfont = font.as_scaled(scale);
+    let ascent = sfont.ascent();
+    let descent = sfont.descent(); // negative
+    let gap = sfont.line_gap();
     let line_height = (ascent - descent + gap).max(size * 1.1);
-    let (pw, ph) = (pm.width(), pm.height());
     let mut y = top.y + ascent;
     for line in text.split('\n') {
         let mut x = top.x;
@@ -240,17 +147,19 @@ fn draw_text(pm: &mut Pixmap, font: &FontArc, size: f32, text: &str, top: Pt, co
                 og.draw(|gx, gy, cov| {
                     let px = bounds.min.x.floor() as i32 + gx as i32;
                     let py = bounds.min.y.floor() as i32 + gy as i32;
-                    blend_px(pm.data_mut(), pw, px, py, ph, color, cov);
+                    if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+                        sf.blend_px(px, py, color, cov, Blend::Normal);
+                    }
                 });
             }
-            x += sf.h_advance(gid);
+            x += sfont.h_advance(gid);
         }
         y += line_height;
     }
 }
 
-fn pixelate(pm: &mut Pixmap, r: FRect, cell: f32) {
-    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
+fn pixelate(sf: &mut Surf, r: FRect, cell: f32) {
+    let (pw, ph) = (sf.width() as i32, sf.height() as i32);
     let x0 = r.x.max(0.0).floor() as i32;
     let y0 = r.y.max(0.0).floor() as i32;
     let x1 = r.x1().min(pw as f32).ceil() as i32;
@@ -260,7 +169,7 @@ fn pixelate(pm: &mut Pixmap, r: FRect, cell: f32) {
     }
     let c = cell.max(2.0).round();
     let step = (c / 4.0).max(1.0) as i32;
-    let data = pm.data_mut();
+    let Surf { data, .. } = sf;
     let mut cy = y0;
     while cy < y1 {
         let mut cx = x0;
@@ -305,13 +214,13 @@ fn pixelate(pm: &mut Pixmap, r: FRect, cell: f32) {
     }
 }
 
-fn invert(pm: &mut Pixmap, r: FRect) {
-    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
+fn invert(sf: &mut Surf, r: FRect) {
+    let (pw, ph) = (sf.width() as i32, sf.height() as i32);
     let x0 = r.x.max(0.0).floor() as i32;
     let y0 = r.y.max(0.0).floor() as i32;
     let x1 = r.x1().min(pw as f32).ceil() as i32;
     let y1 = r.y1().min(ph as f32).ceil() as i32;
-    let data = pm.data_mut();
+    let Surf { data, .. } = sf;
     for y in y0.max(0)..y1.min(ph) {
         for x in x0.max(0)..x1.min(pw) {
             let i = ((y * pw + x) as usize) * 4;
@@ -323,52 +232,35 @@ fn invert(pm: &mut Pixmap, r: FRect) {
 }
 
 impl Obj {
-    /// Bake this object into the pixmap.
-    pub fn render(&self, pm: &mut Pixmap, font: Option<&FontArc>) {
+    /// Bake this object into the image.
+    pub fn render(&self, buf: &mut PixBuf, font: Option<&FontArc>) {
+        let mut sf = Surf::from_buf(buf);
         match self {
             Obj::Line { a, b, color, width } => {
-                if let Some(path) = line_path(*a, *b) {
-                    pm.stroke_path(&path, &paint(*color), &stroke(*width), Transform::identity(), None);
-                }
+                sf.stroke_polyline(&[*a, *b], *width, *color, Blend::Normal);
             }
             Obj::Marker { a, b, color, width } => {
-                if let Some(path) = line_path(*a, *b) {
-                    let mut p = paint(*color);
-                    p.blend_mode = BlendMode::Multiply;
-                    pm.stroke_path(&path, &p, &stroke(*width), Transform::identity(), None);
-                }
+                sf.stroke_polyline(&[*a, *b], *width, *color, Blend::Multiply);
             }
             Obj::Arrow { a, b, color, width } => {
-                if let Some((shaft, head)) = arrow_head(*a, *b, *width) {
-                    pm.stroke_path(&shaft, &paint(*color), &stroke(*width), Transform::identity(), None);
-                    pm.fill_path(&head, &paint(*color), FillRule::Winding, Transform::identity(), None);
-                } else if let Some(path) = line_path(*a, *b) {
-                    pm.stroke_path(&path, &paint(*color), &stroke(*width), Transform::identity(), None);
+                if let Some((shaft, head)) = arrow_geometry(*a, *b, *width) {
+                    sf.stroke_polyline(&shaft, *width, *color, Blend::Normal);
+                    sf.fill_convex(&head, *color, Blend::Normal);
+                } else {
+                    sf.stroke_polyline(&[*a, *b], *width, *color, Blend::Normal);
                 }
             }
             Obj::Rect { r, color, width } => {
-                let radius = *width;
-                if let Some(path) = round_rect_path(*r, radius) {
-                    pm.stroke_path(&path, &paint(*color), &stroke(*width), Transform::identity(), None);
-                }
+                sf.stroke_round_rect(*r, *width, *width, *color, Blend::Normal);
             }
             Obj::Ellipse { r, color, width } => {
-                if let Some(path) = ellipse_path(*r) {
-                    pm.stroke_path(&path, &paint(*color), &stroke(*width), Transform::identity(), None);
-                }
+                sf.stroke_ellipse(*r, *width, *color, Blend::Normal);
             }
             Obj::Path { pts, color, width } => {
                 if pts.len() < 2 {
                     return;
                 }
-                let mut pb = PathBuilder::new();
-                pb.move_to(pts[0].x, pts[0].y);
-                for p in &pts[1..] {
-                    pb.line_to(p.x, p.y);
-                }
-                if let Some(path) = pb.finish() {
-                    pm.stroke_path(&path, &paint(*color), &stroke(*width), Transform::identity(), None);
-                }
+                sf.stroke_polyline(pts, *width, *color, Blend::Normal);
             }
             Obj::Text {
                 pos,
@@ -377,11 +269,11 @@ impl Obj {
                 size,
             } => {
                 if let Some(font) = font {
-                    draw_text(pm, font, *size, text, *pos, *color);
+                    draw_text(&mut sf, font, *size, text, *pos, *color);
                 }
             }
-            Obj::Pixelate { r, cell } => pixelate(pm, *r, *cell),
-            Obj::Invert { r } => invert(pm, *r),
+            Obj::Pixelate { r, cell } => pixelate(&mut sf, *r, *cell),
+            Obj::Invert { r } => invert(&mut sf, *r),
         }
     }
 }
@@ -400,27 +292,28 @@ mod tests {
     }
 
     #[test]
-    fn renders_line_into_pixmap() {
-        let mut pm = Pixmap::new(20, 20).unwrap();
+    fn renders_line_into_buffer() {
+        let mut img = PixBuf::new(20, 20);
         Obj::Line {
             a: Pt::new(2.0, 2.0),
             b: Pt::new(18.0, 18.0),
             color: C4::rgb(255, 0, 0),
             width: 3.0,
         }
-        .render(&mut pm, None);
+        .render(&mut img, None);
         let i = ((10 * 20 + 10) * 4) as usize;
-        assert_ne!(pm.data()[i], 0, "line should cover the middle pixel");
-        assert_eq!(pm.data()[i + 3], 255);
+        let d = img.as_raw();
+        assert_ne!(d[i], 0, "line should cover the middle pixel");
+        assert_eq!(d[i + 3], 255);
     }
 
     #[test]
     fn pixelate_fills_region() {
-        let mut pm = Pixmap::new(32, 32).unwrap();
+        let mut img = PixBuf::new(32, 32);
         // gradient-ish content: set a few distinct pixels
         for i in 0..(32 * 32) {
             let v = (i % 255) as u8;
-            let d = &mut pm.data_mut()[i * 4..i * 4 + 4];
+            let d = &mut img.as_raw_mut()[i * 4..i * 4 + 4];
             d[0] = v;
             d[1] = 255 - v;
             d[2] = 100;
@@ -435,26 +328,27 @@ mod tests {
             },
             cell: 8.0,
         }
-        .render(&mut pm, None);
+        .render(&mut img, None);
         // Top-left 8x8 cell must now be a solid color.
-        let first = &pm.data()[0..4];
+        let d = img.as_raw();
+        let first = &d[0..4];
         for y in 0..8 {
             for x in 0..8 {
                 let i = (y * 32 + x) as usize * 4;
-                assert_eq!(&pm.data()[i..i + 4], first, "at {x},{y}");
+                assert_eq!(&d[i..i + 4], first, "at {x},{y}");
             }
         }
     }
 
     #[test]
     fn text_render_does_not_panic_without_font() {
-        let mut pm = Pixmap::new(10, 10).unwrap();
+        let mut img = PixBuf::new(10, 10);
         Obj::Text {
             pos: Pt::new(1.0, 1.0),
             text: "hi".into(),
             color: C4::rgb(255, 255, 255),
             size: 8.0,
         }
-        .render(&mut pm, None);
+        .render(&mut img, None);
     }
 }

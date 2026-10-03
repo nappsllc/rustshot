@@ -61,11 +61,6 @@ impl PixBuf {
         [self.d[i], self.d[i + 1], self.d[i + 2], self.d[i + 3]]
     }
 
-    pub fn put_pixel(&mut self, x: u32, y: u32, px: [u8; 4]) {
-        let i = y as usize * self.w as usize + x as usize;
-        self.d[i * 4..i * 4 + 4].copy_from_slice(&px);
-    }
-
     /// Copy a rect out of the buffer (bounds are the caller's contract).
     pub fn crop(&self, x: u32, y: u32, w: u32, h: u32) -> PixBuf {
         debug_assert!(x + w <= self.w && y + h <= self.h);

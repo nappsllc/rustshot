@@ -6,6 +6,7 @@ mod hotkey;
 mod icons;
 mod objects;
 mod pixbuf;
+mod raster;
 mod uifb;
 mod wind;
 

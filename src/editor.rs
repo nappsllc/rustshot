@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tiny_skia::{Color, Paint, Pixmap, Shader, Transform};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
@@ -255,14 +254,7 @@ impl App {
             r.clamp_to(shot.size.0 as f32, shot.size.1 as f32);
             r
         });
-        let Some(base) = image_to_pixmap(&shot.image) else {
-            eprintln!("error: could not allocate annotation surface");
-            if self.one_shot() {
-                self.exit_code.store(1, Ordering::SeqCst);
-                wind::close(self.hwnd);
-            }
-            return;
-        };
+        let base = shot.image.clone();
         let composed = base.clone();
         let sel = initial_sel.filter(|r| !r.is_trivial());
         let accept_now = accept_on_select && sel.is_some();
@@ -873,25 +865,24 @@ impl Driver for App {
 
         // Compose: base + objects, then dim outside the selection, then
         // the live draft (painted over the dim, like the old overlay).
-        let mut pm = edit.composed.clone();
+        let mut img = edit.composed.clone();
         let dim = edit.cfg.contrast_opacity;
         match edit.sel {
-            None => dim_rect(&mut pm, 0.0, 0.0, ww, wh, dim),
+            None => dim_rect(&mut img, 0.0, 0.0, ww, wh, dim),
             Some(sr) => {
-                dim_rect(&mut pm, 0.0, 0.0, ww, sr.y, dim);
-                dim_rect(&mut pm, 0.0, sr.y1(), ww, wh - sr.y1(), dim);
-                dim_rect(&mut pm, 0.0, sr.y, sr.x, sr.h, dim);
-                dim_rect(&mut pm, sr.x1(), sr.y, ww - sr.x1(), sr.h, dim);
+                dim_rect(&mut img, 0.0, 0.0, ww, sr.y, dim);
+                dim_rect(&mut img, 0.0, sr.y1(), ww, wh - sr.y1(), dim);
+                dim_rect(&mut img, 0.0, sr.y, sr.x, sr.h, dim);
+                dim_rect(&mut img, sr.x1(), sr.y, ww - sr.x1(), sr.h, dim);
             }
         }
         if let Some(d) = &edit.draft {
-            d.render(&mut pm, edit.font.as_ref());
+            d.render(&mut img, edit.font.as_ref());
         }
-        let mut fb = unpremul_pm(&pm);
 
         // Chrome, drawn into the display buffer.
-        let stride = fb.width() as usize;
-        let mut f = Fb::new(fb.as_raw_mut(), stride);
+        let stride = img.width() as usize;
+        let mut f = Fb::new(img.as_raw_mut(), stride);
         let accent = edit.accent();
         let font = edit.font.clone();
 
@@ -1064,7 +1055,7 @@ impl Driver for App {
                 }
             }
         }
-        Some(fb)
+        Some(img)
     }
 
     fn cursor(&self) -> Cursor {
@@ -1187,8 +1178,8 @@ struct TextDraft {
 
 struct Edit {
     shot: Shot,
-    base: Pixmap,
-    composed: Pixmap,
+    base: PixBuf,
+    composed: PixBuf,
     objects: Vec<Obj>,
     hist: Vec<Vec<Obj>>,
     hi: usize,
@@ -1821,83 +1812,56 @@ fn next_boundary(s: &str, i: usize) -> usize {
     s[i..].char_indices().nth(1).map(|(k, _)| i + k).unwrap_or(s.len())
 }
 
-/// Fill a rect of the premultiplied pixmap with translucent black.
-fn dim_rect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, alpha: u8) {
-    if w <= 0.0 || h <= 0.0 {
+/// Dim a rect of the image with translucent black (opaque target).
+fn dim_rect(img: &mut PixBuf, x: f32, y: f32, w: f32, h: f32, alpha: u8) {
+    if w <= 0.0 || h <= 0.0 || alpha == 0 {
         return;
     }
-    let Some(r) = tiny_skia::Rect::from_xywh(x, y, w, h) else { return };
-    let paint = Paint {
-        shader: Shader::SolidColor(Color::from_rgba8(0, 0, 0, alpha)),
-        anti_alias: false,
-        ..Default::default()
-    };
-    pm.fill_rect(r, &paint, Transform::identity(), None);
-}
-
-/// Copy a premultiplied pixmap into an unpremultiplied RGBA buffer.
-fn unpremul_pm(pm: &Pixmap) -> PixBuf {
-    let mut out = PixBuf::new(pm.width(), pm.height());
-    for (s, d) in pm.data().chunks_exact(4).zip(out.as_raw_mut().chunks_exact_mut(4)) {
-        let a = s[3] as u32;
-        if a == 255 {
-            d.copy_from_slice(s);
-        } else if a == 0 {
-            d.fill(0);
-        } else {
-            let un = |v: u8| (((v as u32 * 255) + a / 2) / a).min(255) as u8;
-            d[0] = un(s[0]);
-            d[1] = un(s[1]);
-            d[2] = un(s[2]);
-            d[3] = s[3];
+    let (bw, bh) = (img.width() as i32, img.height() as i32);
+    let x0 = x.floor().max(0.0) as i32;
+    let y0 = y.floor().max(0.0) as i32;
+    let x1 = x1_clamp(x, w, bw);
+    let y1 = y1_clamp(y, h, bh);
+    let k = 1.0 - alpha as f32 / 255.0;
+    let data = img.as_raw_mut();
+    for y in y0.max(0)..y1.min(bh) {
+        for x in x0.max(0)..x1.min(bw) {
+            let i = ((y * bw + x) as usize) * 4;
+            for ch in 0..3 {
+                data[i + ch] = (data[i + ch] as f32 * k).round() as u8;
+            }
         }
     }
-    out
 }
 
-/// Copy an unpremultiplied RGBA image into a tiny-skia pixmap.
-fn image_to_pixmap(img: &PixBuf) -> Option<Pixmap> {
-    let mut pm = Pixmap::new(img.width(), img.height())?;
-    let src = img.as_raw();
-    let dst = pm.data_mut();
-    for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
-        let a = s[3] as u16;
-        d[0] = ((s[0] as u16 * a) / 255) as u8;
-        d[1] = ((s[1] as u16 * a) / 255) as u8;
-        d[2] = ((s[2] as u16 * a) / 255) as u8;
-        d[3] = s[3];
-    }
-    Some(pm)
+fn x1_clamp(x: f32, w: f32, bw: i32) -> i32 {
+    (x + w).ceil().min(bw as f32) as i32
 }
 
-/// Crop a rect from a premultiplied pixmap, returning unpremultiplied RGBA.
-fn crop_to_image(pm: &Pixmap, r: FRect) -> PixBuf {
-    let pw = pm.width() as i32;
-    let ph = pm.height() as i32;
+fn y1_clamp(y: f32, h: f32, bh: i32) -> i32 {
+    (y + h).ceil().min(bh as f32) as i32
+}
+
+/// Crop a rect from an unpremultiplied RGBA image (clamped to bounds).
+fn crop_to_image(img: &PixBuf, r: FRect) -> PixBuf {
+    let pw = img.width() as i32;
+    let ph = img.height() as i32;
     let x0 = r.x.floor().max(0.0) as i32;
     let y0 = r.y.floor().max(0.0) as i32;
-    let x1 = r.x1().ceil().min(pw as f32) as i32;
-    let y1 = r.y1().ceil().min(ph as f32) as i32;
+    let x1 = x1_clamp(r.x, r.w, pw);
+    let y1 = y1_clamp(r.y, r.h, ph);
     let w = (x1 - x0).max(1) as u32;
     let h = (y1 - y0).max(1) as u32;
-    let data = pm.data();
+    let data = img.as_raw();
     let mut out = PixBuf::new(w, h);
+    let dst = out.as_raw_mut();
     for y in 0..h {
         for x in 0..w {
-            let sx = (x0.max(0) as u32 + x).min(pm.width() - 1);
-            let sy = (y0.max(0) as u32 + y).min(pm.height() - 1);
-            let si = ((sy * pm.width() + sx) as usize) * 4;
-            let a = data[si + 3] as u32;
-            let un = |v: u8| -> u8 {
-                if a == 0 {
-                    0
-                } else if a == 255 {
-                    v
-                } else {
-                    (((v as u32 * 255) + a / 2) / a).min(255) as u8
-                }
-            };
-            out.put_pixel(x, y, [un(data[si]), un(data[si + 1]), un(data[si + 2]), data[si + 3]]);
+            let sx = (x0.max(0) as u32 + x).min(img.width() - 1);
+            let sy = (y0.max(0) as u32 + y).min(img.height() - 1);
+            let si = ((sy * img.width() + sx) as usize) * 4;
+            let di = ((y * w + x) as usize) * 4;
+            dst[di..di + 4].copy_from_slice(&data[si..si + 4]);
         }
     }
     out
@@ -1951,11 +1915,10 @@ mod tests {
     }
 
     #[test]
-    fn pixmap_roundtrip_preserves_opaque() {
+    fn crop_roundtrip_preserves_opaque() {
         let img = PixBuf::from_pixel(4, 4, [10, 20, 30, 255]);
-        let pm = image_to_pixmap(&img).unwrap();
         let back = crop_to_image(
-            &pm,
+            &img,
             FRect {
                 x: 0.0,
                 y: 0.0,
@@ -1968,7 +1931,7 @@ mod tests {
 
     #[test]
     fn crop_clamps_to_bounds() {
-        let pm = Pixmap::new(10, 10).unwrap();
+        let pm = PixBuf::new(10, 10);
         let img = crop_to_image(
             &pm,
             FRect {
