@@ -24,8 +24,9 @@ cp packaging/icons/rustshot-256.png "$stage/rustshot.png"
 ln -sf rustshot.png "$stage/.DirIcon"
 ln -sf rustshot "$stage/AppRun"
 
-tool="dist/appimagetool.AppImage"
+tool="dist/.cache/appimagetool.AppImage"
 if [ ! -x "$tool" ]; then
+  mkdir -p dist/.cache
   curl -fsSL -o "$tool" \
     https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
   chmod +x "$tool"
