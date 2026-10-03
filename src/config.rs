@@ -63,10 +63,25 @@ impl Default for Config {
 }
 
 pub fn config_dir() -> PathBuf {
-    match std::env::var("APPDATA") {
-        Ok(v) if !v.is_empty() => PathBuf::from(v).join("rustshot"),
-        _ => PathBuf::from("."),
+    #[cfg(windows)]
+    if let Ok(v) = std::env::var("APPDATA")
+        && !v.is_empty()
+    {
+        return PathBuf::from(v).join("rustshot");
     }
+    #[cfg(unix)]
+    if let Ok(v) = std::env::var("XDG_CONFIG_HOME")
+        && !v.is_empty()
+    {
+        return PathBuf::from(v).join("rustshot");
+    }
+    #[cfg(unix)]
+    if let Ok(v) = std::env::var("HOME")
+        && !v.is_empty()
+    {
+        return PathBuf::from(v).join(".config").join("rustshot");
+    }
+    PathBuf::from(".")
 }
 
 pub fn config_path() -> PathBuf {

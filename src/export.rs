@@ -119,8 +119,20 @@ pub fn default_save_dir(cfg: &Config) -> PathBuf {
     if !cfg.save_path.trim().is_empty() {
         return PathBuf::from(&cfg.save_path);
     }
+    #[cfg(windows)]
     if let Ok(pics) = std::env::var("USERPROFILE") {
         let p = PathBuf::from(pics).join("Pictures");
+        if p.exists() {
+            return p;
+        }
+    }
+    #[cfg(unix)]
+    if let Ok(home) = std::env::var("HOME") {
+        let p = PathBuf::from(&home).join("Pictures");
+        if p.exists() {
+            return p;
+        }
+        let p = PathBuf::from(home);
         if p.exists() {
             return p;
         }

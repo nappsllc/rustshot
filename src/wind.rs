@@ -30,17 +30,15 @@ impl Mods {
 
 #[cfg(target_os = "linux")]
 impl Mods {
-    // TODO: read X11 pointer modifier state (XQueryPointer).
     pub fn current() -> Self {
-        Mods::default()
+        imp::current_mods()
     }
 }
 
 #[cfg(target_os = "macos")]
 impl Mods {
-    // TODO: read CGEventSourceFlagsState modifier state.
     pub fn current() -> Self {
-        Mods::default()
+        imp::current_mods()
     }
 }
 
