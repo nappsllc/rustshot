@@ -22,9 +22,9 @@ windows = { version = "0.62", features = [
     "Win32_System_SystemInformation",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
 ] }
 tiny-skia = "0.11"
-xcap = "0.9.8"
 
 [profile.release]
 strip = true

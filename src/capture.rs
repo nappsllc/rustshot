@@ -1,15 +1,21 @@
 use anyhow::{anyhow, Context, Result};
 use image::RgbaImage;
+use std::mem::size_of;
 use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, LPARAM, POINT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
+use windows::Win32::Graphics::Gdi::{
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+    EnumDisplayMonitors, GetDC, GetDIBits, GetMonitorInfoW, ReleaseDC, SelectObject, BI_RGB,
+    BITMAPINFO, DIB_RGB_COLORS, HDC, HGDIOBJ, HMONITOR, MONITORINFO, SRCCOPY,
+};
 use windows::Win32::UI::HiDpi::{
-    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForMonitor, SetProcessDpiAwarenessContext, MDT_EFFECTIVE_DPI,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
-    IsWindowVisible, SetForegroundWindow,
+    IsWindowVisible, SetForegroundWindow, MONITORINFOF_PRIMARY,
 };
-use xcap::Monitor;
 
 /// Must be called before any window or capture happens so that all
 /// coordinates (cursor, monitor rects, GDI blits) are physical pixels.
@@ -37,28 +43,94 @@ impl MonInfo {
     }
 }
 
-fn xcap_mons() -> Result<Vec<Monitor>> {
-    Monitor::all().context("enumerate monitors")
-}
-
+/// Enumerate monitors via `EnumDisplayMonitors` (replaces xcap).
 pub fn monitors() -> Result<Vec<MonInfo>> {
-    let ms = xcap_mons()?;
-    let mut out = Vec::with_capacity(ms.len());
-    for (i, m) in ms.iter().enumerate() {
-        out.push(MonInfo {
-            index: i,
-            x: m.x()?,
-            y: m.y()?,
-            w: m.width()?,
-            h: m.height()?,
-            scale: m.scale_factor().unwrap_or(1.0).max(0.25),
-            primary: m.is_primary().unwrap_or(false),
-        });
+    unsafe extern "system" fn enum_cb(
+        hmon: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
+        unsafe {
+            let out = &mut *(lparam.0 as *mut Vec<MonInfo>);
+            let mut info: MONITORINFO = std::mem::zeroed();
+            info.cbSize = size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(hmon, &mut info).as_bool() {
+                let (mut dpix, mut dpiy) = (96u32, 96u32);
+                if GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dpix, &mut dpiy).is_err() {
+                    dpix = 96;
+                }
+                out.push(MonInfo {
+                    index: out.len(),
+                    x: info.rcMonitor.left,
+                    y: info.rcMonitor.top,
+                    w: (info.rcMonitor.right - info.rcMonitor.left) as u32,
+                    h: (info.rcMonitor.bottom - info.rcMonitor.top) as u32,
+                    scale: (dpix as f32 / 96.0).max(0.25),
+                    primary: info.dwFlags & MONITORINFOF_PRIMARY != 0,
+                });
+            }
+            BOOL(1)
+        }
+    }
+
+    let mut out: Vec<MonInfo> = Vec::new();
+    let slot: *mut Vec<MonInfo> = &mut out;
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(enum_cb), LPARAM(slot as isize));
     }
     if out.is_empty() {
         return Err(anyhow!("no monitors found"));
     }
     Ok(out)
+}
+
+/// Capture a virtual-screen rect with GDI (`BitBlt` from the screen DC).
+fn gdi_capture(x: i32, y: i32, w: u32, h: u32) -> Result<RgbaImage> {
+    if w == 0 || h == 0 {
+        return Err(anyhow!("empty capture region"));
+    }
+    unsafe {
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(Some(screen));
+        let bmp = CreateCompatibleBitmap(screen, w as i32, h as i32);
+        let old = SelectObject(mem, HGDIOBJ(bmp.0));
+        let blit = BitBlt(mem, 0, 0, w as i32, h as i32, Some(screen), x, y, SRCCOPY);
+
+        let mut bmi: BITMAPINFO = std::mem::zeroed();
+        bmi.bmiHeader.biSize = size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = w as i32;
+        bmi.bmiHeader.biHeight = -(h as i32); // top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB.0;
+        let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+        let got = GetDIBits(
+            mem,
+            bmp,
+            0,
+            h,
+            Some(buf.as_mut_ptr() as *mut _),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+
+        let _ = SelectObject(mem, old);
+        let _ = DeleteObject(HGDIOBJ(bmp.0));
+        let _ = DeleteDC(mem);
+        let _ = ReleaseDC(None, screen);
+
+        blit.map_err(|e| anyhow!("screen blit failed: {e}"))?;
+        if got == 0 {
+            return Err(anyhow!("GetDIBits failed"));
+        }
+        // GDI hands back BGRA with a meaningless alpha channel.
+        for px in buf.chunks_exact_mut(4) {
+            px.swap(0, 2);
+            px[3] = 255;
+        }
+        RgbaImage::from_raw(w, h, buf).ok_or_else(|| anyhow!("bad capture buffer"))
+    }
 }
 
 pub fn cursor_pos() -> (i32, i32) {
@@ -168,61 +240,17 @@ fn union_rect(mons: &[MonInfo]) -> (i32, i32, u32, u32) {
     (min_x, min_y, (max_x - min_x) as u32, (max_y - min_y) as u32)
 }
 
-/// Composite `src` into `dst` at (dx, dy). Both plain RGBA buffers.
-fn blit(dst: &mut RgbaImage, dx: i32, dy: i32, src: &RgbaImage) {
-    let (dw, dh) = (dst.width() as i32, dst.height() as i32);
-    let (sw, sh) = (src.width() as i32, src.height() as i32);
-    // Clip to the visible part of dst (handles partial overlaps/monitors off-canvas).
-    let sx0 = 0.max(-dx);
-    let sy0 = 0.max(-dy);
-    let dx0 = 0.max(dx);
-    let dy0 = 0.max(dy);
-    let copy_w = (sw - sx0).min(dw - dx0).max(0);
-    let copy_h = (sh - sy0).min(dh - dy0).max(0);
-    if copy_w <= 0 || copy_h <= 0 {
-        return;
-    }
-    let row_len = copy_w as usize * 4;
-    let drow0 = (dy0 as usize) * dst.width() as usize * 4 + dx0 as usize * 4;
-    let srow0 = (sy0 as usize) * src.width() as usize * 4 + sx0 as usize * 4;
-    let dstride = dst.width() as usize * 4;
-    let sstride = src.width() as usize * 4;
-    let d = dst.as_mut();
-    let s = src.as_raw();
-    for row in 0..copy_h as usize {
-        let di = drow0 + row * dstride;
-        let si = srow0 + row * sstride;
-        d[di..di + row_len].copy_from_slice(&s[si..si + row_len]);
-    }
-}
-
-fn capture_monitor_image(ms: &[Monitor], i: usize) -> Result<RgbaImage> {
-    ms.get(i)
-        .ok_or_else(|| anyhow!("monitor index {i} out of range"))?
-        .capture_image()
-        .with_context(|| format!("capture monitor {i}"))
-}
-
 /// Capture a single monitor.
 pub fn grab_monitor(index: usize) -> Result<Shot> {
-    let ms = xcap_mons()?;
-    let m = ms
+    let mons = monitors()?;
+    let m = mons
         .get(index)
         .ok_or_else(|| anyhow!("monitor index {index} out of range"))?;
-    let info = MonInfo {
-        index,
-        x: m.x()?,
-        y: m.y()?,
-        w: m.width()?,
-        h: m.height()?,
-        scale: m.scale_factor().unwrap_or(1.0).max(0.25),
-        primary: m.is_primary().unwrap_or(false),
-    };
-    let image = capture_monitor_image(&ms, index)?;
+    let image = gdi_capture(m.x, m.y, m.w, m.h)?;
     Ok(Shot {
-        origin: (info.x, info.y),
-        size: (info.w, info.h),
-        scale: info.scale,
+        origin: (m.x, m.y),
+        size: (m.w, m.h),
+        scale: m.scale,
         image,
     })
 }
@@ -231,18 +259,14 @@ pub fn grab_monitor(index: usize) -> Result<Shot> {
 /// Only valid when all monitors share one scale factor (caller checks).
 pub fn grab_span(mons: &[MonInfo]) -> Result<Shot> {
     let (ox, oy, w, h) = union_rect(mons);
-    let scale = uniform_scale(mons).unwrap_or_else(|| mons.first().map(|m| m.scale).unwrap_or(1.0));
-    let mut canvas = RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
-    let ms = xcap_mons()?;
-    for m in mons {
-        let img = capture_monitor_image(&ms, m.index)?;
-        blit(&mut canvas, m.x - ox, m.y - oy, &img);
-    }
+    let scale =
+        uniform_scale(mons).unwrap_or_else(|| mons.first().map(|m| m.scale).unwrap_or(1.0));
+    let image = gdi_capture(ox, oy, w, h)?;
     Ok(Shot {
         origin: (ox, oy),
         size: (w, h),
         scale,
-        image: canvas,
+        image,
     })
 }
 
@@ -349,11 +373,14 @@ mod tests {
     }
 
     #[test]
-    fn blits_clipped() {
-        let mut dst = RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 255]));
-        let src = RgbaImage::from_pixel(4, 4, image::Rgba([9, 9, 9, 255]));
-        blit(&mut dst, -2, -2, &src);
-        assert_eq!(dst.get_pixel(0, 0).0, [9, 9, 9, 255]);
-        assert_eq!(dst.get_pixel(3, 3).0, [0, 0, 0, 255]);
+    #[ignore = "live display access"]
+    fn live_monitor_capture() {
+        enable_dpi_awareness();
+        let mons = monitors().expect("monitors");
+        assert!(!mons.is_empty());
+        let shot = grab_monitor(0).expect("grab monitor 0");
+        assert_eq!(shot.size, (mons[0].w, mons[0].h));
+        assert_eq!(shot.image.dimensions(), shot.size);
+        assert!(shot.scale >= 0.25);
     }
 }
