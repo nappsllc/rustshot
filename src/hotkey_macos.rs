@@ -96,8 +96,8 @@ const NOT_HANDLED: i32 = -9874;
 /// (specs, Sender) parked by the parsing thread; consumed by `install` on
 /// the pump thread. The Sender must live somewhere until then, which is why
 /// the thread publishes instead of registering itself.
-static PENDING: Mutex<Option<([(i32, String, HotEvent); 2], mpsc::Sender<HotEvent>)>> =
-    Mutex::new(None);
+type Pending = ([(i32, String, HotEvent); 2], mpsc::Sender<HotEvent>);
+static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 /// Live registration, from `install` until wind's loop calls `shutdown`.
 /// The box keeps the handler's `user_data` pointer stable.
 static CTX: Mutex<Option<Box<Ctx>>> = Mutex::new(None);

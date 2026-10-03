@@ -251,7 +251,7 @@ fn convert(
 ) -> Result<PixBuf> {
     let (w, h) = (w as usize, h as usize);
     let mut buf = vec![0u8; w * h * 4];
-    let (bx, by) = if iw % w == 0 && ih % h == 0 && w > 0 && h > 0 {
+    let (bx, by) = if iw.is_multiple_of(w) && ih.is_multiple_of(h) && w > 0 && h > 0 {
         (iw / w, ih / h)
     } else {
         (1, 1)
