@@ -270,6 +270,7 @@ pub fn toast(f: &mut Fb, ui: &Ui, msg: &str, kind: ToastKind, screen: (f32, f32)
     text(f, ui, 12.0, msg, r.x + lpad + isz + gap, cy, th.text.fade(k));
 }
 
+#[allow(dead_code)] // wired in Task 9
 fn key_cap(f: &mut Fb, ui: &Ui, x: f32, cy: f32, w: f32, s: &str, k: f32) {
     let h = ui.px(18.0);
     let r = round(FRect { x, y: cy - h / 2.0, w, h });
@@ -277,11 +278,13 @@ fn key_cap(f: &mut Fb, ui: &Ui, x: f32, cy: f32, w: f32, s: &str, k: f32) {
     text(f, ui, 11.0, s, x + (w - tw(ui, 11.0, s)) / 2.0, cy, ui.th.key_text.fade(k));
 }
 
+#[allow(dead_code)] // wired in Task 9
 fn key_w(ui: &Ui, s: &str) -> f32 {
     (tw(ui, 11.0, s) + ui.px(10.0)).max(ui.px(18.0))
 }
 
 /// Dark label + key caps, 8 above `anchor` (below if no room).
+#[allow(dead_code)] // wired in Task 9
 pub fn tooltip(f: &mut Fb, ui: &Ui, anchor: FRect, label: &str, keys: &[&str], screen_w: f32, k: f32) {
     let th = ui.th;
     let (h, gap, kgap) = (ui.px(26.0), ui.px(8.0), ui.px(4.0));
@@ -311,6 +314,7 @@ pub fn tooltip(f: &mut Fb, ui: &Ui, anchor: FRect, label: &str, keys: &[&str], s
 }
 
 /// "Drag to select · Enter to save · Esc to cancel", centred over the dim.
+#[allow(dead_code)] // wired in Task 9
 pub fn hint(f: &mut Fb, ui: &Ui, screen: (f32, f32), k: f32) {
     enum P {
         T(&'static str),

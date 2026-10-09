@@ -2,7 +2,6 @@
 //! ab_glyph text rendering. Draw into an unpremultiplied RGBA buffer via [`Fb`].
 
 use crate::objects::{FRect, Pt};
-use crate::pixbuf::PixBuf;
 use crate::raster::{Blend, Surf};
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 
@@ -23,21 +22,11 @@ impl C4 {
         C4 { r, g, b, a: 255 }
     }
 
-    pub const fn black_alpha(a: u8) -> Self {
-        C4 {
-            r: 0,
-            g: 0,
-            b: 0,
-            a,
-        }
-    }
-
     pub fn with_alpha(self, a: u8) -> Self {
         C4 { a, ..self }
     }
 
     /// Same color with alpha scaled by `k` (clamped 0..=1): fades, disabled.
-    #[allow(dead_code)] // wired in Task 8
     pub fn fade(self, k: f32) -> Self {
         C4 {
             a: (self.a as f32 * k.clamp(0.0, 1.0)).round() as u8,
@@ -178,28 +167,6 @@ impl<'a> Fb<'a> {
         }
     }
 
-    /// Alpha-blit an RGBA source image onto the buffer.
-    pub fn blit(&mut self, x0: i32, y0: i32, src: &PixBuf) {
-        let (sw, sh) = src.dimensions();
-        let s = src.as_raw();
-        let fh = self.height();
-        for y in 0..sh as i32 {
-            let dy = y0 + y;
-            if dy < 0 || dy >= fh {
-                continue;
-            }
-            for x in 0..sw as i32 {
-                let dx = x0 + x;
-                if dx < 0 || dx >= self.stride as i32 {
-                    continue;
-                }
-                let si = (y as usize * sw as usize + x as usize) * 4;
-                let c = C4::new(s[si], s[si + 1], s[si + 2], s[si + 3]);
-                self.blend_px(dx as usize, dy as usize, c);
-            }
-        }
-    }
-
     /// Draw `s` with the top-left corner at (x, y). Returns the advance width.
     pub fn draw_text(
         &mut self,
@@ -242,15 +209,7 @@ impl<'a> Fb<'a> {
         pen - x
     }
 
-    /// Draw `s` centered at (cx, cy).
-    pub fn draw_text_centered(&mut self, font: &FontArc, px: f32, s: &str, cx: f32, cy: f32, c: C4) {
-        let w = text_width(font, px, s);
-        let h = text_height(font, px);
-        self.draw_text(font, px, s, cx - w / 2.0, cy - h / 2.0, c);
-    }
-
     /// Anti-aliased filled circle.
-    #[allow(dead_code)] // wired in Task 8
     pub fn fill_circle(&mut self, cx: f32, cy: f32, r: f32, c: C4) {
         let fh = self.height();
         let x0 = (cx - r - 1.0).floor().max(0.0) as i32;
@@ -269,7 +228,6 @@ impl<'a> Fb<'a> {
     }
 
     /// Circle outline `width` px wide, centred on radius `r`.
-    #[allow(dead_code)] // wired in Task 8
     pub fn stroke_circle(&mut self, cx: f32, cy: f32, r: f32, width: f32, c: C4) {
         let rect = FRect {
             x: cx - r,
@@ -281,14 +239,12 @@ impl<'a> Fb<'a> {
     }
 
     /// Rounded-rect outline `width` px wide, centred on the edge of `r`.
-    #[allow(dead_code)] // wired in Task 8
     pub fn stroke_rounded(&mut self, r: FRect, radius: f32, width: f32, c: C4) {
         self.surf()
             .stroke_round_rect(r, radius, width, c, Blend::Normal);
     }
 
     /// Dashed rectangle outline: `dash` on, `gap` off, clockwise from top-left.
-    #[allow(dead_code)] // wired in Task 8
     pub fn stroke_dashed_rect(&mut self, r: FRect, dash: f32, gap: f32, width: f32, c: C4) {
         if dash <= 0.0 {
             return;

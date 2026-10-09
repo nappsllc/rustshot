@@ -1,6 +1,6 @@
 //! Minimal RGBA8 image buffer with PNG codec, replacing the `image` crate.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -88,27 +88,5 @@ impl PixBuf {
             wr.write_image_data(&self.d).context("png data")?;
         }
         Ok(out)
-    }
-
-    pub fn from_png(bytes: &[u8]) -> Result<PixBuf> {
-        let dec = png::Decoder::new(std::io::Cursor::new(bytes));
-        let mut reader = dec.read_info().context("png info")?;
-        let mut buf = vec![0u8; reader.output_buffer_size()];
-        let info = reader.next_frame(&mut buf).context("png frame")?;
-        buf.truncate(info.buffer_size());
-        let (w, h) = (info.width, info.height);
-        let rgba = match info.color_type {
-            png::ColorType::Rgba => buf,
-            png::ColorType::Rgb => {
-                let mut o = Vec::with_capacity((w as usize * h as usize) * 4);
-                for c in buf.as_chunks::<3>().0 {
-                    o.extend_from_slice(c);
-                    o.push(255);
-                }
-                o
-            }
-            other => return Err(anyhow!("unsupported png color type {other:?}")),
-        };
-        PixBuf::from_raw(w, h, rgba).ok_or_else(|| anyhow!("bad png dimensions"))
     }
 }
