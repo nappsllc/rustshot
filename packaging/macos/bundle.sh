@@ -31,6 +31,7 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin" "$app/Contents/MacOS/rustshot"
 cp LICENSE "$app/Contents/Resources/LICENSE"
+cp THIRD_PARTY_NOTICES.md "$app/Contents/Resources/THIRD_PARTY_NOTICES.md"
 sips -s format icns packaging/icons/rustshot-256.png \
   --out "$app/Contents/Resources/rustshot.icns" >/dev/null
 

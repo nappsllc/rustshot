@@ -8,7 +8,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -19,6 +19,8 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Tag must match Cargo.toml version
@@ -49,18 +51,33 @@ jobs:
     needs: publish
     if: vars.PUBLISH_MSSTORE == 'true'
     runs-on: windows-latest
+    env:
+      MSIX_IDENTITY_NAME: ${{ vars.MSIX_IDENTITY_NAME }}
+      MSIX_PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
+      MSSTORE_TENANT_ID: ${{ secrets.MSSTORE_TENANT_ID }}
+      MSSTORE_CLIENT_ID: ${{ secrets.MSSTORE_CLIENT_ID }}
+      MSSTORE_CLIENT_SECRET: ${{ secrets.MSSTORE_CLIENT_SECRET }}
+      MSSTORE_SELLER_ID: ${{ vars.MSSTORE_SELLER_ID }}
+      MSSTORE_APP_ID: ${{ vars.MSSTORE_APP_ID }}
     steps:
+      - name: Require Store identity variables
+        run: |
+          if (-not $env:MSIX_IDENTITY_NAME -or -not $env:MSIX_PUBLISHER) {
+            Write-Error "MSIX_IDENTITY_NAME and MSIX_PUBLISHER repository variables must be set; the .msix was built with the dev placeholder identity otherwise."
+            exit 1
+          }
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: rustshot-windows-msix
           path: artifacts
-      - uses: microsoft/setup-msstore-cli@v1
+      - uses: microsoft/microsoft-store-apppublisher@v1
       - name: Submit to Partner Center
         run: |
-          msstore reconfigure --tenantId "${{ secrets.MSSTORE_TENANT_ID }}" --sellerId "${{ vars.MSSTORE_SELLER_ID }}" `
-            --clientId "${{ secrets.MSSTORE_CLIENT_ID }}" --clientSecret "${{ secrets.MSSTORE_CLIENT_SECRET }}"
+          msstore reconfigure --tenantId $env:MSSTORE_TENANT_ID --sellerId $env:MSSTORE_SELLER_ID `
+            --clientId $env:MSSTORE_CLIENT_ID --clientSecret $env:MSSTORE_CLIENT_SECRET
           $pkg = Get-ChildItem artifacts\*.msix | Where-Object Name -notlike '*sideload*' | Select-Object -First 1
-          msstore publish $pkg.FullName -id "${{ vars.MSSTORE_APP_ID }}"
+          msstore publish $PWD -i $pkg.FullName -id $env:MSSTORE_APP_ID
 
   winget:
     needs: publish
@@ -71,7 +88,7 @@ jobs:
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
         run: |
-          $v = "${{ github.ref_name }}".TrimStart('v')
-          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/rustshot-$v-setup.exe"
+          $v = $env:GITHUB_REF_NAME.TrimStart('v')
+          $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/rustshot-$v-setup.exe"
           Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
           .\wingetcreate.exe update nappsllc.rustshot --version $v --urls $url --submit --token $env:WINGET_TOKEN

@@ -24,6 +24,7 @@ install -m755 "$bin" "$stage/usr/bin/rustshot"
 install -m644 packaging/linux/rustshot.desktop "$stage/usr/share/applications/rustshot.desktop"
 install -m644 packaging/icons/rustshot-256.png "$stage/usr/share/icons/hicolor/256x256/apps/rustshot.png"
 install -m644 LICENSE "$stage/usr/share/doc/rustshot/copyright"
+install -m644 THIRD_PARTY_NOTICES.md "$stage/usr/share/doc/rustshot/THIRD_PARTY_NOTICES.md"
 
 cat > "$stage/DEBIAN/control" <<EOF
 Package: rustshot

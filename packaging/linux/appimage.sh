@@ -22,6 +22,7 @@ chmod 755 "$stage/rustshot"
 cp packaging/linux/rustshot.desktop "$stage/rustshot.desktop"
 cp packaging/icons/rustshot-256.png "$stage/rustshot.png"
 cp LICENSE "$stage/LICENSE"
+cp THIRD_PARTY_NOTICES.md "$stage/"
 ln -sf rustshot.png "$stage/.DirIcon"
 ln -sf rustshot "$stage/AppRun"
 

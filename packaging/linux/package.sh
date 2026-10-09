@@ -20,6 +20,7 @@ mkdir -p "$stage"
 cp "$bin" "$stage/rustshot"
 cp packaging/linux/rustshot.desktop "$stage/"
 cp LICENSE "$stage/LICENSE"
+cp THIRD_PARTY_NOTICES.md "$stage/"
 cat > "$stage/INSTALL.txt" <<EOF
 rustshot $version (linux x86_64, X11)
 

@@ -15,6 +15,9 @@ manual first submission where noted.
 2. Reserve the name "rustshot" › Product identity. Copy into repo **variables**:
    `MSIX_IDENTITY_NAME` (Package/Identity/Name), `MSIX_PUBLISHER` (CN=…),
    `MSIX_PUBLISHER_DISPLAY`, `MSSTORE_APP_ID` (Store ID), `MSSTORE_SELLER_ID`.
+   Set the identity variables (`MSIX_IDENTITY_NAME`, `MSIX_PUBLISHER`) before
+   pushing the first tag: the release's .msix is built with them, and the
+   `msstore` job fails if they are empty.
 3. First submission by hand: upload `rustshot-<v>-x64.msix` from the release,
    listing text, screenshots, age rating, privacy policy URL
    `https://github.com/nappsllc/rustshot/blob/main/PRIVACY.md`, and the
@@ -30,6 +33,9 @@ manual first submission where noted.
    (`CurrentUser\TrustedPeople` is not honoured by `Add-AppxPackage`):
    `Import-Certificate -FilePath rustshot-sideload.cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople`
 6. Set `PUBLISH_MSSTORE=true`.
+
+Note: the unsigned `rustshot-<v>-x64.msix` attached to GitHub Releases is the
+Store upload package; end users cannot install it directly.
 
 ## winget
 1. Fork https://github.com/microsoft/winget-pkgs under the account that owns the token.
