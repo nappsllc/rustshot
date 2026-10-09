@@ -74,9 +74,41 @@ const CURRENT_TIME: c_ulong = 0;
 /// awareness switch to make.
 pub fn enable_dpi_awareness() {}
 
-/// One `MonInfo` covering the whole root window: X11 has no multi-monitor
-/// concept below the XRandR level, and every coordinate the app uses is
-/// root-relative anyway. Scale is 1.0 (physical pixels).
+#[repr(C)]
+struct XRRMonitorInfo {
+    name: c_ulong,
+    primary: c_int,
+    automatic: c_int,
+    noutput: c_int,
+    x: c_int,
+    y: c_int,
+    width: c_int,
+    height: c_int,
+    mwidth: c_int,
+    mheight: c_int,
+    outputs: *mut c_ulong,
+}
+
+#[link(name = "Xrandr")]
+unsafe extern "C" {
+    fn XRRQueryExtension(dpy: *mut c_void, event_base: *mut c_int, error_base: *mut c_int) -> c_int;
+    fn XRRGetMonitors(dpy: *mut c_void, window: c_ulong, get_active: c_int, n: *mut c_int) -> *mut XRRMonitorInfo;
+    fn XRRFreeMonitors(monitors: *mut XRRMonitorInfo);
+}
+
+/// Map XRandR 1.5 monitor entries `(x, y, w, h, primary)` to `MonInfo`s,
+/// skipping entries without a positive size.
+fn monitors_from_xrr(entries: &[(i32, i32, i32, i32, bool)]) -> Vec<MonInfo> {
+    entries
+        .iter()
+        .filter(|&&(_, _, w, h, _)| w > 0 && h > 0)
+        .map(|&(x, y, w, h, primary)| MonInfo { x, y, w: w as u32, h: h as u32, scale: 1.0, primary })
+        .collect()
+}
+
+/// One `MonInfo` per XRandR 1.5 monitor (root-relative, physical pixels,
+/// scale 1.0); falls back to a single `MonInfo` covering the root window
+/// when XRandR is unavailable or reports nothing.
 pub fn monitors() -> Result<Vec<MonInfo>> {
     crate::wind::init_x11();
     unsafe {
@@ -85,9 +117,27 @@ pub fn monitors() -> Result<Vec<MonInfo>> {
             return Err(anyhow!("cannot open X display"));
         }
         let screen = XDefaultScreen(dpy);
+        let root = XRootWindow(dpy, screen);
+        let mut mons = Vec::new();
+        let (mut eb, mut er) = (0, 0);
+        if XRRQueryExtension(dpy, &mut eb, &mut er) != 0 {
+            let mut n: c_int = 0;
+            let p = XRRGetMonitors(dpy, root, 1, &mut n);
+            if !p.is_null() {
+                let entries: Vec<_> = core::slice::from_raw_parts(p, n.max(0) as usize)
+                    .iter()
+                    .map(|m| (m.x, m.y, m.width, m.height, m.primary != 0))
+                    .collect();
+                mons = monitors_from_xrr(&entries);
+                XRRFreeMonitors(p);
+            }
+        }
         let w = XDisplayWidth(dpy, screen);
         let h = XDisplayHeight(dpy, screen);
         XCloseDisplay(dpy);
+        if !mons.is_empty() {
+            return Ok(mons);
+        }
         if w <= 0 || h <= 0 {
             return Err(anyhow!("no monitors found"));
         }
@@ -246,5 +296,19 @@ pub fn focus_our_window() {
         XSetInputFocus(dpy, win, REVERT_TO_PARENT, CURRENT_TIME);
         XFlush(dpy);
         XCloseDisplay(dpy);
+    }
+}
+
+#[cfg(test)]
+mod xrr_tests {
+    use super::*;
+
+    #[test]
+    fn xrr_mapping() {
+        assert!(monitors_from_xrr(&[]).is_empty());
+        let m = monitors_from_xrr(&[(0, 0, 1920, 1080, true), (1920, 0, 0, 1080, false), (1920, 0, 1280, 1024, false)]);
+        assert_eq!(m.len(), 2);
+        assert!(m[0].primary && !m[1].primary);
+        assert_eq!((m[1].x, m[1].w, m[1].h), (1920, 1280, 1024));
     }
 }
