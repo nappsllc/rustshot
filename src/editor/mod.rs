@@ -1520,6 +1520,174 @@ fn crop_to_image(img: &PixBuf, r: FRect) -> PixBuf {
 mod tests {
     use super::*;
 
+    // ---- developer preview (renders overlay frames to PNG; no display) ----
+
+    fn synthetic_shot() -> Shot {
+        let (w, h) = (1440u32, 900u32);
+        let mut img = PixBuf::from_pixel(w, h, [0, 0, 0, 255]);
+        let mut put = |x0: u32, y0: u32, x1: u32, y1: u32, c: [u8; 3]| {
+            for y in y0..y1.min(h) {
+                for x in x0..x1.min(w) {
+                    let i = (y as usize * w as usize + x as usize) * 4;
+                    img.as_raw_mut()[i..i + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
+                }
+            }
+        };
+        for y in 0..h {
+            let t = y as f32 / h as f32;
+            put(0, y, w, y + 1, [(20.0 + 20.0 * t) as u8, (40.0 + 40.0 * t) as u8, (90.0 + 60.0 * t) as u8]);
+        }
+        put(120, 90, 1320, 810, [245, 246, 248]); // window
+        put(120, 90, 1320, 130, [225, 228, 233]); // title bar
+        put(120, 130, 340, 810, [236, 239, 243]); // sidebar
+        for i in 0..8 {
+            put(140, 160 + i * 40, 320, 182 + i * 40, [200, 206, 216]);
+        }
+        for i in 0..6 {
+            put(370, 160 + i * 60, 1290 - i * 90, 172 + i * 60, [180, 188, 200]);
+        }
+        put(370, 540, 700, 760, [92, 140, 230]);
+        put(740, 540, 1060, 760, [240, 170, 70]);
+        put(1100, 540, 1290, 760, [110, 190, 140]);
+        Shot { origin: (0, 0), size: (w, h), scale: 1.0, image: img }
+    }
+
+    fn preview_app(th: Theme, sel: Option<FRect>) -> App {
+        let theme_name = if th == theme::DARK { "dark" } else { "light" };
+        let cfg = Config { theme: theme_name.into(), ..Config::default() };
+        let font = fonts::load_system_font();
+        let ui_font = fonts::ui_font().or_else(|| font.clone());
+        let shot = synthetic_shot();
+        let base = shot.image.clone();
+        let edit = Edit {
+            shot,
+            composed: base.clone(),
+            base,
+            objects: Vec::new(),
+            hist: vec![Vec::new()],
+            hi: 0,
+            sel,
+            tool: None,
+            draft: None,
+            stroke_pts: Vec::new(),
+            interact: Interact::None,
+            color: C4::rgb(240, 68, 56),
+            sizes: Sizes::from_cfg(&cfg),
+            text: None,
+            tasks: Vec::new(),
+            accept_on_select: false,
+            cfg: cfg.clone(),
+            toolbar: None,
+            palette_open: false,
+            done: false,
+            cancelled: false,
+            dirty: false,
+            notice: None,
+            last_wheel: Instant::now(),
+            font: font.clone(),
+            th,
+            ui_font: ui_font.clone(),
+            hover: None,
+            hover_at: Instant::now(),
+            pressed: None,
+            hot_handle: None,
+        };
+        App {
+            cfg,
+            kind: RunKind::OneShot,
+            hot: None,
+            pending: None,
+            st: State::Edit(Box::new(edit)),
+            exit_code: Arc::new(AtomicI32::new(0)),
+            upload_slot: Arc::new(Mutex::new(None)),
+            font,
+            ui_font,
+            notice: None,
+            hwnd: Hwnd::default(),
+            mouse: (0, 0),
+            focus_tries: 0,
+        }
+    }
+
+    fn edit_of(app: &mut App) -> &mut Edit {
+        match &mut app.st {
+            State::Edit(e) => e,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Selection with the Arrow tool, a Rect and an Arrow object inside it.
+    fn annotated(th: Theme, sel: FRect) -> App {
+        let mut app = preview_app(th, Some(sel));
+        let e = edit_of(&mut app);
+        e.tool = Some(Tool::Arrow);
+        let red = C4::rgb(240, 68, 56);
+        e.objects.push(Obj::Rect {
+            r: FRect { x: sel.x + 40.0, y: sel.y + 40.0, w: sel.w * 0.35, h: sel.h * 0.3 },
+            color: red,
+            width: 3.0,
+        });
+        e.objects.push(Obj::Arrow {
+            a: Pt::new(sel.x + sel.w * 0.8, sel.y + sel.h * 0.8),
+            b: Pt::new(sel.x + sel.w * 0.5, sel.y + sel.h * 0.5),
+            color: red,
+            width: 4.0,
+        });
+        e.dirty = true;
+        app
+    }
+
+    #[test]
+    #[ignore = "writes preview PNGs; set RUSTSHOT_PREVIEW_DIR"]
+    fn render_preview_pngs() {
+        let Some(dir) = std::env::var_os("RUSTSHOT_PREVIEW_DIR") else { return };
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let save = |app: &mut App, name: &str| {
+            let png = app.frame().expect("frame").to_png().unwrap();
+            std::fs::write(dir.join(name), png).unwrap();
+        };
+        let big = FRect { x: 240.0, y: 140.0, w: 960.0, h: 540.0 };
+
+        let mut app = annotated(theme::DARK, big);
+        app.frame();
+        let e = edit_of(&mut app);
+        let copy = e
+            .toolbar
+            .as_ref()
+            .and_then(|t| t.items.iter().position(|i| i.kind == toolbar::Kind::Btn(Act::Copy)))
+            .expect("copy button");
+        e.hover = Some(copy);
+        e.hover_at = Instant::now() - Duration::from_secs(2);
+        e.notice = Some(Toast::new("Size 4", ToastKind::Info));
+        save(&mut app, "dark-toolbar.png");
+
+        let e = edit_of(&mut app);
+        e.palette_open = true;
+        e.hover = None;
+        save(&mut app, "dark-palette.png");
+
+        let mut app = annotated(theme::DARK, FRect { x: 500.0, y: 300.0, w: 380.0, h: 200.0 });
+        save(&mut app, "dark-narrow.png");
+
+        let mut app = annotated(theme::LIGHT, big);
+        let e = edit_of(&mut app);
+        e.hover = Some(copy);
+        e.hover_at = Instant::now() - Duration::from_secs(2);
+        e.notice = Some(Toast::new("Size 4", ToastKind::Info));
+        save(&mut app, "light-toolbar.png");
+
+        let mut app = annotated(theme::DARK, big);
+        let e = edit_of(&mut app);
+        e.tool = Some(Tool::Text);
+        let text = "Check this".to_string();
+        e.text = Some(TextDraft { pos: Pt::new(400.0, 300.0), caret: text.len(), text, at: Instant::now() });
+        save(&mut app, "dark-text.png");
+
+        let mut app = preview_app(theme::DARK, None);
+        save(&mut app, "dark-hint.png");
+    }
+
     #[test]
     fn square_constraint_keeps_quadrant() {
         let s = Pt::new(10.0, 10.0);
