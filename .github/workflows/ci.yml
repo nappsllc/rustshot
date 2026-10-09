@@ -103,12 +103,14 @@ jobs:
           fi
           set -euo pipefail
           kc="$RUNNER_TEMP/mas-keychain"
+          trap 'security delete-keychain "$kc" >/dev/null 2>&1 || true; rm -f "$RUNNER_TEMP"/MAS_*.p12 "$RUNNER_TEMP/rustshot.provisionprofile"' EXIT
           security create-keychain -p ci "$kc"
           security set-keychain-settings "$kc"
           security unlock-keychain -p ci "$kc"
           for v in MAS_APP_CERT_P12 MAS_INSTALLER_CERT_P12; do
             echo "${!v}" | base64 --decode > "$RUNNER_TEMP/$v.p12"
-            security import "$RUNNER_TEMP/$v.p12" -k "$kc" -P "$MAS_CERT_PASSWORD"               -T /usr/bin/codesign -T /usr/bin/productbuild
+            security import "$RUNNER_TEMP/$v.p12" -k "$kc" -P "$MAS_CERT_PASSWORD" \
+              -T /usr/bin/codesign -T /usr/bin/productbuild
             rm -f "$RUNNER_TEMP/$v.p12"
           done
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci "$kc"
@@ -118,7 +120,6 @@ jobs:
           export MAS_PROFILE="$RUNNER_TEMP/rustshot.provisionprofile"
           echo "$MAS_PROVISION_PROFILE" | base64 --decode > "$MAS_PROFILE"
           bash packaging/macos/mas.sh
-          security delete-keychain "$kc"
       # Signs + notarizes when Apple secrets are configured in the repo;
       # without them the build stays unsigned (fine for local use — other
       # Macs need right-click → Open).

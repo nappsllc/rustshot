@@ -203,5 +203,5 @@ jobs:
           git config user.name "rustshot release"
           git config user.email "noreply@github.com"
           git add Casks/rustshot.rb
-          git commit -m "rustshot ${GITHUB_REF_NAME#v}"
+          git diff --cached --quiet || git commit -m "rustshot ${GITHUB_REF_NAME#v}"
           git push origin HEAD
