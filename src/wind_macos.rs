@@ -248,6 +248,10 @@ pub fn invalidate(_hwnd: Hwnd) {
     PRESENT.store(true, Ordering::SeqCst);
 }
 
+/// The event loop reads `tick_ms()` each pass; nothing to re-arm.
+#[allow(dead_code)] // wired in Task 10
+pub fn retime(_hwnd: Hwnd, _ms: u64) {}
+
 /// Position + show the overlay at an exact rect (points, Quartz space) and
 /// take focus.
 pub fn show_at(hwnd: Hwnd, x: i32, y: i32, w: i32, h: i32) {
@@ -344,7 +348,7 @@ fn pump_loop(driver: &mut dyn Driver) -> i32 {
 
         let mut hook: Option<HotkeyHook> = None;
         let mut cursor: Option<Cursor> = None;
-        let mut next_tick = Instant::now() + Duration::from_millis(150);
+        let mut next_tick = Instant::now() + Duration::from_millis(tick_ms());
         loop {
             if QUIT.load(Ordering::SeqCst) {
                 break;
@@ -401,7 +405,7 @@ fn pump_loop(driver: &mut dyn Driver) -> i32 {
                 }
             }
             if !QUIT.load(Ordering::SeqCst) && Instant::now() >= next_tick {
-                next_tick = Instant::now() + Duration::from_millis(150);
+                next_tick = Instant::now() + Duration::from_millis(tick_ms());
                 driver.on_event(Ev::Timer);
                 repaint = true;
             }

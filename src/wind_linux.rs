@@ -9,6 +9,7 @@ use core::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Once;
+use std::time::{Duration, Instant};
 
 // No `x11` crate: libX11 is declared directly (edition 2024 needs `unsafe`
 // around extern blocks). `cargo check` does not link, so this works without
@@ -320,6 +321,10 @@ pub fn invalidate(_hwnd: Hwnd) {
     PRESENT.store(true, Ordering::SeqCst);
 }
 
+/// The event loop reads `tick_ms()` each pass; nothing to re-arm.
+#[allow(dead_code)] // wired in Task 10
+pub fn retime(_hwnd: Hwnd, _ms: u64) {}
+
 /// Position + show the overlay at an exact physical rect and take focus.
 pub fn show_at(hwnd: Hwnd, x: i32, y: i32, w: i32, h: i32) {
     RUN_DPY.with(|slot| {
@@ -402,26 +407,30 @@ pub fn run(driver: &mut dyn Driver) -> i32 {
         let mut down: HashSet<u32> = HashSet::new();
         let mut cursor: Option<Cursor> = None;
         let mut cursors: [c_ulong; 8] = [0; 8];
+        let mut next_tick = Instant::now() + Duration::from_millis(tick_ms());
         loop {
             if QUIT.load(Ordering::SeqCst) {
                 break;
             }
             let mut repaint = false;
             if XPending(dpy) == 0 {
-                // Same 150 ms cadence as wind_win's SetTimer(hwnd, 1, 150).
+                // Sleep until the next tick (150 ms idle, 16 ms animating)
+                // or until X has input.
+                let wait = next_tick.saturating_duration_since(Instant::now()).as_millis() as c_int;
                 let mut pfd = PollFd {
                     fd: XConnectionNumber(dpy),
                     events: POLLIN,
                     revents: 0,
                 };
-                let n = poll(&mut pfd, 1, 150);
+                poll(&mut pfd, 1, wait);
                 if pfd.revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
                     break; // X connection lost
                 }
-                if n == 0 {
-                    driver.on_event(Ev::Timer);
-                    repaint = true; // wndproc invalidates after WM_TIMER
-                }
+            }
+            if Instant::now() >= next_tick {
+                next_tick = Instant::now() + Duration::from_millis(tick_ms());
+                driver.on_event(Ev::Timer);
+                repaint = true; // wndproc invalidates after WM_TIMER
             }
             while XPending(dpy) > 0 && !QUIT.load(Ordering::SeqCst) {
                 let mut ev: XEvent = core::mem::zeroed();

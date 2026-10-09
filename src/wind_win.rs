@@ -67,6 +67,17 @@ pub fn invalidate(hwnd: HWND) {
     }
 }
 
+/// Re-arm the window timer (same id replaces the old interval).
+#[allow(dead_code)] // wired in Task 10
+pub fn retime(hwnd: HWND, ms: u64) {
+    if hwnd.is_invalid() {
+        return;
+    }
+    unsafe {
+        let _ = SetTimer(Some(hwnd), 1, ms as u32, None);
+    }
+}
+
 unsafe extern "system" fn wndproc(
     hwnd: HWND,
     msg: u32,
@@ -256,7 +267,7 @@ pub fn run(driver: &mut dyn Driver) -> i32 {
         match hwnd {
             Ok(hwnd) => {
                 driver.on_create(hwnd);
-                let _ = SetTimer(Some(hwnd), 1, 150, None);
+                let _ = SetTimer(Some(hwnd), 1, SLOW_TICK_MS as u32, None);
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, None, 0, 0).as_bool() {
                     let _ = TranslateMessage(&msg);
