@@ -1,0 +1,36 @@
+id: io.github.nappsllc.rustshot
+runtime: org.freedesktop.Platform
+runtime-version: "24.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: rustshot
+finish-args:
+  # X11-only today (capture + global hotkeys); see metainfo.
+  - --socket=x11
+  - --share=ipc
+  - --share=network
+  - --filesystem=xdg-pictures
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/rustshot/cargo
+modules:
+  - name: rustshot
+    buildsystem: simple
+    build-commands:
+      - cargo --offline build --release --locked
+      - install -Dm755 target/release/rustshot /app/bin/rustshot
+      - install -Dm644 packaging/linux/io.github.nappsllc.rustshot.desktop /app/share/applications/io.github.nappsllc.rustshot.desktop
+      - install -Dm644 packaging/linux/io.github.nappsllc.rustshot.metainfo.xml /app/share/metainfo/io.github.nappsllc.rustshot.metainfo.xml
+      - for s in 128 256 512; do install -Dm644 packaging/icons/rustshot-$s.png /app/share/icons/hicolor/${s}x${s}/apps/io.github.nappsllc.rustshot.png; done
+      - install -Dm644 LICENSE /app/share/licenses/io.github.nappsllc.rustshot/LICENSE
+      - install -Dm644 THIRD_PARTY_NOTICES.md /app/share/licenses/io.github.nappsllc.rustshot/THIRD_PARTY_NOTICES.md
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - dist
+          - _flameshot
+      - cargo-sources.json

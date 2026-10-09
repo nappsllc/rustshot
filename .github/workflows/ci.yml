@@ -24,6 +24,14 @@ jobs:
         run: |
           desktop-file-validate packaging/linux/io.github.nappsllc.rustshot.desktop
           appstreamcli validate --no-net packaging/linux/io.github.nappsllc.rustshot.metainfo.xml
+      - name: Flatpak cargo sources are up to date
+        run: |
+          pip install --user aiohttp tomlkit
+          curl -fsSL -o "$RUNNER_TEMP/fcg.py" \
+            https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+          python3 "$RUNNER_TEMP/fcg.py" Cargo.lock -o "$RUNNER_TEMP/cargo-sources.json"
+          diff -u packaging/flatpak/cargo-sources.json "$RUNNER_TEMP/cargo-sources.json" \
+            || { echo "::error::regenerate packaging/flatpak/cargo-sources.json (see docs/STORES.md)"; exit 1; }
       - name: Test
         run: cargo test
       - name: Clippy
@@ -42,6 +50,19 @@ jobs:
             dist/*.tar.gz
             dist/*.deb
             dist/*.AppImage
+
+  flatpak:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-24.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: rustshot.flatpak
+          manifest-path: packaging/flatpak/io.github.nappsllc.rustshot.yml
+          cache-key: flatpak-builder-${{ github.sha }}
 
   macos:
     runs-on: macos-latest
