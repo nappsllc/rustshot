@@ -133,16 +133,78 @@ fn is_msix() -> bool {
     false
 }
 
-#[allow(dead_code)] // used by the daemon checker (next task)
 const DAY_SECS: u64 = 86_400;
 
 /// A check is due when none has succeeded yet or the last one is a day old.
-#[allow(dead_code)] // used by the daemon checker (next task)
 pub fn due(last_unix: Option<u64>, now_unix: u64) -> bool {
     match last_unix {
         None => true,
         Some(t) => now_unix.saturating_sub(t) >= DAY_SECS,
     }
+}
+
+const STAMP_FILE: &str = "update-check";
+const FIRST_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+const RECHECK: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// Parse the stamp file's text; anything unreadable counts as "never".
+fn parse_stamp(text: &str) -> Option<u64> {
+    text.trim().parse().ok()
+}
+
+/// One checker iteration. Runs `check` only when due; returns the stamp to
+/// persist (success only) and a newer release, if any. Errors are silent
+/// (stderr) and leave the stamp alone.
+fn tick(
+    last: Option<u64>,
+    now: u64,
+    check: impl FnOnce() -> Result<Option<Release>, String>,
+) -> (Option<u64>, Option<Release>) {
+    if !due(last, now) {
+        return (None, None);
+    }
+    match check() {
+        Ok(r) => (Some(now), r),
+        Err(e) => {
+            eprintln!("update check failed: {e}");
+            (None, None)
+        }
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Start the daemon's background checker. `None` when disabled or when the
+/// install is managed by a store. The thread is detached and never blocks exit.
+pub fn spawn_checker(enabled: bool) -> Option<std::sync::mpsc::Receiver<Release>> {
+    if !enabled || managed_install().is_some() {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let dir = crate::config::config_dir();
+        let stamp = dir.join(STAMP_FILE);
+        std::thread::sleep(FIRST_DELAY);
+        loop {
+            let last = std::fs::read_to_string(&stamp).ok().and_then(|t| parse_stamp(&t));
+            let (new_stamp, release) = tick(last, unix_now(), check_now);
+            if let Some(t) = new_stamp {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(&stamp, t.to_string());
+            }
+            if let Some(r) = release
+                && tx.send(r).is_err()
+            {
+                return;
+            }
+            std::thread::sleep(RECHECK);
+        }
+    });
+    Some(rx)
 }
 
 /// Ask GitHub for the latest release; `Some` only if newer than this build.
@@ -184,6 +246,29 @@ pub fn open_url(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_checker_disabled_is_none() {
+        assert!(spawn_checker(false).is_none());
+    }
+
+    #[test]
+    fn stamp_parsing_tolerates_garbage() {
+        assert_eq!(parse_stamp("1700000000
+"), Some(1_700_000_000));
+        assert_eq!(parse_stamp(""), None);
+        assert_eq!(parse_stamp("nope"), None);
+    }
+
+    #[test]
+    fn tick_respects_schedule_and_errors() {
+        let rel = || Release { version: "9.9.9".into(), url: "u".into() };
+        let (s, r) = tick(Some(1000), 1100, || panic!("must not run"));
+        assert_eq!((s, r), (None, None));
+        assert_eq!(tick(None, 5, || Ok(Some(rel()))), (Some(5), Some(rel())));
+        assert_eq!(tick(None, 5, || Ok(None)), (Some(5), None));
+        assert_eq!(tick(None, 5, || Err("x".into())), (None, None));
+    }
 
     const FIXTURE: &str = r#"{
   "url": "https://api.github.com/repos/nappsllc/rustshot/releases/1",

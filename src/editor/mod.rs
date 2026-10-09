@@ -59,15 +59,23 @@ struct Toast {
     text: String,
     kind: ToastKind,
     at: Instant,
+    /// Visible time before the fade-out starts.
+    ttl: f32,
 }
 
 impl Toast {
     fn new(text: impl Into<String>, kind: ToastKind) -> Self {
-        Toast { text: text.into(), kind, at: Instant::now() }
+        let ttl = if kind == ToastKind::Error { 4000.0 } else { 1600.0 };
+        Toast { text: text.into(), kind, at: Instant::now(), ttl }
+    }
+
+    fn with_ttl(mut self, ms: f32) -> Self {
+        self.ttl = ms;
+        self
     }
 
     fn ttl_ms(&self) -> f32 {
-        if self.kind == ToastKind::Error { 4000.0 } else { 1600.0 }
+        self.ttl
     }
 
     fn age_ms(&self, now: Instant) -> f32 {
@@ -136,6 +144,10 @@ pub fn run(
         RunKind::Daemon => Some(Hotkeys::new(&cfg)),
         RunKind::OneShot => None,
     };
+    let updates = match kind {
+        RunKind::Daemon => crate::update::spawn_checker(cfg.check_updates),
+        RunKind::OneShot => None,
+    };
     let font = fonts::load_system_font();
     let ui_font = fonts::ui_font().or_else(|| font.clone());
     let mut app = App {
@@ -146,6 +158,8 @@ pub fn run(
         st: State::Hidden,
         exit_code,
         upload_slot,
+        updates,
+        update_pending: None,
         font,
         ui_font,
         notice: None,
@@ -188,6 +202,10 @@ struct App {
     st: State,
     exit_code: Arc<AtomicI32>,
     upload_slot: UploadSlot,
+    /// Results from the background update checker (daemon only).
+    updates: Option<Receiver<crate::update::Release>>,
+    /// A newer release found; announced on the next capture.
+    update_pending: Option<crate::update::Release>,
     font: Option<FontArc>,
     ui_font: Option<FontArc>,
     notice: Option<Toast>,
@@ -221,6 +239,11 @@ impl App {
             _ => {}
         }
         self.poll_upload();
+        if let Some(rx) = &self.updates {
+            while let Ok(r) = rx.try_recv() {
+                self.update_pending = Some(r);
+            }
+        }
         if self.notice.as_ref().is_some_and(|t| t.expired(Instant::now())) {
             self.notice = None;
         }
@@ -349,6 +372,15 @@ impl App {
             pressed: None,
             hot_handle: None,
         };
+        if let Some(r) = self.update_pending.take() {
+            edit.notice = Some(
+                Toast::new(
+                    format!("rustshot {} is available — run `rustshot update`", r.version),
+                    ToastKind::Info,
+                )
+                .with_ttl(6000.0),
+            );
+        }
         if accept_now {
             edit.done = true;
             edit.cancelled = false;
@@ -1753,6 +1785,8 @@ mod tests {
             st: State::Edit(Box::new(edit)),
             exit_code: Arc::new(AtomicI32::new(0)),
             upload_slot: Arc::new(Mutex::new(None)),
+            updates: None,
+            update_pending: None,
             font,
             ui_font,
             notice: None,
@@ -1895,6 +1929,15 @@ mod tests {
         assert!(!t.expired(ms(1650)));
         assert!(t.expired(ms(1701)));
         assert!(t.animating(ms(10)) && !t.animating(ms(800)) && t.animating(ms(1500)));
+    }
+
+    #[test]
+    fn toast_custom_ttl() {
+        let t = Toast::new("x", ToastKind::Info).with_ttl(6000.0);
+        let at = t.at;
+        let ms = |n: u64| at + Duration::from_millis(n);
+        assert!(!t.expired(ms(6050)));
+        assert!(t.expired(ms(6101)));
     }
 
     #[test]
