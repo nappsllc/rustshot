@@ -1,5 +1,5 @@
 ﻿//! X11 overlay window: override-redirect surface, event pump (Key/Button/
-//! Motion/Expose → `Ev`), 150 ms timer cadence and framebuffer presentation.
+//! Motion/Expose → `Ev`), variable timer cadence (`wind::tick_ms`) and framebuffer presentation.
 //! X11/Xorg only — Wayland has no client-side override-redirect overlay.
 
 use super::*;
@@ -412,11 +412,16 @@ pub fn run(driver: &mut dyn Driver) -> i32 {
             if QUIT.load(Ordering::SeqCst) {
                 break;
             }
+            // Honour a slow->fast switch made during the previous pass.
+            next_tick = next_tick.min(Instant::now() + Duration::from_millis(tick_ms()));
             let mut repaint = false;
             if XPending(dpy) == 0 {
                 // Sleep until the next tick (150 ms idle, 16 ms animating)
                 // or until X has input.
-                let wait = next_tick.saturating_duration_since(Instant::now()).as_millis() as c_int;
+                let wait = next_tick
+                    .saturating_duration_since(Instant::now())
+                    .as_micros()
+                    .div_ceil(1000) as c_int;
                 let mut pfd = PollFd {
                     fd: XConnectionNumber(dpy),
                     events: POLLIN,

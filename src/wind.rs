@@ -179,6 +179,7 @@ mod tests {
 
     #[test]
     fn tick_switches_between_fast_and_slow() {
+        set_fast_timer(Hwnd::default(), false);
         assert_eq!(tick_ms(), SLOW_TICK_MS);
         set_fast_timer(Hwnd::default(), true);
         assert_eq!(tick_ms(), FAST_TICK_MS);

@@ -1,7 +1,7 @@
 ﻿//! macOS overlay window: a borderless, keyable `NSWindow` whose layer is
 //! presented from raw CoreGraphics images, a hand-rolled Cocoa event pump
-//! (`NSEvent` → `Ev`, the same 150 ms timer cadence as wind_win's
-//! `SetTimer(hwnd, 1, 150)`) and the main-thread Carbon hotkey bridge:
+//! (`NSEvent` → `Ev`, the same variable timer cadence as wind_win's
+//! `SetTimer` via `wind::tick_ms`) and the main-thread Carbon hotkey bridge:
 //! registered OS hotkeys only dispatch through the process' event loop, so
 //! `hotkey_macos` parses on its own thread and hands registration/dispatch
 //! over via `HotkeyHook` instead of owning a `CFRunLoop` nobody spins.
@@ -369,9 +369,11 @@ fn pump_loop(driver: &mut dyn Driver) -> i32 {
             if let Some(h) = hook.as_ref() {
                 (h.pump)();
             }
+            // Honour a slow->fast switch made during the previous pass.
+            next_tick = next_tick.min(Instant::now() + Duration::from_millis(tick_ms()));
             let pool = Pool::new();
             let mut repaint = false;
-            // Block only for the rest of the 150 ms slice on the first wait,
+            // Block only for the rest of the current tick slice on the first wait,
             // then drain the queue without waiting until it runs dry.
             let mut first = true;
             while !QUIT.load(Ordering::SeqCst) {
