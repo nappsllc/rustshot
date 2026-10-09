@@ -1,8 +1,9 @@
 //! Software framebuffer: alpha blending, rectangles, image blits, and
 //! ab_glyph text rendering. Draw into an unpremultiplied RGBA buffer via [`Fb`].
 
+use crate::objects::{FRect, Pt};
 use crate::pixbuf::PixBuf;
-use crate::raster::Surf;
+use crate::raster::{Blend, Surf};
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -33,6 +34,15 @@ impl C4 {
 
     pub fn with_alpha(self, a: u8) -> Self {
         C4 { a, ..self }
+    }
+
+    /// Same color with alpha scaled by `k` (clamped 0..=1): fades, disabled.
+    #[allow(dead_code)] // wired in Task 8
+    pub fn fade(self, k: f32) -> Self {
+        C4 {
+            a: (self.a as f32 * k.clamp(0.0, 1.0)).round() as u8,
+            ..self
+        }
     }
 }
 
@@ -238,6 +248,83 @@ impl<'a> Fb<'a> {
         let h = text_height(font, px);
         self.draw_text(font, px, s, cx - w / 2.0, cy - h / 2.0, c);
     }
+
+    /// Anti-aliased filled circle.
+    #[allow(dead_code)] // wired in Task 8
+    pub fn fill_circle(&mut self, cx: f32, cy: f32, r: f32, c: C4) {
+        let fh = self.height();
+        let x0 = (cx - r - 1.0).floor().max(0.0) as i32;
+        let x1 = ((cx + r + 1.0).ceil() as i32).min(self.stride as i32);
+        let y0 = (cy - r - 1.0).floor().max(0.0) as i32;
+        let y1 = ((cy + r + 1.0).ceil() as i32).min(fh);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let d = (x as f32 + 0.5 - cx).hypot(y as f32 + 0.5 - cy);
+                let cov = (r + 0.5 - d).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    self.blend_px(x as usize, y as usize, c.fade(cov));
+                }
+            }
+        }
+    }
+
+    /// Circle outline `width` px wide, centred on radius `r`.
+    #[allow(dead_code)] // wired in Task 8
+    pub fn stroke_circle(&mut self, cx: f32, cy: f32, r: f32, width: f32, c: C4) {
+        let rect = FRect {
+            x: cx - r,
+            y: cy - r,
+            w: 2.0 * r,
+            h: 2.0 * r,
+        };
+        self.surf().stroke_ellipse(rect, width, c, Blend::Normal);
+    }
+
+    /// Rounded-rect outline `width` px wide, centred on the edge of `r`.
+    #[allow(dead_code)] // wired in Task 8
+    pub fn stroke_rounded(&mut self, r: FRect, radius: f32, width: f32, c: C4) {
+        self.surf()
+            .stroke_round_rect(r, radius, width, c, Blend::Normal);
+    }
+
+    /// Dashed rectangle outline: `dash` on, `gap` off, clockwise from top-left.
+    #[allow(dead_code)] // wired in Task 8
+    pub fn stroke_dashed_rect(&mut self, r: FRect, dash: f32, gap: f32, width: f32, c: C4) {
+        if dash <= 0.0 {
+            return;
+        }
+        let corners = [
+            Pt::new(r.x, r.y),
+            Pt::new(r.x1(), r.y),
+            Pt::new(r.x1(), r.y1()),
+            Pt::new(r.x, r.y1()),
+            Pt::new(r.x, r.y),
+        ];
+        let period = dash + gap.max(0.0);
+        let lerp = |a: Pt, b: Pt, t: f32| Pt::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+        let mut s = self.surf();
+        let mut phase = 0.0f32;
+        for w in corners.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let len = (b.x - a.x).hypot(b.y - a.y);
+            let mut t = 0.0;
+            while t < len {
+                let into = phase % period;
+                let on = into < dash;
+                let seg = if on { dash - into } else { period - into }.min(len - t);
+                if on {
+                    s.stroke_polyline(
+                        &[lerp(a, b, t / len), lerp(a, b, (t + seg) / len)],
+                        width,
+                        c,
+                        Blend::Normal,
+                    );
+                }
+                t += seg;
+                phase += seg;
+            }
+        }
+    }
 }
 
 fn scaled(font: &FontArc, px: f32) -> ab_glyph::PxScaleFont<&FontArc> {
@@ -323,5 +410,46 @@ mod tests {
         }
         assert_eq!(fb[(15 * stride + 15) * 4 + 1], 20);
         assert_eq!(fb[0], 0);
+    }
+
+    #[test]
+    fn fade_scales_alpha() {
+        assert_eq!(C4::new(1, 2, 3, 200).fade(0.5), C4::new(1, 2, 3, 100));
+        assert_eq!(C4::rgb(1, 2, 3).fade(2.0).a, 255);
+    }
+
+    #[test]
+    fn circle_fills_centre_not_corner() {
+        let mut d = vec![0u8; 20 * 20 * 4];
+        Fb::new(&mut d, 20).fill_circle(10.0, 10.0, 5.0, C4::rgb(255, 0, 0));
+        assert_eq!(d[(10 * 20 + 10) * 4], 255);
+        assert_eq!(d[0], 0);
+    }
+
+    #[test]
+    fn circle_stroke_is_a_ring() {
+        let mut d = vec![0u8; 20 * 20 * 4];
+        Fb::new(&mut d, 20).stroke_circle(10.0, 10.0, 6.0, 1.0, C4::rgb(0, 0, 255));
+        assert_eq!(d[(10 * 20 + 10) * 4 + 2], 0, "hollow centre");
+        assert!(d[(4 * 20 + 10) * 4 + 2] > 100, "top of ring");
+    }
+
+    #[test]
+    fn rounded_stroke_is_hollow() {
+        let mut d = vec![0u8; 30 * 30 * 4];
+        let r = FRect { x: 5.0, y: 5.0, w: 20.0, h: 20.0 };
+        Fb::new(&mut d, 30).stroke_rounded(r, 4.0, 1.0, C4::rgb(0, 255, 0));
+        assert_eq!(d[(15 * 30 + 15) * 4 + 1], 0);
+        assert!(d[(15 * 30 + 5) * 4 + 1] > 100);
+    }
+
+    #[test]
+    fn dashes_leave_gaps() {
+        let mut d = vec![0u8; 40 * 10 * 4];
+        let r = FRect { x: 2.5, y: 2.5, w: 35.0, h: 5.0 };
+        Fb::new(&mut d, 40).stroke_dashed_rect(r, 4.0, 4.0, 1.0, C4::rgb(255, 255, 255));
+        let top: Vec<u8> = (2..38).map(|x| d[(2 * 40 + x) * 4]).collect();
+        assert!(top.iter().any(|v| *v > 200), "{top:?}");
+        assert!(top.iter().any(|v| *v < 30), "{top:?}");
     }
 }
