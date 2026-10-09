@@ -6,6 +6,7 @@ mod export;
 mod fonts;
 mod hotkey;
 mod icon_path;
+mod instance;
 mod objects;
 mod pixbuf;
 mod raster;
@@ -81,10 +82,11 @@ rustshot: screenshot and annotation tool (Flameshot-style, written in Rust)
 Usage: rustshot [COMMAND] [OPTIONS]
 
 Commands:
-  gui       Interactive capture: select a region, annotate, then export (default)
+  gui       Interactive capture: select a region, annotate, then export
   full      Capture the whole desktop directly (add --edit for the editor)
   screen    Capture a single monitor (0 = first) directly (add --edit for the editor)
-  daemon    Run in the background and wait for the global capture hotkey
+  daemon    Run in the background and wait for the global capture hotkey (default;
+            launching again while it runs triggers a capture)
   update    Check for a newer release and open its download page
   config    Show or validate the config file (--check)
   help      Print this help
@@ -358,7 +360,7 @@ fn delayed(ms: u32) {
 fn editor_main(cfg: Config, kind: RunKind, pending: Pending) -> i32 {
     let exit_code = Arc::new(AtomicI32::new(0));
     let slot: UploadSlot = Arc::new(Mutex::new(None));
-    let mut code = editor::run(cfg.clone(), kind, Some(pending), exit_code, slot.clone());
+    let mut code = editor::run(cfg.clone(), kind, Some(pending), exit_code, slot.clone(), None);
     if let Some(rx) = slot.lock().unwrap().take()
         && export::wait_upload(rx, cfg.copy_url_after_upload).is_none() {
             code = 1;
@@ -376,7 +378,7 @@ fn main() {
 fn run() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let cmd = match parse_from(&argv) {
-        Ok(Parsed::Cmd(c)) => c.unwrap_or_else(|| Cmd::Gui(CaptureArgs::default())),
+        Ok(Parsed::Cmd(c)) => c.unwrap_or(Cmd::Daemon),
         Ok(Parsed::Help(h)) => {
             print!("{h}");
             return Ok(());
@@ -425,10 +427,14 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Daemon => {
+            let guard = match instance::acquire_or_signal() {
+                instance::Instance::Signalled => std::process::exit(0),
+                instance::Instance::Primary(g) => g,
+            };
             let cfg = config::load();
             let exit_code = Arc::new(AtomicI32::new(0));
             let slot: UploadSlot = Arc::new(Mutex::new(None));
-            let mut code = editor::run(cfg.clone(), RunKind::Daemon, None, exit_code, slot.clone());
+            let mut code = editor::run(cfg.clone(), RunKind::Daemon, None, exit_code, slot.clone(), Some(guard));
             if let Some(rx) = slot.lock().unwrap().take()
                 && export::wait_upload(rx, cfg.copy_url_after_upload).is_none() {
                     code = 1;
@@ -508,8 +514,9 @@ mod cli_tests {
     }
 
     #[test]
-    fn default_is_gui() {
+    fn default_is_daemon() {
         assert!(matches!(p(&[]).unwrap(), Parsed::Cmd(None)));
+        assert!(HELP.contains("(default;"));
         assert!(matches!(cmd(&["gui"]), Cmd::Gui(_)));
     }
 

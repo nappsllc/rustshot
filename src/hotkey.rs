@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::wind::key;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotEvent {
@@ -13,17 +13,24 @@ pub enum HotEvent {
 /// dedicated thread so we own the queue instead of relying on any toolkit.
 pub struct Hotkeys {
     rx: Receiver<HotEvent>,
+    tx: Sender<HotEvent>,
 }
 
 impl Hotkeys {
     pub fn new(cfg: &Config) -> Self {
         let (tx, rx) = mpsc::channel();
+        let hot_tx = tx.clone();
         let specs = [
             (1i32, cfg.capture_hotkey.clone(), HotEvent::Capture),
             (2i32, cfg.quit_hotkey.clone(), HotEvent::Quit),
         ];
-        std::thread::spawn(move || imp::hotkey_thread(specs, tx));
-        Self { rx }
+        std::thread::spawn(move || imp::hotkey_thread(specs, hot_tx));
+        Self { rx, tx }
+    }
+
+    /// Another producer of events (single-instance listener, tray).
+    pub fn sender(&self) -> Sender<HotEvent> {
+        self.tx.clone()
     }
 
     pub fn poll(&self) -> Option<HotEvent> {

@@ -139,11 +139,16 @@ pub fn run(
     pending: Option<Pending>,
     exit_code: Arc<AtomicI32>,
     upload_slot: UploadSlot,
+    instance: Option<crate::instance::Guard>,
 ) -> i32 {
     let hot = match kind {
         RunKind::Daemon => Some(Hotkeys::new(&cfg)),
         RunKind::OneShot => None,
     };
+    // A later launch of the daemon asks this one to capture; the guard lives until we return.
+    if let (Some(g), Some(h)) = (&instance, &hot) {
+        g.listen(h.sender());
+    }
     let updates = match kind {
         RunKind::Daemon => crate::update::spawn_checker(cfg.check_updates),
         RunKind::OneShot => None,
@@ -170,6 +175,7 @@ pub fn run(
     if wind::run(&mut app) != 0 {
         return 1;
     }
+    drop(instance);
     app.exit_code.load(Ordering::SeqCst)
 }
 
