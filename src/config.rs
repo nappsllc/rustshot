@@ -95,6 +95,16 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+/// Make sure `config.toml` exists (written with defaults if missing); returns its path.
+pub fn ensure_config_file() -> std::io::Result<PathBuf> {
+    let path = config_path();
+    if !path.exists() {
+        std::fs::create_dir_all(config_dir())?;
+        std::fs::write(&path, to_toml(&Config::default()))?;
+    }
+    Ok(path)
+}
+
 pub fn load() -> Config {
     let path = config_path();
     match std::fs::read_to_string(&path) {
@@ -192,7 +202,6 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
 }
 
 /// Render the config as the same flat TOML subset.
-#[cfg(test)]
 pub fn to_toml(c: &Config) -> String {
     fn q(s: &str) -> String {
         format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))

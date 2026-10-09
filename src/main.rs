@@ -1,4 +1,6 @@
+mod actions;
 mod anim;
+mod autostart;
 mod capture;
 mod config;
 mod editor;
@@ -11,6 +13,9 @@ mod objects;
 mod pixbuf;
 mod raster;
 mod theme;
+mod tray;
+#[cfg(windows)]
+mod tray_win;
 mod uifb;
 mod update;
 mod wind;

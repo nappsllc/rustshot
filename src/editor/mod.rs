@@ -148,6 +148,7 @@ pub fn run(
     // A later launch of the daemon asks this one to capture; the guard lives until we return.
     if let (Some(g), Some(h)) = (&instance, &hot) {
         g.listen(h.sender());
+        crate::tray::spawn(h.sender());
     }
     let updates = match kind {
         RunKind::Daemon => crate::update::spawn_checker(cfg.check_updates),

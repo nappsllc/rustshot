@@ -44,6 +44,7 @@ mod imp {
     pub struct Inner {
         mutex: HANDLE,
         thread_id: u32,
+        thread: Option<std::thread::JoinHandle<()>>,
     }
 
     impl Inner {
@@ -58,6 +59,10 @@ mod imp {
                 if self.thread_id != 0 {
                     let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
                 }
+                // Wait for the window thread so the tray icon is removed before we exit.
+                if let Some(t) = self.thread.take() {
+                    let _ = t.join();
+                }
                 if !self.mutex.is_invalid() {
                     let _ = CloseHandle(self.mutex);
                 }
@@ -67,6 +72,9 @@ mod imp {
     }
 
     unsafe extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        if let Some(r) = crate::tray_win::handle(h, m, w, l) {
+            return r;
+        }
         if m == WM_CAPTURE {
             if let Some(tx) = TX.lock().unwrap().as_ref() {
                 let _ = tx.send(HotEvent::Capture);
@@ -77,9 +85,9 @@ mod imp {
     }
 
     /// Message-only window on its own thread; returns the thread id once created.
-    fn spawn_window() -> Option<u32> {
+    fn spawn_window() -> Option<(u32, std::thread::JoinHandle<()>)> {
         let (tx, rx) = mpsc::channel::<Option<u32>>();
-        std::thread::spawn(move || unsafe {
+        let handle = std::thread::spawn(move || unsafe {
             let hinst = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
             let mut wc: WNDCLASSEXW = std::mem::zeroed();
             wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
@@ -111,9 +119,11 @@ mod imp {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
+            crate::tray_win::remove(hwnd);
             let _ = DestroyWindow(hwnd);
         });
-        rx.recv().ok().flatten()
+        let id = rx.recv().ok().flatten()?;
+        Some((id, handle))
     }
 
     pub fn acquire_or_signal() -> Instance {
@@ -122,7 +132,7 @@ mod imp {
                 Ok(h) => h,
                 // Cannot tell; behave as the sole instance without a guard.
                 Err(_) => {
-                    return Instance::Primary(super::Guard(Inner { mutex: HANDLE::default(), thread_id: 0 }));
+                    return Instance::Primary(super::Guard(Inner { mutex: HANDLE::default(), thread_id: 0, thread: None }));
                 }
             };
             if GetLastError() == ERROR_ALREADY_EXISTS {
@@ -139,8 +149,11 @@ mod imp {
                 }
                 return Instance::Signalled;
             }
-            let thread_id = spawn_window().unwrap_or(0);
-            Instance::Primary(super::Guard(Inner { mutex, thread_id }))
+            let (thread_id, thread) = match spawn_window() {
+                Some((id, t)) => (id, Some(t)),
+                None => (0, None),
+            };
+            Instance::Primary(super::Guard(Inner { mutex, thread_id, thread }))
         }
     }
 }
