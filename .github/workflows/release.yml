@@ -147,3 +147,61 @@ jobs:
           git add PKGBUILD .SRCINFO
           git commit -m "Update to $v"
           git push origin HEAD:master
+
+  mas:
+    needs: publish
+    if: vars.PUBLISH_MAS == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustshot-macos
+          path: artifacts
+      - name: Upload to App Store Connect
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          pkg=$(ls artifacts/*-mas.pkg 2>/dev/null | head -n1 || true)
+          if [ -z "$pkg" ]; then
+            echo "::error::No *-mas.pkg in artifact rustshot-macos (MAS signing secrets were not set when the build ran)"
+            exit 1
+          fi
+          mkdir -p ~/.appstoreconnect/private_keys
+          printf '%s' "$ASC_KEY_P8" > ~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8
+          xcrun altool --upload-app -f "$pkg" -t macos --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+
+  homebrew:
+    needs: publish
+    if: vars.PUBLISH_HOMEBREW == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustshot-macos
+          path: artifacts
+      - name: Render cask
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"
+          sum=$(sha256sum "artifacts/rustshot-$v-macos-universal.dmg" | cut -d' ' -f1)
+          sed -e "s/@VERSION@/$v/" -e "s/@SHA256@/$sum/" packaging/homebrew/rustshot.rb.in > "$RUNNER_TEMP/rustshot.rb"
+      - uses: actions/checkout@v4
+        with:
+          repository: nappsllc/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Push cask
+        run: |
+          set -euo pipefail
+          mkdir -p tap/Casks
+          cp "$RUNNER_TEMP/rustshot.rb" tap/Casks/rustshot.rb
+          cd tap
+          git config user.name "rustshot release"
+          git config user.email "noreply@github.com"
+          git add Casks/rustshot.rb
+          git commit -m "rustshot ${GITHUB_REF_NAME#v}"
+          git push origin HEAD

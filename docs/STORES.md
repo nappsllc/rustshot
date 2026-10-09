@@ -73,5 +73,30 @@ Store upload package; end users cannot install it directly.
    `ssh://aur@aur.archlinux.org/rustshot-bin.git` (empty repo is fine).
 3. Set `PUBLISH_AUR=true`.
 
-## macOS
-Mac App Store and Homebrew packaging are planned (docs/superpowers/plans/2026-10-09-store-packaging.md) and not built yet.
+## Mac App Store
+1. Apple Developer Program membership (https://developer.apple.com/programs/).
+2. Identifiers › App ID `io.github.nappsllc.rustshot` (platform macOS).
+3. Certificates: "Apple Distribution" and "Mac Installer Distribution"
+   (shows as "3rd Party Mac Developer Installer"). Export both as .p12 with one
+   password. **Secrets**: `MAS_APP_CERT_P12`, `MAS_INSTALLER_CERT_P12` (base64),
+   `MAS_CERT_PASSWORD`, `APPLE_TEAM_ID`.
+4. Profiles › Mac App Store profile for the App ID → secret
+   `MAS_PROVISION_PROFILE` (base64).
+5. App Store Connect › new macOS app with that bundle id; privacy URL as above;
+   App Privacy: "Data not collected".
+6. App Store Connect API key (Users and Access › Integrations, role App
+   Manager) → secrets `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_P8` (file contents).
+7. Before the first upload, run the sandboxed build locally and verify:
+   capture works after granting Screen Recording, hotkeys fire, Save to
+   Pictures works, **Upload works** (it spawns `/usr/bin/curl`; if blocked,
+   the uploader must move to NSURLSession before submitting).
+8. Set `PUBLISH_MAS=true`; submit each uploaded build for review in App Store Connect.
+
+## Developer ID (dmg) — needed for Homebrew
+Secrets `APPLE_CERT_P12`, `APPLE_CERT_PASSWORD`, `APPLE_ID`, `APPLE_TEAM_ID`,
+`APPLE_APP_PASSWORD` (see the "Sign and notarize" step in `ci.yml`).
+
+## Homebrew
+1. Create public repo `nappsllc/homebrew-tap` (users run `brew install --cask nappsllc/tap/rustshot`).
+2. Fine-grained PAT with Contents: read/write on that repo → secret `HOMEBREW_TAP_TOKEN`.
+3. Requires the notarized dmg (Developer ID secrets above). Set `PUBLISH_HOMEBREW=true`.

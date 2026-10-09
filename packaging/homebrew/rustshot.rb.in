@@ -1,0 +1,16 @@
+cask "rustshot" do
+  version "@VERSION@"
+  sha256 "@SHA256@"
+
+  url "https://github.com/nappsllc/rustshot/releases/download/v#{version}/rustshot-#{version}-macos-universal.dmg"
+  name "rustshot"
+  desc "Screenshot capture with annotation, upload and global hotkeys"
+  homepage "https://github.com/nappsllc/rustshot"
+
+  depends_on macos: ">= :big_sur"
+
+  app "Rustshot.app"
+  binary "#{appdir}/Rustshot.app/Contents/MacOS/rustshot"
+
+  zap trash: "~/.config/rustshot"
+end
