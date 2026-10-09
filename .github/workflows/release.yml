@@ -1,0 +1,46 @@
+name: release
+
+# Push a tag matching Cargo.toml's version (e.g. `git tag v0.1.0 && git push
+# origin v0.1.0`) to build all three platforms with the same jobs as ci.yml
+# and publish every package to a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/ci.yml
+    # macOS signing/notarization secrets, when configured.
+    secrets: inherit
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match Cargo.toml version
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version v$v"
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Give the bare Windows exe a versioned name
+        run: |
+          mv artifacts/rustshot-windows-x86_64/rustshot.exe \
+             "artifacts/rustshot-windows-x86_64/rustshot-${GITHUB_REF_NAME#v}-windows-x86_64.exe"
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l artifacts/*/*
+          gh release create "$GITHUB_REF_NAME" \
+            --title "rustshot $GITHUB_REF_NAME" \
+            --generate-notes \
+            artifacts/*/*

@@ -30,6 +30,7 @@ app="dist/Rustshot.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin" "$app/Contents/MacOS/rustshot"
+cp LICENSE "$app/Contents/Resources/LICENSE"
 sips -s format icns packaging/icons/rustshot-256.png \
   --out "$app/Contents/Resources/rustshot.icns" >/dev/null
 

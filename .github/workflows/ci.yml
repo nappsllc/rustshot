@@ -6,6 +6,8 @@ on:
   pull_request:
     branches: [main, handroll]
   workflow_dispatch:
+  # release.yml reuses these jobs to build the tagged artifacts.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always

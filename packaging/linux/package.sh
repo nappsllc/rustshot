@@ -19,6 +19,7 @@ rm -rf "$stage"
 mkdir -p "$stage"
 cp "$bin" "$stage/rustshot"
 cp packaging/linux/rustshot.desktop "$stage/"
+cp LICENSE "$stage/LICENSE"
 cat > "$stage/INSTALL.txt" <<EOF
 rustshot $version (linux x86_64, X11)
 

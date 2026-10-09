@@ -28,6 +28,7 @@ Section "${PRODUCT_NAME} (required)" SecMain
   SectionIn RO
   SetOutPath "$INSTDIR"
   File "..\target\release\${PRODUCT_EXE}"
+  File "..\LICENSE"
   WriteUninstaller "$INSTDIR\uninstall.exe"
   WriteRegStr HKCU "Software\${PRODUCT_NAME}" "InstallDir" "$INSTDIR"
   CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
@@ -57,6 +58,7 @@ SectionEnd
 Section "Uninstall"
   Delete "$INSTDIR\${PRODUCT_EXE}"
   Delete "$INSTDIR\uninstall.exe"
+  Delete "$INSTDIR\LICENSE"
   RMDir "$INSTDIR"
   Delete "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk"
   Delete "$SMPROGRAMS\${PRODUCT_NAME}\Uninstall.lnk"
