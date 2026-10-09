@@ -36,6 +36,9 @@ pub fn uniform_scale(mons: &[MonInfo]) -> Option<f32> {
     mons.iter().all(|m| (m.scale - first).abs() < 0.01).then_some(first)
 }
 
+/// A rectangle in image pixels: x, y, w, h.
+pub type IRect = (i32, i32, u32, u32);
+
 /// A captured region of the desktop in physical pixels.
 #[derive(Clone)]
 pub struct Shot {
@@ -46,6 +49,30 @@ pub struct Shot {
     /// window that will display this shot.
     pub scale: f32,
     pub image: PixBuf,
+    /// Monitors covered by this shot, image coordinates; never empty.
+    // Read by the toolbar/toast placement in Task 2; drop this allow then.
+    #[allow(dead_code)]
+    pub monitors: Vec<IRect>,
+}
+
+/// Monitors intersected with a shot at `origin`/`size`, in image coordinates.
+/// Never empty: falls back to the whole shot.
+pub fn monitors_in_shot(mons: &[MonInfo], origin: (i32, i32), size: (u32, u32)) -> Vec<IRect> {
+    let (sw, sh) = (size.0 as i32, size.1 as i32);
+    let mut out: Vec<IRect> = mons
+        .iter()
+        .filter_map(|m| {
+            let x0 = (m.x - origin.0).max(0);
+            let y0 = (m.y - origin.1).max(0);
+            let x1 = (m.x + m.w as i32 - origin.0).min(sw);
+            let y1 = (m.y + m.h as i32 - origin.1).min(sh);
+            (x1 > x0 && y1 > y0).then(|| (x0, y0, (x1 - x0) as u32, (y1 - y0) as u32))
+        })
+        .collect();
+    if out.is_empty() {
+        out.push((0, 0, size.0, size.1));
+    }
+    out
 }
 
 impl Shot {
@@ -83,6 +110,7 @@ pub fn grab_monitor(index: usize) -> Result<Shot> {
         size: (m.w, m.h),
         scale: m.scale,
         image,
+        monitors: vec![(0, 0, m.w, m.h)],
     })
 }
 
@@ -98,6 +126,7 @@ pub fn grab_span(mons: &[MonInfo]) -> Result<Shot> {
         size: (w, h),
         scale,
         image,
+        monitors: monitors_in_shot(mons, (ox, oy), (w, h)),
     })
 }
 
@@ -207,6 +236,23 @@ pub use imp::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitors_in_shot_are_image_relative_and_clipped() {
+        let mons = vec![
+            MonInfo { x: -1920, y: 200, w: 1920, h: 1080, scale: 1.0, primary: false },
+            MonInfo { x: 0, y: 0, w: 2560, h: 1440, scale: 1.0, primary: true },
+        ];
+        let (ox, oy, w, h) = union_rect(&mons);
+        assert_eq!((ox, oy, w, h), (-1920, 0, 4480, 1440));
+        let r = monitors_in_shot(&mons, (ox, oy), (w, h));
+        assert_eq!(r, vec![(0, 200, 1920, 1080), (1920, 0, 2560, 1440)]);
+    }
+
+    #[test]
+    fn monitors_in_shot_never_empty() {
+        assert_eq!(monitors_in_shot(&[], (0, 0), (800, 600)), vec![(0, 0, 800, 600)]);
+    }
 
     #[test]
     fn parses_geometry() {

@@ -1641,7 +1641,13 @@ mod tests {
         put(370, 540, 700, 760, [92, 140, 230]);
         put(740, 540, 1060, 760, [240, 170, 70]);
         put(1100, 540, 1290, 760, [110, 190, 140]);
-        Shot { origin: (0, 0), size: (w, h), scale: 1.0, image: img }
+        Shot {
+            origin: (0, 0),
+            size: (w, h),
+            scale: 1.0,
+            image: img,
+            monitors: vec![(0, 0, w, h)],
+        }
     }
 
     fn preview_app(th: Theme, sel: Option<FRect>) -> App {
