@@ -74,7 +74,8 @@ pub struct Item {
 
 pub struct Input<'a> {
     pub sel: FRect,
-    pub screen: (f32, f32),
+    /// Work area (the active monitor) in image px.
+    pub area: FRect,
     pub s: f32,
     /// Export tasks were given up front: Copy/Save/Upload collapse into OK.
     pub busy: bool,
@@ -151,10 +152,10 @@ fn place_row(gs: &[Group], x0: f32, y: f32, items: &mut Vec<Item>) {
 pub fn layout(inp: &Input) -> Toolbar {
     let s = inp.s;
     let gs = groups(inp);
-    let (sw, sh) = inp.screen;
+    let area = inp.area;
     let m = MARGIN * s;
     let one_row = row_w(&gs) + 2.0 * PAD;
-    let room = (inp.sel.w.max(NARROW * s) + WRAP_SLACK * s).min(sw - 2.0 * m);
+    let room = (inp.sel.w.max(NARROW * s) + WRAP_SLACK * s).min(area.w - 2.0 * m);
     let wrapped = one_row * s > room;
 
     let mut items = Vec::new();
@@ -177,15 +178,15 @@ pub fn layout(inp: &Input) -> Toolbar {
     let g = SEL_GAP * s;
     let narrow = sel.w < NARROW * s;
     let x = if narrow { sel.x + sel.w / 2.0 - bw / 2.0 } else { sel.x1() - bw };
-    let x = x.clamp(m, (sw - m - bw).max(m));
-    let (y, above) = if sel.y1() + g + bh <= sh - m {
+    let x = x.clamp(area.x + m, (area.x1() - m - bw).max(area.x + m));
+    let (y, above) = if sel.y1() + g + bh <= area.y1() - m {
         (sel.y1() + g, false)
-    } else if sel.y - g - bh >= m {
+    } else if sel.y - g - bh >= area.y + m {
         (sel.y - g - bh, true)
     } else if sel.h > INSIDE_MIN_H * s {
         (sel.y1() - g - bh, true)
     } else {
-        ((sel.y1() + g).clamp(m, (sh - m - bh).max(m)), false)
+        ((sel.y1() + g).clamp(area.y + m, (area.y1() - m - bh).max(area.y + m)), false)
     };
     for it in &mut items {
         it.r = FRect { x: x + it.r.x * s, y: y + it.r.y * s, w: it.r.w * s, h: it.r.h * s };
@@ -208,9 +209,9 @@ fn place_palette(colors: &[C4], bar: FRect, items: &mut Vec<Item>, inp: &Input) 
         .find(|it| it.kind == Kind::Btn(Act::Palette))
         .map(|it| it.r)
         .unwrap_or(bar);
-    let px = (anchor.x1() - pw).clamp(m, (inp.screen.0 - m - pw).max(m));
+    let px = (anchor.x1() - pw).clamp(inp.area.x + m, (inp.area.x1() - m - pw).max(inp.area.x + m));
     let mut py = bar.y - POP_GAP * s - ph;
-    if py < m {
+    if py < inp.area.y + m {
         py = bar.y1() + POP_GAP * s;
     }
     for (i, c) in colors.iter().enumerate() {
@@ -264,15 +265,15 @@ impl Toolbar {
 }
 
 /// Size label: 8 above the selection's top-left, or 8 inside it when there
-/// is less than 30 px of screen above.
-pub fn label_rect(sel: FRect, w: f32, s: f32, screen_w: f32) -> FRect {
+/// is less than 30 px of the work area above.
+pub fn label_rect(sel: FRect, w: f32, s: f32, area: FRect) -> FRect {
     let h = LABEL_H * s;
-    let (x, y) = if sel.y < LABEL_MIN_ROOM * s {
+    let (x, y) = if sel.y - area.y < LABEL_MIN_ROOM * s {
         (sel.x + LABEL_GAP * s, sel.y + LABEL_GAP * s)
     } else {
         (sel.x, sel.y - LABEL_GAP * s - h)
     };
-    FRect { x: x.clamp(0.0, (screen_w - w).max(0.0)), y, w, h }
+    FRect { x: x.clamp(area.x, (area.x1() - w).max(area.x)), y, w, h }
 }
 
 pub fn hit(r: FRect, p: Pt) -> bool {
@@ -283,14 +284,14 @@ pub fn hit(r: FRect, p: Pt) -> bool {
 mod tests {
     use super::*;
 
-    const SCREEN: (f32, f32) = (1920.0, 1080.0);
+    const AREA: FRect = FRect { x: 0.0, y: 0.0, w: 1920.0, h: 1080.0 };
 
     fn r(x: f32, y: f32, w: f32, h: f32) -> FRect {
         FRect { x, y, w, h }
     }
 
     fn inp<'a>(sel: FRect) -> Input<'a> {
-        Input { sel, screen: SCREEN, s: 1.0, busy: false, can_undo: true, can_redo: true, palette: None }
+        Input { sel, area: AREA, s: 1.0, busy: false, can_undo: true, can_redo: true, palette: None }
     }
 
     fn btn(tb: &Toolbar, a: Act) -> FRect {
@@ -410,10 +411,28 @@ mod tests {
 
     #[test]
     fn label_above_or_inside() {
-        let l = label_rect(r(240.0, 140.0, 960.0, 540.0), 120.0, 1.0, 1920.0);
+        let l = label_rect(r(240.0, 140.0, 960.0, 540.0), 120.0, 1.0, AREA);
         assert_eq!((l.x, l.y, l.h), (240.0, 110.0, 22.0));
-        let l = label_rect(r(300.0, 0.0, 664.0, 110.0), 120.0, 1.0, 1920.0);
+        let l = label_rect(r(300.0, 0.0, 664.0, 110.0), 120.0, 1.0, AREA);
         assert_eq!((l.x, l.y), (308.0, 8.0));
+    }
+
+    #[test]
+    fn area_offset_clamps_inside_monitor() {
+        let area = r(1920.0, 0.0, 1280.0, 720.0);
+        let mut i = inp(r(1920.0, 600.0, 1280.0, 120.0));
+        i.area = area;
+        let tb = layout(&i);
+        assert!(tb.above);
+        assert!(tb.bar.x >= 1932.0, "{:?}", tb.bar);
+        assert!(tb.bar.x1() <= 3188.0, "{:?}", tb.bar);
+    }
+
+    #[test]
+    fn label_inside_when_no_room_in_area() {
+        let area = r(0.0, 200.0, 1920.0, 880.0);
+        let l = label_rect(r(300.0, 210.0, 664.0, 300.0), 120.0, 1.0, area);
+        assert_eq!((l.x, l.y), (308.0, 218.0));
     }
 
     #[test]

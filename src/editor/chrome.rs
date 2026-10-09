@@ -228,7 +228,7 @@ pub fn selection(f: &mut Fb, ui: &Ui, sr: FRect, hot: Option<usize>, k: f32) {
 }
 
 /// "W × H" (and "x, y" when not dragging) above the selection.
-pub fn size_label(f: &mut Fb, ui: &Ui, sr: FRect, show_pos: bool, screen_w: f32, k: f32) {
+pub fn size_label(f: &mut Fb, ui: &Ui, sr: FRect, show_pos: bool, area: FRect, k: f32) {
     let size = format!("{} × {}", sr.w.round() as i32, sr.h.round() as i32);
     let pos = format!("{}, {}", sr.x.round() as i32, sr.y.round() as i32);
     let pad = ui.px(8.0);
@@ -236,7 +236,7 @@ pub fn size_label(f: &mut Fb, ui: &Ui, sr: FRect, show_pos: bool, screen_w: f32,
     if show_pos {
         w += pad + tw(ui, 11.0, &pos);
     }
-    let r = label_rect(sr, w, ui.s, screen_w);
+    let r = label_rect(sr, w, ui.s, area);
     surface(f, ui, r, 6.0, &SMALL_LAYERS, k);
     let cy = r.y + r.h / 2.0;
     let x = r.x + pad + text(f, ui, 12.0, &size, r.x + pad, cy, ui.th.text.fade(k));
@@ -253,7 +253,7 @@ pub enum ToastKind {
 }
 
 /// Bottom-centre notice; `k` drives both fade and the 4 px rise.
-pub fn toast(f: &mut Fb, ui: &Ui, msg: &str, kind: ToastKind, screen: (f32, f32), k: f32) {
+pub fn toast(f: &mut Fb, ui: &Ui, msg: &str, kind: ToastKind, area: FRect, k: f32) {
     let th = ui.th;
     let (icon, color) = match kind {
         ToastKind::Info => ("info", th.accent),
@@ -261,9 +261,9 @@ pub fn toast(f: &mut Fb, ui: &Ui, msg: &str, kind: ToastKind, screen: (f32, f32)
         ToastKind::Error => ("alert", th.error),
     };
     let (h, isz, gap, lpad) = (ui.px(36.0), ui.px(16.0), ui.px(8.0), ui.px(10.0));
-    let w = (lpad + isz + gap + tw(ui, 12.0, msg) + ui.px(14.0)).min(screen.0 - ui.px(24.0));
+    let w = (lpad + isz + gap + tw(ui, 12.0, msg) + ui.px(14.0)).min(area.w - ui.px(24.0));
     let rise = ui.px(4.0) * (1.0 - k);
-    let r = FRect { x: (screen.0 - w) / 2.0, y: screen.1 - ui.px(28.0) - h + rise, w, h };
+    let r = FRect { x: area.x + (area.w - w) / 2.0, y: area.y1() - ui.px(28.0) - h + rise, w, h };
     surface(f, ui, r, 12.0, &ALL_LAYERS, k);
     let cy = r.y + h / 2.0;
     draw_icon(f, icon, r.x + lpad, cy - isz / 2.0, isz, color.fade(k));
@@ -313,7 +313,7 @@ pub fn act_tip(a: Act) -> (&'static str, &'static [&'static str]) {
 }
 
 /// Dark label + key caps, 8 above `anchor` (below if no room).
-pub fn tooltip(f: &mut Fb, ui: &Ui, anchor: FRect, label: &str, keys: &[&str], screen_w: f32, k: f32) {
+pub fn tooltip(f: &mut Fb, ui: &Ui, anchor: FRect, label: &str, keys: &[&str], area: FRect, k: f32) {
     let th = ui.th;
     let (h, gap, kgap) = (ui.px(26.0), ui.px(8.0), ui.px(4.0));
     let keys_w: f32 = keys.iter().map(|s| key_w(ui, s)).sum::<f32>() + kgap * keys.len().saturating_sub(1) as f32;
@@ -321,9 +321,9 @@ pub fn tooltip(f: &mut Fb, ui: &Ui, anchor: FRect, label: &str, keys: &[&str], s
     if !keys.is_empty() {
         w += gap + keys_w;
     }
-    let x = (anchor.x + anchor.w / 2.0 - w / 2.0).clamp(0.0, (screen_w - w).max(0.0));
+    let x = (anchor.x + anchor.w / 2.0 - w / 2.0).clamp(area.x, (area.x1() - w).max(area.x));
     let mut y = anchor.y - ui.px(8.0) - h;
-    if y < 0.0 {
+    if y < area.y {
         y = anchor.y1() + ui.px(8.0);
     }
     let r = FRect { x, y, w, h };
@@ -341,8 +341,8 @@ pub fn tooltip(f: &mut Fb, ui: &Ui, anchor: FRect, label: &str, keys: &[&str], s
     }
 }
 
-/// "Drag to select · Enter to save · Esc to cancel", centred over the dim.
-pub fn hint(f: &mut Fb, ui: &Ui, screen: (f32, f32), k: f32) {
+/// "Drag to select · Enter to save · Esc to cancel", centred in the active monitor.
+pub fn hint(f: &mut Fb, ui: &Ui, area: FRect, k: f32) {
     enum P {
         T(&'static str),
         K(&'static str),
@@ -362,7 +362,7 @@ pub fn hint(f: &mut Fb, ui: &Ui, screen: (f32, f32), k: f32) {
         P::K(s) => key_w(ui, s),
     };
     let total = parts.iter().map(width).sum::<f32>() + sp * (parts.len() - 1) as f32;
-    let (mut x, cy) = ((screen.0 - total) / 2.0, screen.1 / 2.0);
+    let (mut x, cy) = (area.x + (area.w - total) / 2.0, area.y + area.h / 2.0);
     let c = C4::rgb(255, 255, 255).fade(0.7 * k);
     for p in &parts {
         let w = width(p);
@@ -412,7 +412,7 @@ mod tests {
     fn bar(tool: Option<Tool>, can_undo: bool) -> (Vec<u8>, Toolbar) {
         let tb = layout(&Input {
             sel: FRect { x: 20.0, y: 20.0, w: 760.0, h: 100.0 },
-            screen: (800.0, 200.0),
+            area: FRect { x: 0.0, y: 0.0, w: 800.0, h: 200.0 },
             s: 1.0,
             busy: false,
             can_undo,

@@ -938,12 +938,13 @@ impl Driver for App {
             edit.rebuild();
         }
         let (ww, wh) = (edit.shot.size.0 as f32, edit.shot.size.1 as f32);
+        let area = pick_area(&edit.shot.monitors, edit.sel, Pt::new(self.mouse.0 as f32, self.mouse.1 as f32));
         let s = edit.ui_scale();
         let colors = palette_colors(&edit.cfg);
         edit.toolbar = edit.sel.map(|sel| {
             toolbar::layout(&toolbar::Input {
                 sel,
-                screen: (ww, wh),
+                area,
                 s,
                 busy: !edit.tasks.is_empty(),
                 can_undo: edit.hi > 0,
@@ -991,7 +992,7 @@ impl Driver for App {
 
         if let Some(sr) = edit.sel {
             chrome::selection(&mut f, &ui, sr, edit.hot_handle, 1.0);
-            chrome::size_label(&mut f, &ui, sr, !interacting, ww, 1.0);
+            chrome::size_label(&mut f, &ui, sr, !interacting, area, 1.0);
         }
         if let Some(td) = &edit.text {
             let r = text_box_rect(ww, td, edit.sizes.font, edit.font.as_ref(), s);
@@ -1013,7 +1014,7 @@ impl Driver for App {
             }
         }
         if let Some(t) = edit.notice.as_ref().or(self.notice.as_ref()) {
-            chrome::toast(&mut f, &ui, &t.text, t.kind, (ww, wh), t.opacity(now));
+            chrome::toast(&mut f, &ui, &t.text, t.kind, area, t.opacity(now));
         }
         if let Some(tb) = &edit.toolbar {
             let kb = edit.mo.bar.value(now);
@@ -1038,12 +1039,12 @@ impl Driver for App {
             {
                 let (label, keys) = chrome::act_tip(act);
                 let tk = anim::ease_out(shown_ms / 80.0);
-                chrome::tooltip(&mut f, &ui, it.r, label, keys, ww, tk);
+                chrome::tooltip(&mut f, &ui, it.r, label, keys, area, tk);
             }
         }
         let kh = edit.mo.hint.value(now);
         if kh > 0.01 {
-            chrome::hint(&mut f, &ui, (ww, wh), kh);
+            chrome::hint(&mut f, &ui, area, kh);
         }
         let tip_pending = edit.hover.is_some() && edit.hover_at.elapsed() < Duration::from_millis(500);
         let toast_moving = edit.notice.as_ref().or(self.notice.as_ref()).is_some_and(|t| t.animating(now));
@@ -1608,11 +1609,56 @@ fn crop_to_image(img: &PixBuf, r: FRect) -> PixBuf {
     out
 }
 
+/// The monitor chrome is placed on: largest overlap with `sel` (ties go to
+/// the first), else the one under `pointer`, else the first.
+fn pick_area(monitors: &[capture::IRect], sel: Option<FRect>, pointer: Pt) -> FRect {
+    let rect = |m: &capture::IRect| FRect { x: m.0 as f32, y: m.1 as f32, w: m.2 as f32, h: m.3 as f32 };
+    let first = monitors.first().map(rect).unwrap_or(FRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 });
+    if let Some(sel) = sel {
+        let overlap = |r: FRect| {
+            let w = (sel.x1().min(r.x1()) - sel.x.max(r.x)).max(0.0);
+            let h = (sel.y1().min(r.y1()) - sel.y.max(r.y)).max(0.0);
+            w * h
+        };
+        let mut best: Option<(f32, FRect)> = None;
+        for r in monitors.iter().map(rect) {
+            let o = overlap(r);
+            if o > 0.0 && best.is_none_or(|(bo, _)| o > bo) {
+                best = Some((o, r));
+            }
+        }
+        if let Some((_, r)) = best {
+            return r;
+        }
+    }
+    monitors.iter().map(rect).find(|r| toolbar::hit(*r, pointer)).unwrap_or(first)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // ---- developer preview (renders overlay frames to PNG; no display) ----
+
+    /// 2400x900 desktop: a shorter, offset left monitor and a taller right one.
+    fn two_monitor_shot() -> Shot {
+        let mut shot = synthetic_shot();
+        let (w, h) = (2400u32, 900u32);
+        let mut img = PixBuf::from_pixel(w, h, [30, 34, 44, 255]);
+        let src = shot.image.clone();
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y as usize * w as usize + x as usize) * 4;
+                let (sx, sy) = (x % src.width(), y.min(src.height() - 1));
+                let j = (sy as usize * src.width() as usize + sx as usize) * 4;
+                img.as_raw_mut()[i..i + 4].copy_from_slice(&src.as_raw()[j..j + 4]);
+            }
+        }
+        shot.size = (w, h);
+        shot.image = img;
+        shot.monitors = vec![(0, 200, 1200, 700), (1200, 0, 1200, 900)];
+        shot
+    }
 
     fn synthetic_shot() -> Shot {
         let (w, h) = (1440u32, 900u32);
@@ -1651,11 +1697,14 @@ mod tests {
     }
 
     fn preview_app(th: Theme, sel: Option<FRect>) -> App {
+        preview_app_with(th, sel, synthetic_shot())
+    }
+
+    fn preview_app_with(th: Theme, sel: Option<FRect>, shot: Shot) -> App {
         let theme_name = if th == theme::DARK { "dark" } else { "light" };
         let cfg = Config { theme: theme_name.into(), ..Config::default() };
         let font = fonts::load_system_font();
         let ui_font = fonts::ui_font().or_else(|| font.clone());
-        let shot = synthetic_shot();
         let base = shot.image.clone();
         let edit = Edit {
             mo: Motion::new(Instant::now()),
@@ -1799,6 +1848,35 @@ mod tests {
 
         let mut app = preview_app(theme::DARK, None);
         save(&mut app, "dark-hint.png");
+
+        let sel = FRect { x: 100.0, y: 700.0, w: 800.0, h: 180.0 };
+        let mut app = preview_app_with(theme::DARK, Some(sel), two_monitor_shot());
+        edit_of(&mut app).notice = Some(Toast::new("Copied", ToastKind::Success));
+        save(&mut app, "dark-two-monitors.png");
+    }
+
+    fn two_mons() -> Vec<capture::IRect> {
+        vec![(0, 0, 1000, 800), (1000, 0, 1000, 800)]
+    }
+
+    #[test]
+    fn pick_area_follows_selection_overlap() {
+        let m = two_mons();
+        let sel = FRect { x: 900.0, y: 100.0, w: 400.0, h: 100.0 };
+        let a = pick_area(&m, Some(sel), Pt::new(0.0, 0.0));
+        assert_eq!((a.x, a.w), (1000.0, 1000.0));
+        let split = FRect { x: 800.0, y: 100.0, w: 400.0, h: 100.0 };
+        let a = pick_area(&m, Some(split), Pt::new(1500.0, 10.0));
+        assert_eq!(a.x, 0.0, "tie goes to the first monitor");
+    }
+
+    #[test]
+    fn pick_area_falls_back_to_pointer_then_first() {
+        let m = vec![(0, 0, 1000, 800), (1100, 0, 1000, 800)];
+        let a = pick_area(&m, None, Pt::new(1500.0, 10.0));
+        assert_eq!(a.x, 1100.0);
+        let a = pick_area(&m, None, Pt::new(1050.0, 10.0));
+        assert_eq!(a.x, 0.0, "pointer in a gap");
     }
 
     #[test]

@@ -50,8 +50,6 @@ pub struct Shot {
     pub scale: f32,
     pub image: PixBuf,
     /// Monitors covered by this shot, image coordinates; never empty.
-    // Read by the toolbar/toast placement in Task 2; drop this allow then.
-    #[allow(dead_code)]
     pub monitors: Vec<IRect>,
 }
 
