@@ -255,29 +255,9 @@ pub fn text_height(font: &FontArc, px: f32) -> f32 {
 mod tests {
     use super::*;
 
-    /// Any recognizable system UI font — the test only needs real glyph
-    /// metrics. Candidates cover windows/macos/linux; `None` means the host
-    /// has no font we know and the test skips instead of panicking.
+    /// A real font for glyph metrics (system font, else embedded Inter).
     fn font() -> Option<FontArc> {
-        const CANDIDATES: &[&str] = &[
-            r"C:\Windows\Fonts\segoeui.ttf",
-            r"C:\Windows\Fonts\arial.ttf",
-            "/System/Library/Fonts/Supplemental/Arial.ttf",
-            "/System/Library/Fonts/Supplemental/Verdana.ttf",
-            "/Library/Fonts/Arial.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/TTF/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-        ];
-        for path in CANDIDATES {
-            if let Ok(bytes) = std::fs::read(path)
-                && let Ok(f) = FontArc::try_from_vec(bytes)
-            {
-                return Some(f);
-            }
-        }
-        None
+        crate::fonts::load_system_font()
     }
 
     #[test]
