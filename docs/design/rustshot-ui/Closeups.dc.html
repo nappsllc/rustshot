@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>rustshot close-ups and component states</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;display=swap">
+<style>
+body{margin:0;font-family:'Inter',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+.dk{--sf:rgba(27,28,32,.96);--bd:rgba(255,255,255,.09);--sep:rgba(255,255,255,.10);--ic:#A3A7B3;--ich:#ECEEF3;--hv:rgba(255,255,255,.06);--pr:rgba(255,255,255,.11);--ac:#8B93FF;--acbg:rgba(139,147,255,.18);--acbg2:rgba(139,147,255,.24);--acrg:rgba(139,147,255,.30);--acfg:#B7BCFF;--tx:#ECEEF3;--tx2:#9296A3;--tip:rgba(14,15,18,.97);--tipx:#F2F3F6;--kbd:rgba(255,255,255,.14);--kbdx:#C4C7D0;--dgbg:rgba(255,107,107,.16);--dgfg:#FF8F8F;--s1:rgba(0,0,0,.26);--s2:rgba(0,0,0,.15);--s3:rgba(0,0,0,.08);--s4:rgba(0,0,0,.04);--rim:rgba(255,255,255,.22)}
+.lt{--sf:rgba(250,250,252,.97);--bd:rgba(0,0,0,.08);--sep:rgba(0,0,0,.10);--ic:#5F6473;--ich:#15171E;--hv:rgba(0,0,0,.06);--pr:rgba(0,0,0,.10);--ac:#5B63F5;--acbg:rgba(91,99,245,.12);--acbg2:rgba(91,99,245,.18);--acrg:rgba(91,99,245,.32);--acfg:#4047D6;--tx:#15171E;--tx2:#737889;--tip:rgba(22,23,28,.97);--tipx:#F2F3F6;--kbd:rgba(255,255,255,.14);--kbdx:#C4C7D0;--dgbg:rgba(220,38,38,.10);--dgfg:#C62828;--s1:rgba(0,0,0,.14);--s2:rgba(0,0,0,.09);--s3:rgba(0,0,0,.05);--s4:rgba(0,0,0,.025);--rim:rgba(0,0,0,.18)}
+.bt{box-sizing:border-box;width:32px;height:32px;border:0;padding:0;margin:0;background:transparent;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--ic);cursor:pointer;flex:none;position:relative}
+.bt.h{background:var(--hv);color:var(--ich)}
+.bt.on{background:var(--acbg);color:var(--acfg);box-shadow:inset 0 0 0 1px var(--acrg)}
+.bt.on.h{background:var(--acbg2)}
+.bt.p{background:var(--pr);color:var(--ich);transform:scale(.96)}
+.bt.d{opacity:.34}
+.bt.dg.h{background:var(--dgbg);color:var(--dgfg)}
+.bt.f{box-shadow:0 0 0 2px var(--ac)}
+.ic{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;display:block}
+.tb{box-sizing:border-box;display:flex;align-items:center;gap:6px;padding:6px;background:var(--sf);border-radius:12px;color:var(--tx);box-shadow:inset 0 0 0 1px var(--bd),0 1px 0 0 var(--s1),0 3px 0 2px var(--s2),0 7px 0 5px var(--s3),0 12px 0 9px var(--s4)}
+.g{display:flex;align-items:center;gap:2px}
+.sp{width:1px;height:16px;background:var(--sep);flex:none}
+.val{width:56px;height:32px;display:flex;align-items:center;justify-content:center;gap:4px;flex:none}
+.v{font-size:12px;font-weight:600;color:var(--tx);font-variant-numeric:tabular-nums}
+.u{font-size:11px;font-weight:500;color:var(--tx2)}
+.sw{width:18px;height:18px;border-radius:50%;box-shadow:inset 0 0 0 1px var(--rim);display:block}
+.lb{box-sizing:border-box;height:22px;padding:0 8px;border-radius:6px;background:var(--sf);color:var(--tx);display:flex;align-items:center;gap:8px;box-shadow:inset 0 0 0 1px var(--bd),0 1px 0 0 var(--s1),0 3px 0 2px var(--s3)}
+.ts{box-sizing:border-box;height:36px;padding:0 14px 0 10px;border-radius:12px;background:var(--sf);color:var(--tx);display:flex;align-items:center;gap:8px;font-size:12px;font-weight:500;box-shadow:inset 0 0 0 1px var(--bd),0 1px 0 0 var(--s1),0 3px 0 2px var(--s2),0 7px 0 5px var(--s3),0 12px 0 9px var(--s4)}
+.tip{box-sizing:border-box;height:26px;padding:0 6px 0 9px;border-radius:7px;background:var(--tip);color:var(--tipx);display:inline-flex;align-items:center;gap:8px;font-size:12px;font-weight:500;white-space:nowrap;box-shadow:inset 0 0 0 1px rgba(255,255,255,.08),0 1px 0 0 rgba(0,0,0,.22),0 3px 0 2px rgba(0,0,0,.10)}
+.kbd{height:18px;min-width:18px;padding:0 5px;border-radius:4px;background:var(--kbd);color:var(--kbdx);font-size:10.5px;font-weight:600;display:inline-flex;align-items:center;justify-content:center;font-variant-numeric:tabular-nums}
+.pal{box-sizing:border-box;display:flex;align-items:center;gap:4px;padding:6px;background:var(--sf);border-radius:12px;box-shadow:inset 0 0 0 1px var(--bd),0 1px 0 0 var(--s1),0 3px 0 2px var(--s2),0 7px 0 5px var(--s3),0 12px 0 9px var(--s4)}
+.pb{width:28px;height:28px;border-radius:7px;display:flex;align-items:center;justify-content:center;border:0;padding:0;margin:0;background:transparent;cursor:pointer}
+.pb.on{background:var(--hv);box-shadow:inset 0 0 0 1px var(--acrg)}
+.pd{width:18px;height:18px;border-radius:50%;box-shadow:inset 0 0 0 1px var(--rim);display:block}
+.sec{display:flex;flex-direction:column;gap:14px}
+.h2{font-size:13px;font-weight:600;color:#ECEEF3;letter-spacing:.01em}
+.cap{font-size:11px;font-weight:500;color:#8A8F9C}
+.row{display:flex;gap:28px;align-items:flex-start;flex-wrap:wrap}
+.card{box-sizing:border-box;border-radius:14px;padding:24px;display:flex;flex-direction:column;gap:14px;background:#2A2D36}
+.card.li{background:#D9DDE6}
+.card.li .h2{color:#15171E}.card.li .cap{color:#5F6473}
+.state{display:flex;flex-direction:column;align-items:center;gap:8px}
+.state .cap{text-align:center}
+</style>
+</helmet>
+<div class="dk" style="position:relative;width:1440px;height:2200px;box-sizing:border-box;background:#15161B;padding:48px;display:flex;flex-direction:column;gap:40px;font-family:'Inter',system-ui,sans-serif">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-pencil" viewBox="0 0 24 24"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"></path><path d="m15 5 4 4"></path></symbol>
+<symbol id="i-line" viewBox="0 0 24 24"><path d="M20 4 4 20"></path></symbol>
+<symbol id="i-arrow" viewBox="0 0 24 24"><path d="M7 7h10v10"></path><path d="M7 17 17 7"></path></symbol>
+<symbol id="i-rect" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="5" rx="2"></rect></symbol>
+<symbol id="i-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle></symbol>
+<symbol id="i-marker" viewBox="0 0 24 24"><path d="m9 11-6 6v3h9l3-3"></path><path d="m22 12-4.6 4.6a2 2 0 0 1-2.8 0l-5.2-5.2a2 2 0 0 1 0-2.8L14 4"></path></symbol>
+<symbol id="i-text" viewBox="0 0 24 24"><path d="M4 7V4h16v3"></path><path d="M9 20h6"></path><path d="M12 4v16"></path></symbol>
+<symbol id="i-pixel" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M3 9h18"></path><path d="M3 15h18"></path><path d="M9 3v18"></path><path d="M15 3v18"></path></symbol>
+<symbol id="i-invert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 18a6 6 0 0 0 0-12v12z"></path></symbol>
+<symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"></path><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11"></path></symbol>
+<symbol id="i-redo" viewBox="0 0 24 24"><path d="m15 14 5-5-5-5"></path><path d="M20 9H9.5A5.5 5.5 0 0 0 4 14.5A5.5 5.5 0 0 0 9.5 20H13"></path></symbol>
+<symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"></path></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"></path><path d="M12 5v14"></path></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"></rect><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"></path></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="m7 10 5 5 5-5"></path><path d="M12 15V3"></path></symbol>
+<symbol id="i-cloud" viewBox="0 0 24 24"><path d="M12 13v8"></path><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"></path><path d="m8 17 4-4 4 4"></path></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"></path></symbol>
+<symbol id="i-okc" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="m9 12 2 2 4-4"></path></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 16v-4"></path><path d="M12 8h.01"></path></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 8v4"></path><path d="M12 16h.01"></path></symbol>
+<symbol id="i-spin" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></symbol>
+</defs></svg>
+
+<!-- ===== 1. Toolbar, default (dark) ===== -->
+<div class="sec">
+  <div class="h2">Toolbar · default (dark)</div>
+  <div class="cap">Four groups — tools | history | size + color | actions — on a 44px bar. 32px hit targets, 20px icons, 2px gaps inside a group, 6px between groups around a 1×16 separator. 12px radius, 6px padding, 1px inner border.</div>
+  <div class="tb" style="align-self:flex-start">
+    <div class="g">
+      <button class="bt" aria-label="Pencil (P)"><svg class="ic"><use href="#i-pencil"></use></svg></button>
+      <button class="bt" aria-label="Line (L)"><svg class="ic"><use href="#i-line"></use></svg></button>
+      <button class="bt" aria-label="Arrow (A)"><svg class="ic"><use href="#i-arrow"></use></svg></button>
+      <button class="bt" aria-label="Rectangle (R)"><svg class="ic"><use href="#i-rect"></use></svg></button>
+      <button class="bt" aria-label="Ellipse (E)"><svg class="ic"><use href="#i-circle"></use></svg></button>
+      <button class="bt" aria-label="Marker (M)"><svg class="ic"><use href="#i-marker"></use></svg></button>
+      <button class="bt" aria-label="Text (T)"><svg class="ic"><use href="#i-text"></use></svg></button>
+      <button class="bt" aria-label="Pixelate (X)"><svg class="ic"><use href="#i-pixel"></use></svg></button>
+      <button class="bt" aria-label="Invert (I)"><svg class="ic"><use href="#i-invert"></use></svg></button>
+    </div>
+    <div class="sp"></div>
+    <div class="g">
+      <button class="bt d" aria-label="Undo (Ctrl+Z)" disabled=""><svg class="ic"><use href="#i-undo"></use></svg></button>
+      <button class="bt d" aria-label="Redo (Ctrl+Shift+Z)" disabled=""><svg class="ic"><use href="#i-redo"></use></svg></button>
+    </div>
+    <div class="sp"></div>
+    <div class="g">
+      <button class="bt" aria-label="Smaller ([)"><svg class="ic"><use href="#i-minus"></use></svg></button>
+      <div class="val"><span class="v">3</span><span class="u">line</span></div>
+      <button class="bt" aria-label="Larger (])"><svg class="ic"><use href="#i-plus"></use></svg></button>
+      <button class="bt" aria-label="Color (C)"><span class="sw" style="background:#F04438"></span></button>
+    </div>
+    <div class="sp"></div>
+    <div class="g">
+      <button class="bt" aria-label="Copy (Ctrl+C)"><svg class="ic"><use href="#i-copy"></use></svg></button>
+      <button class="bt" aria-label="Save (Ctrl+S)"><svg class="ic"><use href="#i-save"></use></svg></button>
+      <button class="bt" aria-label="Upload (Ctrl+U)"><svg class="ic"><use href="#i-cloud"></use></svg></button>
+      <button class="bt dg" aria-label="Close (Esc)"><svg class="ic"><use href="#i-x"></use></svg></button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 2. Toolbar, uploading ===== -->
+<div class="sec">
+  <div class="h2">Toolbar · while uploading</div>
+  <div class="cap">Copy / Save / Upload collapse into one accept button (OK · Enter). Tools stay visible but go disabled; the bar keeps its width to avoid jumping.</div>
+  <div class="tb" style="align-self:flex-start">
+    <div class="g" style="opacity:.34">
+      <button class="bt" aria-label="Pencil"><svg class="ic"><use href="#i-pencil"></use></svg></button>
+      <button class="bt" aria-label="Line"><svg class="ic"><use href="#i-line"></use></svg></button>
+      <button class="bt" aria-label="Arrow"><svg class="ic"><use href="#i-arrow"></use></svg></button>
+      <button class="bt" aria-label="Rectangle"><svg class="ic"><use href="#i-rect"></use></svg></button>
+      <button class="bt" aria-label="Ellipse"><svg class="ic"><use href="#i-circle"></use></svg></button>
+      <button class="bt" aria-label="Marker"><svg class="ic"><use href="#i-marker"></use></svg></button>
+      <button class="bt" aria-label="Text"><svg class="ic"><use href="#i-text"></use></svg></button>
+      <button class="bt" aria-label="Pixelate"><svg class="ic"><use href="#i-pixel"></use></svg></button>
+      <button class="bt" aria-label="Invert"><svg class="ic"><use href="#i-invert"></use></svg></button>
+    </div>
+    <div class="sp"></div>
+    <div class="g" style="opacity:.34">
+      <button class="bt" aria-label="Undo"><svg class="ic"><use href="#i-undo"></use></svg></button>
+      <button class="bt" aria-label="Redo"><svg class="ic"><use href="#i-redo"></use></svg></button>
+    </div>
+    <div class="sp"></div>
+    <div class="g" style="opacity:.34">
+      <button class="bt" aria-label="Smaller"><svg class="ic"><use href="#i-minus"></use></svg></button>
+      <div class="val"><span class="v">3</span><span class="u">line</span></div>
+      <button class="bt" aria-label="Larger"><svg class="ic"><use href="#i-plus"></use></svg></button>
+      <button class="bt" aria-label="Color"><span class="sw" style="background:#F04438"></span></button>
+    </div>
+    <div class="sp"></div>
+    <div class="g">
+      <button class="bt on" style="width:68px;gap:6px" aria-label="OK (Enter)"><svg class="ic" style="width:18px;height:18px"><use href="#i-check"></use></svg><span class="v" style="color:var(--acfg)">OK</span></button>
+      <button class="bt dg" aria-label="Close (Esc)"><svg class="ic"><use href="#i-x"></use></svg></button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 3. Button states ===== -->
+<div class="row">
+  <div class="card" style="width:656px">
+    <div class="h2">Button states · dark</div>
+    <div style="display:flex;gap:28px;align-items:flex-start;flex-wrap:wrap">
+      <div class="state"><button class="bt" aria-label="Default"><svg class="ic"><use href="#i-rect"></use></svg></button><div class="cap">Default<br>icon #A3A7B3</div></div>
+      <div class="state"><button class="bt h" aria-label="Hover"><svg class="ic"><use href="#i-rect"></use></svg></button><div class="cap">Hover<br>white 6% · icon #ECEEF3</div></div>
+      <div class="state"><button class="bt p" aria-label="Pressed"><svg class="ic"><use href="#i-rect"></use></svg></button><div class="cap">Pressed<br>white 11% · scale .96</div></div>
+      <div class="state"><button class="bt on" aria-label="Active"><svg class="ic"><use href="#i-rect"></use></svg></button><div class="cap">Active tool<br>accent 18% + 1px 30% ring</div></div>
+      <div class="state"><button class="bt on h" aria-label="Active hover"><svg class="ic"><use href="#i-rect"></use></svg></button><div class="cap">Active + hover<br>accent 24%</div></div>
+      <div class="state"><button class="bt d" aria-label="Disabled"><svg class="ic"><use href="#i-rect"></use></svg></button><div class="cap">Disabled<br>opacity 34%</div></div>
+      <div class="state"><button class="bt f" aria-label="Keyboard focus"><svg class="ic"><use href="#i-rect"></use></svg></button><div class="cap">Focus (kbd)<br>2px accent ring</div></div>
+      <div class="state"><button class="bt dg h" aria-label="Close hover"><svg class="ic"><use href="#i-x"></use></svg></button><div class="cap">Close hover<br>red 16% · #FF8F8F</div></div>
+    </div>
+  </div>
+  <div class="card li lt" style="width:656px">
+    <div class="h2">Button states · light</div>
+    <div style="display:flex;gap:28px;align-items:flex-start;flex-wrap:wrap">
+      <div class="state"><button class="bt" aria-label="Default"><svg class="ic"><use href="#i-rect"></use></svg></button><div class="cap">Default<br>icon #5F6473</div></div>
+      <div class="state"><button class="bt h" aria-label="Hover"><svg class="ic"><use href="#i-rect"></use></svg></button><div class="cap">Hover<br>black 6% · icon #15171E</div></div>
+      <div class="state"><button class="bt p" aria-label="Pressed"><svg class="ic"><use href="#i-rect"></use></svg></button><div class="cap">Pressed<br>black 10% · scale .96</div></div>
+      <div class="state"><button class="bt on" aria-label="Active"><svg class="ic"><use href="#i-rect"></use></svg></button><div class="cap">Active tool<br>accent 12% + 1px 32% ring</div></div>
+      <div class="state"><button class="bt on h" aria-label="Active hover"><svg class="ic"><use href="#i-rect"></use></svg></button><div class="cap">Active + hover<br>accent 18%</div></div>
+      <div class="state"><button class="bt d" aria-label="Disabled"><svg class="ic"><use href="#i-rect"></use></svg></button><div class="cap">Disabled<br>opacity 34%</div></div>
+      <div class="state"><button class="bt f" aria-label="Keyboard focus"><svg class="ic"><use href="#i-rect"></use></svg></button><div class="cap">Focus (kbd)<br>2px accent ring</div></div>
+      <div class="state"><button class="bt dg h" aria-label="Close hover"><svg class="ic"><use href="#i-x"></use></svg></button><div class="cap">Close hover<br>red 10% · #C62828</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 4. Tooltip + palette ===== -->
+<div class="row">
+  <div class="card" style="width:656px">
+    <div class="h2">Tooltip</div>
+    <div class="cap">Appears 400ms after hover, 8px above the button, centered; fades in 80ms. 26px tall, 7px radius, near-black surface in both themes. Label 12/500, key cap 18px tall 10.5/600 at 14% white.</div>
+    <div style="position:relative;height:84px">
+      <div class="tip" style="position:absolute;left:0;top:0">Arrow<span class="kbd">A</span></div>
+      <button class="bt on" style="position:absolute;left:11px;top:34px" aria-label="Arrow"><svg class="ic"><use href="#i-arrow"></use></svg></button>
+      <div class="tip" style="position:absolute;left:140px;top:0">Undo<span class="kbd">Ctrl</span><span class="kbd">Z</span></div>
+      <button class="bt h" style="position:absolute;left:170px;top:34px" aria-label="Undo"><svg class="ic"><use href="#i-undo"></use></svg></button>
+      <div class="tip" style="position:absolute;left:300px;top:0">Upload to cloud<span class="kbd">Ctrl</span><span class="kbd">U</span></div>
+      <button class="bt h" style="position:absolute;left:354px;top:34px" aria-label="Upload"><svg class="ic"><use href="#i-cloud"></use></svg></button>
+      <div class="tip" style="position:absolute;left:500px;top:0">Close<span class="kbd">Esc</span></div>
+      <button class="bt dg h" style="position:absolute;left:520px;top:34px" aria-label="Close"><svg class="ic"><use href="#i-x"></use></svg></button>
+    </div>
+  </div>
+  <div class="card" style="width:656px">
+    <div class="h2">Color palette · open</div>
+    <div class="cap">Pops 6px above the swatch button, right-aligned to it; scales from .96 → 1 in 100ms. Ten 18px dots on 28px targets with a 1px rim so pale colors stay visible. Selected dot gets the active ring. Last slot is the custom/eyedropper picker.</div>
+    <div style="position:relative;height:96px">
+      <div class="pal" style="position:absolute;left:0;top:0">
+        <button class="pb on" aria-label="Red #F04438"><span class="pd" style="background:#F04438"></span></button>
+        <button class="pb" aria-label="Orange #FF8A1F"><span class="pd" style="background:#FF8A1F"></span></button>
+        <button class="pb" aria-label="Yellow #FFC532"><span class="pd" style="background:#FFC532"></span></button>
+        <button class="pb" aria-label="Green #2DC06F"><span class="pd" style="background:#2DC06F"></span></button>
+        <button class="pb" aria-label="Cyan #19B5D6"><span class="pd" style="background:#19B5D6"></span></button>
+        <button class="pb" aria-label="Blue #3B82F6"><span class="pd" style="background:#3B82F6"></span></button>
+        <button class="pb" aria-label="Violet #8B5CF6"><span class="pd" style="background:#8B5CF6"></span></button>
+        <button class="pb" aria-label="Pink #EC4899"><span class="pd" style="background:#EC4899"></span></button>
+        <button class="pb" aria-label="White #FFFFFF"><span class="pd" style="background:#FFFFFF"></span></button>
+        <button class="pb" aria-label="Black #111318"><span class="pd" style="background:#111318"></span></button>
+        <div class="sp" style="margin:0 2px"></div>
+        <button class="pb" aria-label="Custom color"><span class="pd" style="background:conic-gradient(#F04438,#FFC532,#2DC06F,#19B5D6,#8B5CF6,#F04438)"></span></button>
+      </div>
+      <div class="tb" style="position:absolute;left:216px;top:52px;padding:6px">
+        <div class="g">
+          <button class="bt" aria-label="Smaller"><svg class="ic"><use href="#i-minus"></use></svg></button>
+          <div class="val"><span class="v">3</span><span class="u">line</span></div>
+          <button class="bt" aria-label="Larger"><svg class="ic"><use href="#i-plus"></use></svg></button>
+          <button class="bt on" aria-label="Color"><span class="sw" style="background:#F04438"></span></button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 5. Text entry, size label, handles ===== -->
+<div class="row">
+  <div class="card" style="width:432px">
+    <div class="h2">Text-entry box (Text tool)</div>
+    <div class="cap">Drawn in the current annotation color at stroke-size × 6 px font. 1px dashed accent outline with 4px padding, 4px radius. Caret 2px wide, blinks 530ms on/off.</div>
+    <div style="position:relative;height:120px;border-radius:10px;background:#D7DCE6;overflow:hidden">
+      <div style="position:absolute;left:0;top:0;width:432px;height:120px;background:linear-gradient(135deg,#C9D3E8,#E6DCE9)"></div>
+      <div style="position:absolute;left:24px;top:36px;box-sizing:border-box;padding:4px 6px;border:1px dashed #8B93FF;border-radius:4px;display:flex;align-items:center;gap:1px">
+        <span style="font-size:24px;font-weight:600;color:#F04438;line-height:1.1">Check this</span>
+        <span style="width:2px;height:28px;background:#F04438;border-radius:1px;display:block"></span>
+      </div>
+      <div class="cap" style="position:absolute;left:24px;top:94px;color:#4A5062">Empty state: a lone caret inside a 24×28 dashed box.</div>
+    </div>
+  </div>
+  <div class="card" style="width:396px">
+    <div class="h2">Size / position label</div>
+    <div class="cap">Floats 8px above the selection's top-left; flips inside the selection when at the screen top. 22px tall, 6px radius. Size 12/600 tabular, origin 11/500 muted. Shows "W × H" while dragging, adds "x, y" at rest.</div>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center">
+      <div class="lb"><span class="v">1280 × 720</span></div>
+      <div class="lb"><span class="v">1280 × 720</span><span class="u">120, 64</span></div>
+      <div class="lb lt"><span class="v">640 × 360</span><span class="u">0, 0</span></div>
+    </div>
+  </div>
+  <div class="card" style="width:452px">
+    <div class="h2">Selection border &amp; handles</div>
+    <div class="cap">1px accent border with a 1px 40%-black outer shadow and a 1px 28%-black inner line, so it reads on light and dark pixels. Handles: 6px white dot, 2px accent ring, 1px dark halo = 12px visual, 20px hit area. Hover: ring grows to 3px.</div>
+    <div style="position:relative;height:118px;border-radius:10px;overflow:hidden;background:linear-gradient(90deg,#F4F5F8 0%,#F4F5F8 50%,#1B1D24 50%,#1B1D24 100%)">
+      <div style="position:absolute;left:0;top:0;right:0;bottom:0;box-shadow:inset 0 0 0 2000px rgba(7,8,11,.58)"></div>
+      <div style="position:absolute;left:60px;top:28px;width:284px;height:62px;background:linear-gradient(90deg,#F4F5F8 0%,#F4F5F8 50%,#1B1D24 50%,#1B1D24 100%)"></div>
+      <div style="position:absolute;left:59px;top:27px;width:284px;height:62px;border:1px solid #8B93FF;box-shadow:0 0 0 1px rgba(0,0,0,.40),inset 0 0 0 1px rgba(0,0,0,.28)"></div>
+      <div style="position:absolute;left:54px;top:22px;width:6px;height:6px;border-radius:50%;background:#fff;border:2px solid #8B93FF;box-shadow:0 0 0 1px rgba(0,0,0,.45)"></div>
+      <div style="position:absolute;left:196px;top:22px;width:6px;height:6px;border-radius:50%;background:#fff;border:2px solid #8B93FF;box-shadow:0 0 0 1px rgba(0,0,0,.45)"></div>
+      <div style="position:absolute;left:338px;top:22px;width:6px;height:6px;border-radius:50%;background:#fff;border:2px solid #8B93FF;box-shadow:0 0 0 1px rgba(0,0,0,.45)"></div>
+      <div style="position:absolute;left:54px;top:53px;width:6px;height:6px;border-radius:50%;background:#fff;border:2px solid #8B93FF;box-shadow:0 0 0 1px rgba(0,0,0,.45)"></div>
+      <div style="position:absolute;left:337px;top:52px;width:6px;height:6px;border-radius:50%;background:#fff;border:3px solid #8B93FF;box-shadow:0 0 0 1px rgba(0,0,0,.45)"></div>
+      <div style="position:absolute;left:54px;top:84px;width:6px;height:6px;border-radius:50%;background:#fff;border:2px solid #8B93FF;box-shadow:0 0 0 1px rgba(0,0,0,.45)"></div>
+      <div style="position:absolute;left:196px;top:84px;width:6px;height:6px;border-radius:50%;background:#fff;border:2px solid #8B93FF;box-shadow:0 0 0 1px rgba(0,0,0,.45)"></div>
+      <div style="position:absolute;left:338px;top:84px;width:6px;height:6px;border-radius:50%;background:#fff;border:2px solid #8B93FF;box-shadow:0 0 0 1px rgba(0,0,0,.45)"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 6. Toasts + empty-state hint ===== -->
+<div class="row">
+  <div class="card" style="width:656px">
+    <div class="h2">Toasts (bottom center, 28px above screen edge)</div>
+    <div class="cap">36px tall, 12px radius, 16px leading icon. Fade + 4px rise in 120ms; auto-dismiss 1.6s (errors 4s). Icon color carries the kind: accent info, green success, accent spinner, red error.</div>
+    <div style="display:flex;flex-direction:column;gap:12px;align-items:flex-start">
+      <div class="ts"><svg class="ic" style="width:16px;height:16px;color:#4ADE9A" aria-hidden="true"><use href="#i-okc"></use></svg>Copied to clipboard</div>
+      <div class="ts"><svg class="ic" style="width:16px;height:16px;color:#8B93FF" aria-hidden="true"><use href="#i-info"></use></svg>Size 5</div>
+      <div class="ts"><svg class="ic" style="width:16px;height:16px;color:#8B93FF" aria-hidden="true"><use href="#i-spin"></use></svg>Uploading…</div>
+      <div class="ts"><svg class="ic" style="width:16px;height:16px;color:#FF7A7A" aria-hidden="true"><use href="#i-alert"></use></svg>Upload failed — check your connection</div>
+      <div class="ts lt"><svg class="ic" style="width:16px;height:16px;color:#1E9E63" aria-hidden="true"><use href="#i-okc"></use></svg>Saved to ~/Pictures/rustshot-2026-10-09.png</div>
+    </div>
+  </div>
+  <div class="card" style="width:656px">
+    <div class="h2">Empty-state hint (before any selection)</div>
+    <div class="cap">Centered on screen over the plain dim, fades in 120ms and fades out 100ms the moment a drag starts. 13/500 text at 70% white, separators as middle dots, keys as the tooltip key-cap style.</div>
+    <div style="position:relative;height:150px;border-radius:10px;overflow:hidden;background:linear-gradient(135deg,#2F4573,#5A3E8A)">
+      <div style="position:absolute;left:0;top:0;right:0;bottom:0;background:rgba(7,8,11,.58)"></div>
+      <div style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%)" class="ts">
+        <span style="display:inline-flex;align-items:center;gap:6px;font-size:13px">Drag to select</span><span style="color:var(--tx2)">·</span>
+        <span class="kbd">Enter</span><span style="font-size:13px">to copy</span><span style="color:var(--tx2)">·</span>
+        <span class="kbd">Esc</span><span style="font-size:13px">to cancel</span>
+      </div>
+      <div style="position:absolute;left:50%;top:14px;transform:translateX(-50%);width:0;height:0"></div>
+    </div>
+  </div>
+</div>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":2200}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {};
+  }
+}
+</script>
+</body>
+</html>

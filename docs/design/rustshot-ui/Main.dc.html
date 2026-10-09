@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>rustshot overlay, dark</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;display=swap">
+<style>
+body{margin:0;font-family:'Inter',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+.dk{--sf:rgba(27,28,32,.96);--bd:rgba(255,255,255,.09);--sep:rgba(255,255,255,.10);--ic:#A3A7B3;--ich:#ECEEF3;--hv:rgba(255,255,255,.06);--pr:rgba(255,255,255,.11);--ac:#8B93FF;--acbg:rgba(139,147,255,.18);--acbg2:rgba(139,147,255,.24);--acrg:rgba(139,147,255,.30);--acfg:#B7BCFF;--onac:#0E1020;--tx:#ECEEF3;--tx2:#9296A3;--tip:rgba(14,15,18,.97);--tipx:#F2F3F6;--kbd:rgba(255,255,255,.14);--kbdx:#C4C7D0;--dgbg:rgba(255,107,107,.16);--dgfg:#FF8F8F;--ok:#4ADE9A;--er:#FF7A7A;--dim:rgba(7,8,11,.58);--s1:rgba(0,0,0,.26);--s2:rgba(0,0,0,.15);--s3:rgba(0,0,0,.08);--s4:rgba(0,0,0,.04);--rim:rgba(255,255,255,.22)}
+.bt{box-sizing:border-box;width:32px;height:32px;border:0;padding:0;margin:0;background:transparent;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--ic);cursor:pointer;flex:none}
+.bt:hover,.bt.h{background:var(--hv);color:var(--ich)}
+.bt.on{background:var(--acbg);color:var(--acfg);box-shadow:inset 0 0 0 1px var(--acrg)}
+.bt.on:hover,.bt.on.h{background:var(--acbg2)}
+.bt.p{background:var(--pr);color:var(--ich);transform:scale(.96)}
+.bt.d{opacity:.34;cursor:default;pointer-events:none}
+.bt.dg:hover,.bt.dg.h{background:var(--dgbg);color:var(--dgfg)}
+.ic{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;display:block}
+.tb{box-sizing:border-box;display:flex;align-items:center;gap:6px;padding:6px;background:var(--sf);border-radius:12px;color:var(--tx);box-shadow:inset 0 0 0 1px var(--bd),0 1px 0 0 var(--s1),0 3px 0 2px var(--s2),0 7px 0 5px var(--s3),0 12px 0 9px var(--s4)}
+.g{display:flex;align-items:center;gap:2px}
+.sp{width:1px;height:16px;background:var(--sep);flex:none}
+.val{width:56px;height:32px;display:flex;align-items:center;justify-content:center;gap:4px;flex:none}
+.v{font-size:12px;font-weight:600;color:var(--tx);font-variant-numeric:tabular-nums}
+.u{font-size:11px;font-weight:500;color:var(--tx2)}
+.sw{width:18px;height:18px;border-radius:50%;box-shadow:inset 0 0 0 1px var(--rim);display:block}
+.lb{box-sizing:border-box;height:22px;padding:0 8px;border-radius:6px;background:var(--sf);color:var(--tx);display:flex;align-items:center;gap:8px;box-shadow:inset 0 0 0 1px var(--bd),0 1px 0 0 var(--s1),0 3px 0 2px var(--s3)}
+.ts{box-sizing:border-box;height:36px;padding:0 14px 0 10px;border-radius:12px;background:var(--sf);color:var(--tx);display:flex;align-items:center;gap:8px;font-size:12px;font-weight:500;box-shadow:inset 0 0 0 1px var(--bd),0 1px 0 0 var(--s1),0 3px 0 2px var(--s2),0 7px 0 5px var(--s3),0 12px 0 9px var(--s4)}
+.sb{position:absolute;left:-1px;top:-1px;right:-1px;bottom:-1px;border:1px solid var(--ac);box-shadow:0 0 0 1px rgba(0,0,0,.40),inset 0 0 0 1px rgba(0,0,0,.28);pointer-events:none}
+.hd{position:absolute;box-sizing:content-box;width:6px;height:6px;border-radius:50%;background:#fff;border:2px solid var(--ac);box-shadow:0 0 0 1px rgba(0,0,0,.45)}
+.nv{height:34px;border-radius:8px;display:flex;align-items:center;gap:10px;padding:0 10px;font-size:12px;font-weight:500;color:#5A6070}
+.nv i{width:16px;height:16px;border-radius:5px;background:#BFC5D4;display:block}
+.nv.a{background:#E1E3F7;color:#2B2F45}
+.nv.a i{background:#8E96E8}
+.cd{position:absolute;box-sizing:border-box;background:#fff;border:1px solid #E4E7EC;border-radius:10px}
+</style>
+</helmet>
+<div class="dk" style="position:relative;width:1440px;height:900px;overflow:hidden;font-family:'Inter',system-ui,sans-serif">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-pencil" viewBox="0 0 24 24"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"></path><path d="m15 5 4 4"></path></symbol>
+<symbol id="i-line" viewBox="0 0 24 24"><path d="M20 4 4 20"></path></symbol>
+<symbol id="i-arrow" viewBox="0 0 24 24"><path d="M7 7h10v10"></path><path d="M7 17 17 7"></path></symbol>
+<symbol id="i-rect" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="5" rx="2"></rect></symbol>
+<symbol id="i-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle></symbol>
+<symbol id="i-marker" viewBox="0 0 24 24"><path d="m9 11-6 6v3h9l3-3"></path><path d="m22 12-4.6 4.6a2 2 0 0 1-2.8 0l-5.2-5.2a2 2 0 0 1 0-2.8L14 4"></path></symbol>
+<symbol id="i-text" viewBox="0 0 24 24"><path d="M4 7V4h16v3"></path><path d="M9 20h6"></path><path d="M12 4v16"></path></symbol>
+<symbol id="i-pixel" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M3 9h18"></path><path d="M3 15h18"></path><path d="M9 3v18"></path><path d="M15 3v18"></path></symbol>
+<symbol id="i-invert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 18a6 6 0 0 0 0-12v12z"></path></symbol>
+<symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"></path><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11"></path></symbol>
+<symbol id="i-redo" viewBox="0 0 24 24"><path d="m15 14 5-5-5-5"></path><path d="M20 9H9.5A5.5 5.5 0 0 0 4 14.5A5.5 5.5 0 0 0 9.5 20H13"></path></symbol>
+<symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"></path></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"></path><path d="M12 5v14"></path></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"></rect><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"></path></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><path d="m7 10 5 5 5-5"></path><path d="M12 15V3"></path></symbol>
+<symbol id="i-cloud" viewBox="0 0 24 24"><path d="M12 13v8"></path><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"></path><path d="m8 17 4-4 4 4"></path></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"></path></symbol>
+<symbol id="i-okc" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="m9 12 2 2 4-4"></path></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 16v-4"></path><path d="M12 8h.01"></path></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 8v4"></path><path d="M12 16h.01"></path></symbol>
+<symbol id="i-spin" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></symbol>
+</defs></svg>
+
+<!-- ===== Captured screen (sample) ===== -->
+<div style="position:absolute;left:0;top:0;width:1440px;height:900px;background:linear-gradient(135deg,#1F3B63 0%,#5A3E8A 100%)"></div>
+<div style="position:absolute;left:120px;top:70px;width:1200px;height:720px;border-radius:12px;background:#F6F7F9;overflow:hidden;box-shadow:0 24px 60px rgba(0,0,0,.35)">
+  <div style="position:absolute;left:0;top:0;width:1200px;height:40px;background:#fff;border-bottom:1px solid #E6E8ED;box-sizing:border-box">
+    <div style="position:absolute;left:16px;top:12px;font-size:12px;font-weight:500;color:#4A4F5C">Dashboard</div>
+    <div style="position:absolute;right:16px;top:14px;display:flex;gap:8px"><i style="width:12px;height:12px;border-radius:4px;background:#D5D8DF;display:block"></i><i style="width:12px;height:12px;border-radius:4px;background:#D5D8DF;display:block"></i><i style="width:12px;height:12px;border-radius:4px;background:#D5D8DF;display:block"></i></div>
+  </div>
+  <div style="position:absolute;left:0;top:40px;width:200px;height:680px;background:#EEF0F4;border-right:1px solid #E1E4EA;box-sizing:border-box;padding:20px 14px;display:flex;flex-direction:column;gap:6px">
+    <div class="nv a"><i></i>Overview</div>
+    <div class="nv"><i></i>Reports</div>
+    <div class="nv"><i></i>Audience</div>
+    <div class="nv"><i></i>Campaigns</div>
+    <div class="nv"><i></i>Billing</div>
+    <div class="nv"><i></i>Settings</div>
+  </div>
+  <div style="position:absolute;left:232px;top:62px;font-size:20px;font-weight:600;color:#1B1E27">Overview</div>
+  <div style="position:absolute;left:232px;top:94px;width:300px;height:9px;border-radius:5px;background:#DADEE6"></div>
+  <div class="cd" style="left:232px;top:130px;width:300px;height:96px"><div style="position:absolute;left:18px;top:16px;font-size:11px;font-weight:500;color:#7A8090">Revenue</div><div style="position:absolute;left:18px;top:42px;width:130px;height:22px;border-radius:6px;background:#1F2330"></div><div style="position:absolute;left:18px;top:74px;width:64px;height:8px;border-radius:4px;background:#BFE8D2"></div></div>
+  <div class="cd" style="left:556px;top:130px;width:300px;height:96px"><div style="position:absolute;left:18px;top:16px;font-size:11px;font-weight:500;color:#7A8090">Sessions</div><div style="position:absolute;left:18px;top:42px;width:110px;height:22px;border-radius:6px;background:#1F2330"></div><div style="position:absolute;left:18px;top:74px;width:54px;height:8px;border-radius:4px;background:#BFE8D2"></div></div>
+  <div class="cd" style="left:880px;top:130px;width:300px;height:96px"><div style="position:absolute;left:18px;top:16px;font-size:11px;font-weight:500;color:#7A8090">Conversion</div><div style="position:absolute;left:18px;top:42px;width:90px;height:22px;border-radius:6px;background:#1F2330"></div><div style="position:absolute;left:18px;top:74px;width:58px;height:8px;border-radius:4px;background:#F2C4C4"></div></div>
+  <div class="cd" style="left:232px;top:250px;width:948px;height:440px">
+    <div style="position:absolute;left:24px;top:20px;font-size:13px;font-weight:600;color:#1B1E27">Weekly trend</div>
+    <svg width="948" height="440" style="position:absolute;left:0;top:0" aria-hidden="true">
+      <path d="M40 90H908M40 150H908M40 210H908M40 270H908M40 330H908M40 390H908" stroke="#EEF0F4" stroke-width="1" fill="none"></path>
+      <path d="M40 300L140 260L240 285L340 215L440 235L540 150L640 185L740 110L840 165L908 135L908 390L40 390Z" fill="#3B6CF6" fill-opacity=".10"></path>
+      <path d="M40 300L140 260L240 285L340 215L440 235L540 150L640 185L740 110L840 165L908 135" stroke="#3B6CF6" stroke-width="3" fill="none" stroke-linejoin="round" stroke-linecap="round"></path>
+    </svg>
+  </div>
+</div>
+<div style="position:absolute;left:520px;top:840px;width:400px;height:44px;border-radius:14px;background:rgba(255,255,255,.14);display:flex;align-items:center;justify-content:center;gap:12px">
+  <i style="width:28px;height:28px;border-radius:8px;background:#F0846B;display:block"></i><i style="width:28px;height:28px;border-radius:8px;background:#7DD3A8;display:block"></i><i style="width:28px;height:28px;border-radius:8px;background:#6FA8F2;display:block"></i><i style="width:28px;height:28px;border-radius:8px;background:#F2D06F;display:block"></i><i style="width:28px;height:28px;border-radius:8px;background:#B79BF0;display:block"></i><i style="width:28px;height:28px;border-radius:8px;background:#E8EAF0;display:block"></i>
+</div>
+
+<!-- ===== Overlay: dim everywhere except the selection (4-rect fill in the rasterizer) ===== -->
+<div style="position:absolute;left:240px;top:140px;width:960px;height:540px;box-shadow:0 0 0 2000px var(--dim)">
+  <svg width="960" height="540" style="position:absolute;left:0;top:0" aria-hidden="true">
+    <rect x="428" y="52" width="316" height="112" rx="2" fill="none" stroke="#F04438" stroke-width="4"></rect>
+    <path d="M640 460L822.6 318.5" stroke="#F04438" stroke-width="4" stroke-linecap="round" fill="none"></path>
+    <path d="M840 305L829.3 327.2L815.9 309.8Z" fill="#F04438" stroke="#F04438" stroke-width="2" stroke-linejoin="round"></path>
+  </svg>
+  <div class="sb"></div>
+  <div class="hd" style="left:-5px;top:-5px"></div>
+  <div class="hd" style="left:475px;top:-5px"></div>
+  <div class="hd" style="left:955px;top:-5px"></div>
+  <div class="hd" style="left:-5px;top:265px"></div>
+  <div class="hd" style="left:955px;top:265px"></div>
+  <div class="hd" style="left:-5px;top:535px"></div>
+  <div class="hd" style="left:475px;top:535px"></div>
+  <div class="hd" style="left:955px;top:535px"></div>
+</div>
+
+<!-- Size / position label -->
+<div class="lb" style="position:absolute;left:240px;top:110px"><span class="v">960 × 540</span><span class="u">240, 140</span></div>
+
+<!-- Toolbar (below selection, right-aligned to it) -->
+<div class="tb" style="position:absolute;right:240px;top:690px">
+  <div class="g">
+    <button class="bt" aria-label="Pencil (P)"><svg class="ic"><use href="#i-pencil"></use></svg></button>
+    <button class="bt" aria-label="Line (L)"><svg class="ic"><use href="#i-line"></use></svg></button>
+    <button class="bt on" aria-label="Arrow (A)"><svg class="ic"><use href="#i-arrow"></use></svg></button>
+    <button class="bt" aria-label="Rectangle (R)"><svg class="ic"><use href="#i-rect"></use></svg></button>
+    <button class="bt" aria-label="Ellipse (E)"><svg class="ic"><use href="#i-circle"></use></svg></button>
+    <button class="bt" aria-label="Marker (M)"><svg class="ic"><use href="#i-marker"></use></svg></button>
+    <button class="bt" aria-label="Text (T)"><svg class="ic"><use href="#i-text"></use></svg></button>
+    <button class="bt" aria-label="Pixelate (X)"><svg class="ic"><use href="#i-pixel"></use></svg></button>
+    <button class="bt" aria-label="Invert (I)"><svg class="ic"><use href="#i-invert"></use></svg></button>
+  </div>
+  <div class="sp"></div>
+  <div class="g">
+    <button class="bt" aria-label="Undo (Ctrl+Z)"><svg class="ic"><use href="#i-undo"></use></svg></button>
+    <button class="bt d" aria-label="Redo (Ctrl+Shift+Z)" disabled=""><svg class="ic"><use href="#i-redo"></use></svg></button>
+  </div>
+  <div class="sp"></div>
+  <div class="g">
+    <button class="bt" aria-label="Smaller ([)"><svg class="ic"><use href="#i-minus"></use></svg></button>
+    <div class="val"><span class="v">4</span><span class="u">line</span></div>
+    <button class="bt" aria-label="Larger (])"><svg class="ic"><use href="#i-plus"></use></svg></button>
+    <button class="bt" aria-label="Color (C)"><span class="sw" style="background:#F04438"></span></button>
+  </div>
+  <div class="sp"></div>
+  <div class="g">
+    <button class="bt" aria-label="Copy (Ctrl+C)"><svg class="ic"><use href="#i-copy"></use></svg></button>
+    <button class="bt" aria-label="Save (Ctrl+S)"><svg class="ic"><use href="#i-save"></use></svg></button>
+    <button class="bt" aria-label="Upload (Ctrl+U)"><svg class="ic"><use href="#i-cloud"></use></svg></button>
+    <button class="bt dg" aria-label="Close (Esc)"><svg class="ic"><use href="#i-x"></use></svg></button>
+  </div>
+</div>
+
+<!-- Toast -->
+<div style="position:absolute;left:0;right:0;top:836px;display:flex;justify-content:center">
+  <div class="ts"><svg class="ic" style="width:16px;height:16px;color:var(--ac)" aria-hidden="true"><use href="#i-info"></use></svg>Size 4</div>
+</div>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {};
+  }
+}
+</script>
+</body>
+</html>
