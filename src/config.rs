@@ -8,8 +8,11 @@ pub struct Config {
     pub save_path: String,
     /// strftime-like pattern, e.g. `%F_%H-%M`.
     pub filename_pattern: String,
-    /// Accent color for the overlay UI (Flameshot `uiColor`).
+    /// Accent override for the overlay UI (Flameshot `uiColor`); empty =
+    /// the theme's own accent.
     pub ui_color: String,
+    /// Overlay theme: "auto" (follow the OS), "dark" or "light".
+    pub theme: String,
     /// Darkness of the dimmed area outside the selection (0-255).
     pub contrast_opacity: u8,
     pub draw_color: String,
@@ -38,9 +41,10 @@ impl Default for Config {
         Self {
             save_path: String::new(),
             filename_pattern: "%F_%H-%M".into(),
-            ui_color: "#740096".into(),
-            contrast_opacity: 190,
-            draw_color: "#ff0000".into(),
+            ui_color: String::new(),
+            theme: "auto".into(),
+            contrast_opacity: 148,
+            draw_color: "#f04438".into(),
             draw_thickness: 3.0,
             draw_marker_size: 15.0,
             draw_pixelate_size: 12.0,
@@ -49,8 +53,8 @@ impl Default for Config {
             capture_hotkey: "Meta+Shift+X".into(),
             quit_hotkey: "Ctrl+Alt+Shift+Q".into(),
             user_colors: [
-                "#ffffff", "#ff0000", "#ffff00", "#00ff00", "#008000", "#00ffff", "#0000ff",
-                "#ff00ff", "#800080", "#800000", "#000000",
+                "#f04438", "#ff8a1f", "#ffc532", "#2dc06f", "#19b5d6", "#3b82f6", "#8b5cf6",
+                "#ec4899", "#ffffff", "#111318",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -141,6 +145,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
                 cfg.filename_pattern = as_string(val).map_err(|e| bad("string", &e))?
             }
             "ui_color" => cfg.ui_color = as_string(val).map_err(|e| bad("string", &e))?,
+            "theme" => cfg.theme = as_string(val).map_err(|e| bad("string", &e))?,
             "draw_color" => cfg.draw_color = as_string(val).map_err(|e| bad("string", &e))?,
             "capture_hotkey" => {
                 cfg.capture_hotkey = as_string(val).map_err(|e| bad("string", &e))?
@@ -191,6 +196,7 @@ pub fn to_toml(c: &Config) -> String {
         "save_path = {}\n\
          filename_pattern = {}\n\
          ui_color = {}\n\
+         theme = {}\n\
          contrast_opacity = {}\n\
          draw_color = {}\n\
          draw_thickness = {}\n\
@@ -207,6 +213,7 @@ pub fn to_toml(c: &Config) -> String {
         q(&c.save_path),
         q(&c.filename_pattern),
         q(&c.ui_color),
+        q(&c.theme),
         c.contrast_opacity,
         q(&c.draw_color),
         c.draw_thickness,
@@ -377,8 +384,8 @@ mod tests {
         let back = parse_config(&text).unwrap();
         assert_eq!(back.filename_pattern, "%F_%H-%M");
         assert_eq!(back.draw_thickness, 3.0);
-        assert_eq!(back.contrast_opacity, 190);
-        assert_eq!(back.user_colors.len(), 11);
+        assert_eq!(back.contrast_opacity, 148);
+        assert_eq!(back.user_colors.len(), 10);
         assert!(back.copy_url_after_upload);
     }
 

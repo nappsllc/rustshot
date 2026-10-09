@@ -7,6 +7,8 @@ mod icons;
 mod objects;
 mod pixbuf;
 mod raster;
+#[allow(dead_code)] // wired in Task 8
+mod theme;
 mod uifb;
 mod wind;
 
