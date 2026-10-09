@@ -64,6 +64,17 @@ jobs:
           manifest-path: packaging/flatpak/io.github.nappsllc.rustshot.yml
           cache-key: flatpak-builder-${{ github.sha }}
 
+  snap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: snapcore/action-build@v1
+        id: build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustshot-snap
+          path: ${{ steps.build.outputs.snap }}
+
   macos:
     runs-on: macos-latest
     steps:

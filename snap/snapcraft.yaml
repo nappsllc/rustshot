@@ -1,0 +1,41 @@
+name: rustshot
+base: core24
+adopt-info: rustshot
+summary: Capture, annotate and share screenshots
+description: |
+  rustshot captures the whole screen or a region and lets you annotate it
+  with arrows, lines, shapes, text, a highlighter and pixelation before
+  saving it, copying it to the clipboard or uploading it to imgur. A small
+  background daemon provides global hotkeys. Requires an X11 session.
+grade: stable
+confinement: strict
+license: GPL-3.0-only
+icon: packaging/icons/rustshot-256.png
+platforms:
+  amd64:
+
+apps:
+  rustshot:
+    command: bin/rustshot
+    common-id: io.github.nappsllc.rustshot
+    desktop: usr/share/applications/io.github.nappsllc.rustshot.desktop
+    plugs: [x11, network, home, desktop]
+
+parts:
+  rustshot:
+    plugin: rust
+    source: .
+    rust-channel: stable
+    build-packages: [libx11-dev]
+    stage-packages: [libx11-6]
+    parse-info: [usr/share/metainfo/io.github.nappsllc.rustshot.metainfo.xml]
+    override-build: |
+      craftctl default
+      install -Dm644 packaging/linux/io.github.nappsllc.rustshot.desktop \
+        "$CRAFT_PART_INSTALL/usr/share/applications/io.github.nappsllc.rustshot.desktop"
+      install -Dm644 packaging/linux/io.github.nappsllc.rustshot.metainfo.xml \
+        "$CRAFT_PART_INSTALL/usr/share/metainfo/io.github.nappsllc.rustshot.metainfo.xml"
+      install -Dm644 packaging/icons/rustshot-256.png \
+        "$CRAFT_PART_INSTALL/usr/share/icons/hicolor/256x256/apps/io.github.nappsllc.rustshot.png"
+      install -Dm644 LICENSE "$CRAFT_PART_INSTALL/usr/share/doc/rustshot/LICENSE"
+      install -Dm644 THIRD_PARTY_NOTICES.md "$CRAFT_PART_INSTALL/usr/share/doc/rustshot/THIRD_PARTY_NOTICES.md"
