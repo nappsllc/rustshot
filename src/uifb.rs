@@ -117,10 +117,10 @@ impl<'a> Fb<'a> {
         let (x1, y1) = (x0 + w, y0 + h);
         let half = thickness / 2.0;
         let fh = self.height();
-        let ys = y0.floor().max(0.0) as i32;
-        let ye = ((y1 + half).ceil() as i32).min(fh);
-        let xs = x0.floor().max(0.0) as i32;
-        let xe = ((x1 + half).ceil() as i32).min(self.stride as i32);
+        let ys = (y0 - half - 1.0).floor().max(0.0) as i32;
+        let ye = ((y1 + half + 1.0).ceil() as i32).min(fh);
+        let xs = (x0 - half - 1.0).floor().max(0.0) as i32;
+        let xe = ((x1 + half + 1.0).ceil() as i32).min(self.stride as i32);
         for y in ys..ye {
             for x in xs..xe {
                 let cx = x as f32 + 0.5;
@@ -399,6 +399,19 @@ mod tests {
         assert!(adv > 5.0);
         let lit = fb.as_chunks::<4>().0.iter().filter(|p| p[0] > 128).count();
         assert!(lit > 20, "only {lit} lit pixels");
+    }
+
+    #[test]
+    fn stroke_rect_is_symmetric() {
+        let stride = 20;
+        let mut d = vec![0u8; stride * 20 * 4];
+        Fb::new(&mut d, stride).stroke_rect(5.0, 5.0, 10.0, 10.0, 1.0, C4::rgb(255, 255, 255));
+        let at = |x: usize, y: usize| d[(y * stride + x) * 4];
+        // Edge at x=5 / x=15 covers half of columns 4 and 5 / 14 and 15 equally.
+        assert_eq!(at(4, 10), at(15, 10), "left vs right outer half");
+        assert_eq!(at(10, 4), at(10, 15), "top vs bottom outer half");
+        assert!(at(4, 10) > 60, "outer half drawn: {}", at(4, 10));
+        assert_eq!(at(10, 10), 0, "hollow");
     }
 
     #[test]

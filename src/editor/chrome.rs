@@ -211,6 +211,7 @@ fn dot(f: &mut Fb, ui: &Ui, r: FRect, c: C4, (selected, hovered): (bool, bool), 
 /// Accent border with dark (or light) outer/inner lines, plus 8 handles:
 /// white 6 ⌀ dot, 2 px accent ring (3 when hot), 1 px halo.
 pub fn selection(f: &mut Fb, ui: &Ui, sr: FRect, hot: Option<usize>, k: f32) {
+    let sr = round(sr);
     let th = ui.th;
     let lw = ui.line();
     let grow = |d: f32| FRect { x: sr.x - d, y: sr.y - d, w: sr.w + 2.0 * d, h: sr.h + 2.0 * d };
