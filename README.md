@@ -1,0 +1,177 @@
+# rustshot
+
+A fast, tiny screenshot and annotation tool for **Windows, macOS and Linux**,
+modelled on [Flameshot](https://flameshot.org) and written in Rust.
+
+Press a hotkey, drag a region, annotate it, and copy, save or upload it.
+The whole app is a single ~550 KB native binary with no runtime and no GUI
+toolkit: every pixel of the overlay is drawn by rustshot's own anti-aliased
+renderer.
+
+![rustshot overlay, dark theme](docs/screenshots/overlay-dark.png)
+
+| Light theme | Color palette | Text tool |
+|---|---|---|
+| ![Light theme](docs/screenshots/overlay-light.png) | ![Palette](docs/screenshots/palette.png) | ![Text tool](docs/screenshots/text-tool.png) |
+
+## Features
+
+- **Region capture** with resize handles, arrow-key nudging, and a live
+  `W × H` size readout. A single click selects the whole screen.
+- **Annotation tools:** pencil, line, arrow, rectangle, ellipse, highlighter,
+  text, pixelate and invert, with Shift constraints (squares, circles, 45°
+  lines) and unlimited undo/redo.
+- **Export:** copy to the clipboard, save as PNG (native save dialog), or
+  upload to imgur with the link copied for you.
+- **Modern overlay UI:** dark and light themes that follow your OS, a grouped
+  toolbar that wraps and repositions near screen edges, tooltips with the real
+  shortcuts, and short animations.
+- **Multi-monitor aware:** spans all monitors when they share a scale factor;
+  the toolbar and notices stay on the monitor you're working on.
+- **Global hotkey daemon** (default <kbd>Meta</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd>).
+- **Scriptable CLI** for headless captures (`rustshot full --clip`,
+  `--region`, `--raw` to stdout, `--upload`, delays).
+- **Update notices** for direct downloads (store installs update themselves).
+
+## Install
+
+Download the latest build from
+**[GitHub Releases](https://github.com/nappsllc/rustshot/releases/latest)**:
+
+| Platform | File | Notes |
+|---|---|---|
+| Windows 10/11 | `rustshot-<v>-setup.exe` | Per-user installer, no admin needed; optional desktop shortcut and start-with-Windows. |
+| Windows (portable) | `rustshot-<v>-windows-x86_64.exe` | Single executable. |
+| macOS 11+ | `rustshot-<v>-macos-universal.dmg` | Universal (Apple Silicon + Intel). Drag to Applications. |
+| Debian / Ubuntu | `rustshot-<v>-amd64.deb` | `sudo apt install ./rustshot-<v>-amd64.deb` |
+| Any Linux | `rustshot-<v>-x86_64.AppImage` | `chmod +x` and run. |
+| Any Linux | `rustshot.flatpak` | `flatpak install --user rustshot.flatpak` |
+| Any Linux | `rustshot_<v>_amd64.snap` | `sudo snap install --dangerous rustshot_<v>_amd64.snap` |
+| Any Linux | `rustshot-<v>-linux-x86_64.tar.gz` | Binary + desktop file; see `INSTALL.txt` inside. |
+
+Store and package-manager listings (Microsoft Store, winget, Mac App Store,
+Homebrew, Flathub, Snap Store, AUR) are being set up; see
+[docs/STORES.md](docs/STORES.md).
+
+> **Unsigned builds.** Current releases are not code-signed yet. Windows
+> SmartScreen may warn on first run (More info › Run anyway); on macOS,
+> right-click the app › Open the first time.
+
+## Usage
+
+Start the background daemon once (the installers can do this at login):
+
+```bash
+rustshot daemon
+```
+
+Then press <kbd>Meta</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> (<kbd>Win</kbd> on
+Windows, <kbd>⌘</kbd> on macOS) to capture. Quit the daemon with
+<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>Q</kbd>.
+
+Or capture directly from a terminal:
+
+```bash
+rustshot                          # interactive capture (same as `rustshot gui`)
+rustshot gui --clip               # select, annotate, Enter copies to clipboard
+rustshot full --path ~/Pictures   # whole desktop, no editor
+rustshot screen -n 1 --edit       # second monitor, open the editor
+rustshot gui --region 800x600+100+100 --upload
+rustshot full --raw > shot.png    # PNG bytes to stdout
+rustshot update                   # check for a newer release
+rustshot --help
+```
+
+### Editor shortcuts
+
+| Action | Keys |
+|---|---|
+| Pencil / Line / Arrow | <kbd>P</kbd> / <kbd>L</kbd> (or <kbd>D</kbd>) / <kbd>A</kbd> |
+| Rectangle / Ellipse / Marker | <kbd>R</kbd> / <kbd>C</kbd> / <kbd>M</kbd> |
+| Text / Pixelate / Invert | <kbd>T</kbd> / <kbd>B</kbd> / <kbd>I</kbd> |
+| Stroke size | mouse wheel, or the − / + buttons |
+| Undo / Redo | <kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> (or <kbd>Ctrl</kbd>+<kbd>Y</kbd>) |
+| Copy / Save / Upload | <kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>U</kbd> |
+| Accept (save, or run the `--clip`/`--path` tasks) | <kbd>Enter</kbd> |
+| Drop the current tool / cancel | <kbd>Esc</kbd> |
+| Move / resize the selection | arrow keys / <kbd>Shift</kbd>+arrows |
+| Square, circle, 45° line | hold <kbd>Shift</kbd> while drawing |
+| Keep aspect ratio while resizing | hold <kbd>Ctrl</kbd> |
+
+On macOS, <kbd>⌘</kbd> works wherever <kbd>Ctrl</kbd> is listed.
+
+## Configuration
+
+rustshot reads an optional `config.toml`:
+
+| OS | Path |
+|---|---|
+| Windows | `%APPDATA%\rustshot\config.toml` |
+| macOS / Linux | `$XDG_CONFIG_HOME/rustshot/config.toml` or `~/.config/rustshot/config.toml` |
+
+`rustshot config` prints the path; `rustshot config --check` validates the
+file. Every key is optional:
+
+```toml
+save_path = ""                    # default save folder ("" = Pictures)
+filename_pattern = "%F_%H-%M"     # strftime-style
+theme = "auto"                    # "auto" (follow the OS), "dark" or "light"
+ui_color = ""                     # accent override, e.g. "#8b93ff" ("" = theme accent)
+contrast_opacity = 148            # dim strength outside the selection (0-255)
+draw_color = "#f04438"
+draw_thickness = 3.0
+draw_marker_size = 15.0
+draw_pixelate_size = 12.0
+draw_font_size = 16.0
+undo_limit = 100
+user_colors = ["#f04438", "#ff8a1f", "#ffc532", "#2dc06f", "#19b5d6",
+               "#3b82f6", "#8b5cf6", "#ec4899", "#ffffff", "#111318"]
+capture_hotkey = "Meta+Shift+X"
+quit_hotkey = "Ctrl+Alt+Shift+Q"
+copy_url_after_upload = true
+capture_active_monitor = false    # true = only the monitor under the cursor
+check_updates = true              # daemon checks GitHub once a day
+upload_client_id = "313baf0c7b4d3ff"
+```
+
+## Platform notes
+
+- **Linux** needs an **X11** session (or XWayland). Native Wayland capture and
+  hotkeys are not supported yet. Runtime dependencies: `libx11`, `libxrandr`.
+- **Mixed-DPI setups** (for example a 150 % laptop with a 100 % monitor): the
+  editor captures the monitor under the cursor instead of spanning all of them.
+- **macOS** asks for *Screen Recording* permission on first capture
+  (System Settings › Privacy & Security).
+
+## Building from source
+
+Requires Rust 1.87+ (edition 2024). On Linux also install the X11 headers
+(`libx11-dev libxrandr-dev` on Debian/Ubuntu).
+
+```bash
+cargo build --release          # target/release/rustshot(.exe)
+cargo test                     # unit tests
+cargo test -- --ignored        # live display / clipboard / network tests
+```
+
+Packaging scripts live in [`packaging/`](packaging) (NSIS, MSIX, `.app`/dmg,
+deb, AppImage, Flatpak, Snap, AUR, Homebrew). CI builds all of them on every
+push; pushing a `vX.Y.Z` tag that matches `Cargo.toml` publishes a GitHub
+Release ([`.github/workflows/release.yml`](.github/workflows/release.yml)).
+
+Design references: [docs/design/rustshot-ui](docs/design/rustshot-ui) (UI
+boards) and [docs/superpowers](docs/superpowers) (specs and plans).
+
+## Privacy
+
+No telemetry. Images leave your machine only when you choose **Upload**. The
+daemon's update check is a single anonymous request to the GitHub Releases
+API, at most once a day, and can be turned off with `check_updates = false`.
+See [PRIVACY.md](PRIVACY.md).
+
+## License
+
+rustshot is free software under the **GNU General Public License v3.0 only**
+([LICENSE](LICENSE)). Its behaviour and UI are modelled on Flameshot (also
+GPL-3.0). It bundles the Inter font (SIL OFL 1.1) and Lucide icons (ISC); see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
