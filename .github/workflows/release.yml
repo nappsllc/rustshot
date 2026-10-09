@@ -92,3 +92,58 @@ jobs:
           $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/rustshot-$v-setup.exe"
           Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
           .\wingetcreate.exe update nappsllc.rustshot --version $v --urls $url --submit --token $env:WINGET_TOKEN
+
+  snap:
+    needs: publish
+    if: vars.PUBLISH_SNAP == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustshot-snap
+          path: artifacts
+      - id: find
+        run: echo "snap=$(ls artifacts/*.snap)" >> "$GITHUB_OUTPUT"
+      - uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: ${{ steps.find.outputs.snap }}
+          release: edge
+
+  aur:
+    needs: publish
+    if: vars.PUBLISH_AUR == 'true'
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustshot-linux
+          path: artifacts
+      - name: Render and push rustshot-bin
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm git openssh
+          git config --global --add safe.directory '*'
+          v="${GITHUB_REF_NAME#v}"
+          sum=$(sha256sum "artifacts/rustshot-$v-linux-x86_64.tar.gz" | cut -d' ' -f1)
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur"
+          git clone ssh://aur@aur.archlinux.org/rustshot-bin.git aur
+          sed -e "s/@VERSION@/$v/" -e "s/@SHA256@/$sum/" packaging/aur/PKGBUILD.in > aur/PKGBUILD
+          useradd -m builder
+          chown -R builder aur
+          (cd aur && su builder -c 'makepkg --printsrcinfo' > .SRCINFO)
+          cd aur
+          git config user.name "rustshot release"
+          git config user.email "noreply@github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to $v"
+          git push

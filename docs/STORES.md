@@ -9,6 +9,8 @@ manual first submission where noted.
 ## Before any store: screenshots
 - [ ] Capture `docs/screenshots/overlay-dark.png` (and `overlay-light.png`) from
       the redesigned UI, 1440×900 or larger; commit to `main`.
+- [ ] Add a `<release>` entry to packaging/linux/io.github.nappsllc.rustshot.metainfo.xml
+      for every tag (newest first).
 
 ## Microsoft Store (MSIX)
 1. Partner Center account (individual or company): https://partner.microsoft.com/dashboard
@@ -47,6 +49,29 @@ Store upload package; end users cannot install it directly.
 ## Known issues
 - Linux builds are X11-only; Wayland sessions need XWayland (stated in metainfo).
 
-## macOS and Linux
-Mac App Store, Homebrew, Flathub, Snap Store and AUR packaging are planned
-(see docs/superpowers/plans/2026-10-09-store-packaging.md) and not built yet.
+## Flathub
+1. Wait for the screenshots, then open a PR to https://github.com/flathub/flathub
+   (branch `new-pr`) with `io.github.nappsllc.rustshot.yml` copied from
+   `packaging/flatpak/`, its `dir` source replaced by
+   `type: git, url: https://github.com/nappsllc/rustshot.git, tag: v<x.y.z>, commit: <sha>`,
+   plus `cargo-sources.json`. Flathub verifies `io.github.nappsllc` via the GitHub org.
+2. After acceptance, update the Flathub repo per release (tag + commit +
+   regenerated `cargo-sources.json`) or add `x-checker-data`.
+3. Regenerate sources whenever `Cargo.lock` changes:
+   `python flatpak-cargo-generator.py Cargo.lock -o packaging/flatpak/cargo-sources.json`.
+
+## Snap Store
+1. https://snapcraft.io account; `snapcraft register rustshot`.
+2. `snapcraft export-login --snaps=rustshot --channels=edge,stable --acls=package_upload -`
+   → secret `SNAPCRAFT_STORE_CREDENTIALS`.
+3. Set `PUBLISH_SNAP=true`. Builds land on `edge`; promote with
+   `snapcraft release rustshot <rev> stable`.
+
+## AUR
+1. https://aur.archlinux.org account with an SSH key; private key → secret `AUR_SSH_KEY`.
+2. First push creates the package: the release job clones
+   `ssh://aur@aur.archlinux.org/rustshot-bin.git` (empty repo is fine).
+3. Set `PUBLISH_AUR=true`.
+
+## macOS
+Mac App Store and Homebrew packaging are planned (docs/superpowers/plans/2026-10-09-store-packaging.md) and not built yet.

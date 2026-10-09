@@ -1,0 +1,21 @@
+# Maintainer: nappsllc <noreply@github.com>
+pkgname=rustshot-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Screenshot capture with annotation, upload and global hotkeys (X11)"
+arch=('x86_64')
+url="https://github.com/nappsllc/rustshot"
+license=('GPL-3.0-only')
+depends=('libx11')
+provides=('rustshot')
+conflicts=('rustshot')
+source=("https://github.com/nappsllc/rustshot/releases/download/v${pkgver}/rustshot-${pkgver}-linux-x86_64.tar.gz")
+sha256sums=('@SHA256@')
+
+package() {
+  install -Dm755 rustshot "$pkgdir/usr/bin/rustshot"
+  install -Dm644 io.github.nappsllc.rustshot.desktop "$pkgdir/usr/share/applications/io.github.nappsllc.rustshot.desktop"
+  install -Dm644 io.github.nappsllc.rustshot.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/io.github.nappsllc.rustshot.png"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 THIRD_PARTY_NOTICES.md "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES.md"
+}
