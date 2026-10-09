@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.nappsllc.rustshot</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <name>rustshot</name>
+  <summary>Capture, annotate and share screenshots</summary>
+  <developer id="io.github.nappsllc">
+    <name>nappsllc</name>
+  </developer>
+  <description>
+    <p>
+      rustshot captures the whole screen or a region and lets you annotate it
+      with arrows, lines, shapes, text, a highlighter and pixelation before
+      saving it, copying it to the clipboard or uploading it to imgur.
+    </p>
+    <p>
+      A small background daemon provides global hotkeys. rustshot currently
+      needs an X11 session (or XWayland).
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.nappsllc.rustshot.desktop</launchable>
+  <url type="homepage">https://github.com/nappsllc/rustshot</url>
+  <url type="bugtracker">https://github.com/nappsllc/rustshot/issues</url>
+  <url type="vcs-browser">https://github.com/nappsllc/rustshot</url>
+  <content_rating type="oars-1.1"/>
+  <provides>
+    <binary>rustshot</binary>
+  </provides>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <categories>
+    <category>Graphics</category>
+    <category>Utility</category>
+  </categories>
+  <keywords>
+    <keyword>screenshot</keyword>
+    <keyword>capture</keyword>
+    <keyword>annotate</keyword>
+  </keywords>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Annotating a selection</caption>
+      <image>https://raw.githubusercontent.com/nappsllc/rustshot/main/docs/screenshots/overlay-dark.png</image>
+    </screenshot>
+  </screenshots>
+  <releases>
+    <release version="0.1.0" date="2026-10-09"/>
+  </releases>
+</component>

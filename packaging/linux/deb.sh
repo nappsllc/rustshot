@@ -17,12 +17,15 @@ rm -rf "$stage"
 mkdir -p "$stage/DEBIAN" \
          "$stage/usr/bin" \
          "$stage/usr/share/applications" \
-         "$stage/usr/share/doc/rustshot" \
-         "$stage/usr/share/icons/hicolor/256x256/apps"
+         "$stage/usr/share/metainfo" \
+         "$stage/usr/share/doc/rustshot"
 
 install -m755 "$bin" "$stage/usr/bin/rustshot"
-install -m644 packaging/linux/rustshot.desktop "$stage/usr/share/applications/rustshot.desktop"
-install -m644 packaging/icons/rustshot-256.png "$stage/usr/share/icons/hicolor/256x256/apps/rustshot.png"
+install -m644 packaging/linux/io.github.nappsllc.rustshot.desktop "$stage/usr/share/applications/io.github.nappsllc.rustshot.desktop"
+install -m644 packaging/linux/io.github.nappsllc.rustshot.metainfo.xml "$stage/usr/share/metainfo/io.github.nappsllc.rustshot.metainfo.xml"
+for s in 128 256 512; do
+  install -Dm644 "packaging/icons/rustshot-$s.png" "$stage/usr/share/icons/hicolor/${s}x${s}/apps/io.github.nappsllc.rustshot.png"
+done
 install -m644 LICENSE "$stage/usr/share/doc/rustshot/copyright"
 install -m644 THIRD_PARTY_NOTICES.md "$stage/usr/share/doc/rustshot/THIRD_PARTY_NOTICES.md"
 

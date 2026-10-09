@@ -18,8 +18,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install X11 headers
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev desktop-file-utils
+      - name: Install X11 headers and validators
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev desktop-file-utils appstream
+      - name: Validate desktop entry and AppStream metadata
+        run: |
+          desktop-file-validate packaging/linux/io.github.nappsllc.rustshot.desktop
+          appstreamcli validate --no-net packaging/linux/io.github.nappsllc.rustshot.metainfo.xml
       - name: Test
         run: cargo test
       - name: Clippy

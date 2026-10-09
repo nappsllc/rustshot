@@ -18,7 +18,8 @@ stage="dist/stage-linux"
 rm -rf "$stage"
 mkdir -p "$stage"
 cp "$bin" "$stage/rustshot"
-cp packaging/linux/rustshot.desktop "$stage/"
+cp packaging/linux/io.github.nappsllc.rustshot.desktop "$stage/"
+cp packaging/icons/rustshot-256.png "$stage/io.github.nappsllc.rustshot.png"
 cp LICENSE "$stage/LICENSE"
 cp THIRD_PARTY_NOTICES.md "$stage/"
 cat > "$stage/INSTALL.txt" <<EOF
@@ -27,7 +28,8 @@ rustshot $version (linux x86_64, X11)
 1. Move the binary onto your PATH:
        install -Dm755 rustshot ~/.local/bin/rustshot
 2. Install the desktop entry (global hotkeys via your session autostart):
-       install -Dm644 rustshot.desktop ~/.local/share/applications/rustshot.desktop
+       install -Dm644 io.github.nappsllc.rustshot.desktop ~/.local/share/applications/io.github.nappsllc.rustshot.desktop
+       install -Dm644 io.github.nappsllc.rustshot.png ~/.local/share/icons/hicolor/256x256/apps/io.github.nappsllc.rustshot.png
 3. Start the daemon (registers the global hotkeys):
        rustshot daemon
 
