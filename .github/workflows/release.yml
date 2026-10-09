@@ -44,3 +44,34 @@ jobs:
             --title "rustshot $GITHUB_REF_NAME" \
             --generate-notes \
             artifacts/*/*
+
+  msstore:
+    needs: publish
+    if: vars.PUBLISH_MSSTORE == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rustshot-windows-msix
+          path: artifacts
+      - uses: microsoft/setup-msstore-cli@v1
+      - name: Submit to Partner Center
+        run: |
+          msstore reconfigure --tenantId "${{ secrets.MSSTORE_TENANT_ID }}" --sellerId "${{ vars.MSSTORE_SELLER_ID }}" `
+            --clientId "${{ secrets.MSSTORE_CLIENT_ID }}" --clientSecret "${{ secrets.MSSTORE_CLIENT_SECRET }}"
+          $pkg = Get-ChildItem artifacts\*.msix | Where-Object Name -notlike '*sideload*' | Select-Object -First 1
+          msstore publish $pkg.FullName -id "${{ vars.MSSTORE_APP_ID }}"
+
+  winget:
+    needs: publish
+    if: vars.PUBLISH_WINGET == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Open winget-pkgs PR
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart('v')
+          $url = "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/rustshot-$v-setup.exe"
+          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          .\wingetcreate.exe update nappsllc.rustshot --version $v --urls $url --submit --token $env:WINGET_TOKEN
