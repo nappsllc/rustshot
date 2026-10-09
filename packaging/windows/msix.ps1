@@ -8,6 +8,10 @@ Set-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
 
 $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
 if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "MSIX needs a plain x.y.z version, got '$v'" }
+# Drop outputs from earlier runs so CI never uploads a stale package.
+$out = "dist\rustshot-$v-x64.msix"
+$signed = "dist\rustshot-$v-x64-sideload.msix"
+foreach ($f in $out, $signed) { if (Test-Path $f) { Remove-Item $f -Force } }
 $exe = 'target\release\rustshot.exe'
 if (-not (Test-Path $exe)) { throw "$exe missing (cargo build --release first)" }
 
@@ -31,24 +35,25 @@ $manifest = (Get-Content packaging\windows\AppxManifest.xml.in -Raw).
     Replace('@VERSION@', "$v.0")
 Set-Content -Path "$stage\AppxManifest.xml" -Value $manifest -Encoding utf8
 
-$bin = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.*\x64\makeappx.exe" |
-    Sort-Object FullName -Descending | Select-Object -First 1
+$bin = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.*\x64\makeappx.exe" -ErrorAction SilentlyContinue |
+    Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
 if (-not $bin) { throw 'makeappx.exe not found (install the Windows 10/11 SDK)' }
 $sdk = $bin.DirectoryName
 
-$out = "dist\rustshot-$v-x64.msix"
 & "$sdk\makeappx.exe" pack /o /d $stage /p $out
 if ($LASTEXITCODE) { throw "makeappx failed ($LASTEXITCODE)" }
 Write-Host "wrote $out"
 
 if ($env:MSIX_SIGN_PFX) {
+    if (-not (Test-Path "$sdk\signtool.exe")) { throw "signtool.exe not found in $sdk (install the Windows SDK signing tools)" }
     $pfx = Join-Path ([System.IO.Path]::GetTempPath()) 'rustshot-sideload.pfx'
-    [System.IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:MSIX_SIGN_PFX))
-    $signed = "dist\rustshot-$v-x64-sideload.msix"
-    Copy-Item $out $signed -Force
-    & "$sdk\signtool.exe" sign /fd SHA256 /f $pfx /p $env:MSIX_SIGN_PASSWORD $signed
-    $rc = $LASTEXITCODE
-    Remove-Item $pfx -Force
-    if ($rc) { throw "signtool failed ($rc)" }
+    try {
+        [System.IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:MSIX_SIGN_PFX))
+        Copy-Item $out $signed -Force
+        & "$sdk\signtool.exe" sign /fd SHA256 /f $pfx /p $env:MSIX_SIGN_PASSWORD $signed
+        if ($LASTEXITCODE) { throw "signtool failed ($LASTEXITCODE)" }
+    } finally {
+        Remove-Item $pfx -Force -ErrorAction SilentlyContinue
+    }
     Write-Host "wrote $signed"
 }
