@@ -12,6 +12,8 @@ ManifestDPIAware true
 SetCompressor /SOLID lzma
 
 Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
+Icon "icons\rustshot.ico"
+UninstallIcon "icons\rustshot.ico"
 BrandingText "${PRODUCT_NAME} ${PRODUCT_VERSION}"
 OutFile "..\dist\${PRODUCT_NAME}-${PRODUCT_VERSION}-setup.exe"
 InstallDir "$LOCALAPPDATA\${PRODUCT_NAME}"
