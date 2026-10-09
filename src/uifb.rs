@@ -312,6 +312,7 @@ impl<'a> Fb<'a> {
                 let into = phase % period;
                 let on = into < dash;
                 let seg = if on { dash - into } else { period - into }.min(len - t);
+                let seg = seg.max(1e-3);
                 if on {
                     s.stroke_polyline(
                         &[lerp(a, b, t / len), lerp(a, b, (t + seg) / len)],
@@ -451,5 +452,13 @@ mod tests {
         let top: Vec<u8> = (2..38).map(|x| d[(2 * 40 + x) * 4]).collect();
         assert!(top.iter().any(|v| *v > 200), "{top:?}");
         assert!(top.iter().any(|v| *v < 30), "{top:?}");
+    }
+
+    #[test]
+    fn dashed_rect_terminates_on_awkward_periods() {
+        let mut d = vec![0u8; 400 * 300 * 4];
+        let r = FRect { x: 1.5, y: 1.5, w: 397.0, h: 297.0 };
+        Fb::new(&mut d, 400).stroke_dashed_rect(r, 3.3, 0.7, 1.0, C4::rgb(255, 255, 255));
+        assert!(d.as_chunks::<4>().0.iter().any(|p| p[0] > 200));
     }
 }
