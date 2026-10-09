@@ -7,6 +7,8 @@ use std::sync::mpsc::Sender;
 pub enum Instance {
     Primary(Guard),
     Signalled,
+    /// Single-instance protection is unavailable: run as the daemon without a guard.
+    Solo,
 }
 
 pub fn acquire_or_signal() -> Instance {
@@ -131,9 +133,7 @@ mod imp {
             let mutex = match CreateMutexW(None, true, w!("Local\\rustshot-daemon")) {
                 Ok(h) => h,
                 // Cannot tell; behave as the sole instance without a guard.
-                Err(_) => {
-                    return Instance::Primary(super::Guard(Inner { mutex: HANDLE::default(), thread_id: 0, thread: None }));
-                }
+                Err(_) => return Instance::Solo,
             };
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 let _ = CloseHandle(mutex);
@@ -147,11 +147,15 @@ mod imp {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-                return Instance::Signalled;
+                eprintln!("error: another rustshot is starting but not responding");
+                std::process::exit(1);
             }
             let (thread_id, thread) = match spawn_window() {
                 Some((id, t)) => (id, Some(t)),
-                None => (0, None),
+                None => {
+                    eprintln!("error: could not create the tray window; running without tray or single-instance signalling");
+                    (0, None)
+                }
             };
             Instance::Primary(super::Guard(Inner { mutex, thread_id, thread }))
         }
@@ -161,10 +165,13 @@ mod imp {
 #[cfg(unix)]
 mod imp {
     use super::{HotEvent, Instance};
+    use std::fs::{File, OpenOptions};
     use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::Sender;
+    use std::time::Duration;
 
     /// Pure path logic: Linux prefers `$XDG_RUNTIME_DIR/rustshot.sock`, otherwise
     /// `/tmp/rustshot-<uid>.sock`; macOS uses `$TMPDIR/rustshot-<uid>.sock`.
@@ -193,6 +200,8 @@ mod imp {
     pub struct Inner {
         listener: UnixListener,
         path: PathBuf,
+        /// Holds the exclusive flock for the daemon's lifetime.
+        _lock: File,
     }
 
     impl Inner {
@@ -200,7 +209,15 @@ mod imp {
             let Ok(listener) = self.listener.try_clone() else { return };
             std::thread::spawn(move || {
                 for conn in listener.incoming() {
-                    let Ok(conn) = conn else { continue };
+                    let conn = match conn {
+                        Ok(c) => c,
+                        Err(_) => {
+                            std::thread::sleep(Duration::from_millis(100));
+                            continue;
+                        }
+                    };
+                    // A silent client must not block later signals.
+                    let _ = conn.set_read_timeout(Some(Duration::from_secs(1)));
                     let mut line = String::new();
                     if BufReader::new(conn).read_line(&mut line).is_ok()
                         && line.trim() == "capture"
@@ -219,27 +236,81 @@ mod imp {
         }
     }
 
+    unsafe extern "C" {
+        fn flock(fd: i32, op: i32) -> i32;
+    }
+    const LOCK_EX_NB: i32 = 2 | 4;
+
+    /// Sibling lock file: `<socket path>.lock`.
+    pub fn lock_path(sock: &Path) -> PathBuf {
+        let mut s = sock.as_os_str().to_owned();
+        s.push(".lock");
+        PathBuf::from(s)
+    }
+
+    enum Lock {
+        Held(File),
+        Busy,
+        Unavailable(std::io::Error),
+    }
+
+    fn try_lock(path: &Path) -> Lock {
+        let file = match OpenOptions::new().create(true).truncate(false).write(true).open(path) {
+            Ok(f) => f,
+            Err(e) => return Lock::Unavailable(e),
+        };
+        if unsafe { flock(file.as_raw_fd(), LOCK_EX_NB) } == 0 {
+            return Lock::Held(file);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            Lock::Busy
+        } else {
+            Lock::Unavailable(err)
+        }
+    }
+
     fn signal(path: &Path) -> bool {
         UnixStream::connect(path).and_then(|mut s| s.write_all(b"capture\n")).is_ok()
     }
 
-    pub fn acquire_at(path: &Path) -> Instance {
-        for _ in 0..2 {
-            if signal(path) {
-                return Instance::Signalled;
+    fn solo(err: impl std::fmt::Display) -> Option<Instance> {
+        eprintln!("warning: single-instance socket unavailable ({err}); running without it");
+        Some(Instance::Solo)
+    }
+
+    /// `None` = another primary exists but could not be signalled.
+    pub fn acquire_at(path: &Path) -> Option<Instance> {
+        match try_lock(&lock_path(path)) {
+            Lock::Held(lock) => {
+                // We are the primary: any socket file is stale.
+                let _ = std::fs::remove_file(path);
+                match UnixListener::bind(path) {
+                    Ok(listener) => {
+                        Some(Instance::Primary(super::Guard(Inner { listener, path: path.to_path_buf(), _lock: lock })))
+                    }
+                    Err(e) => solo(e),
+                }
             }
-            // Nobody answered: any socket file is stale.
-            let _ = std::fs::remove_file(path);
-            if let Ok(listener) = UnixListener::bind(path) {
-                return Instance::Primary(super::Guard(Inner { listener, path: path.to_path_buf() }));
+            Lock::Busy => {
+                // The primary may still be binding; retry briefly.
+                for _ in 0..20 {
+                    if signal(path) {
+                        return Some(Instance::Signalled);
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                None
             }
+            Lock::Unavailable(e) => solo(e),
         }
-        // Another instance won the bind race and is not answering yet.
-        Instance::Signalled
     }
 
     pub fn acquire_or_signal() -> Instance {
-        acquire_at(&default_path())
+        acquire_at(&default_path()).unwrap_or_else(|| {
+            eprintln!("error: another rustshot is running but not responding");
+            std::process::exit(1);
+        })
     }
 
     #[cfg(test)]
@@ -269,16 +340,50 @@ mod imp {
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("t.sock");
             let _ = std::fs::remove_file(&path);
-            let Instance::Primary(g) = acquire_at(&path) else { panic!("first must be primary") };
+            let Some(Instance::Primary(g)) = acquire_at(&path) else { panic!("first must be primary") };
             let (tx, rx) = mpsc::channel();
             g.listen(tx);
-            assert!(matches!(acquire_at(&path), Instance::Signalled));
+            assert!(matches!(acquire_at(&path), Some(Instance::Signalled)));
             assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(HotEvent::Capture));
             drop(g);
             assert!(!path.exists());
             // A stale socket file is replaced.
             drop(UnixListener::bind(&path).unwrap());
-            assert!(matches!(acquire_at(&path), Instance::Primary(_)));
+            assert!(matches!(acquire_at(&path), Some(Instance::Primary(_))));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn lock_path_is_sibling() {
+            assert_eq!(lock_path(Path::new("/run/u/rustshot.sock")), PathBuf::from("/run/u/rustshot.sock.lock"));
+        }
+
+        #[test]
+        fn held_lock_means_signal_not_second_primary() {
+            let dir = std::env::temp_dir().join(format!("rustshot-flock-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("t.sock");
+            let Some(Instance::Primary(g)) = acquire_at(&path) else { panic!("first must be primary") };
+            let (tx, rx) = mpsc::channel();
+            g.listen(tx);
+            // The lock is held, so a second acquire must take the signal path.
+            assert!(matches!(try_lock(&lock_path(&path)), Lock::Busy));
+            assert!(matches!(acquire_at(&path), Some(Instance::Signalled)));
+            assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(HotEvent::Capture));
+            drop(g);
+            // Released with the guard: a new primary can start.
+            assert!(matches!(acquire_at(&path), Some(Instance::Primary(_))));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn bind_failure_is_solo() {
+            let dir = std::env::temp_dir().join(format!("rustshot-solo-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            // Path longer than sun_path: lock file opens fine, bind fails.
+            let long = dir.join("x".repeat(200)).join("s.sock");
+            std::fs::create_dir_all(long.parent().unwrap()).unwrap();
+            assert!(matches!(acquire_at(&long), Some(Instance::Solo)));
             let _ = std::fs::remove_dir_all(&dir);
         }
     }

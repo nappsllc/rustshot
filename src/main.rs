@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 enum Cmd {
-    /// Interactive capture: select a region, annotate, then export (default).
+    /// Interactive capture: select a region, annotate, then export.
     Gui(CaptureArgs),
     /// Capture the whole desktop directly (add --edit for the editor).
     Full(CaptureArgs),
@@ -76,7 +76,7 @@ struct CaptureArgs {
 }
 
 enum Parsed {
-    /// None = no subcommand given (run the default `gui`).
+    /// None = no subcommand given (run the background daemon).
     Cmd(Option<Cmd>),
     Help(String),
 }
@@ -434,12 +434,13 @@ fn run() -> Result<()> {
         Cmd::Daemon => {
             let guard = match instance::acquire_or_signal() {
                 instance::Instance::Signalled => std::process::exit(0),
-                instance::Instance::Primary(g) => g,
+                instance::Instance::Primary(g) => Some(g),
+                instance::Instance::Solo => None,
             };
             let cfg = config::load();
             let exit_code = Arc::new(AtomicI32::new(0));
             let slot: UploadSlot = Arc::new(Mutex::new(None));
-            let mut code = editor::run(cfg.clone(), RunKind::Daemon, None, exit_code, slot.clone(), Some(guard));
+            let mut code = editor::run(cfg.clone(), RunKind::Daemon, None, exit_code, slot.clone(), guard);
             if let Some(rx) = slot.lock().unwrap().take()
                 && export::wait_upload(rx, cfg.copy_url_after_upload).is_none() {
                     code = 1;

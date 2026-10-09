@@ -62,8 +62,11 @@ Homebrew, Flathub, Snap Store, AUR) are being set up; see
 Start the background daemon once (the installers can do this at login):
 
 ```bash
-rustshot daemon
+rustshot          # or `rustshot daemon`
 ```
+
+Launching rustshot again while it is running triggers a capture in the running
+instance instead of starting a second one.
 
 Then press <kbd>Meta</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> (<kbd>Win</kbd> on
 Windows, <kbd>⌘</kbd> on macOS) to capture. Quit the daemon with
@@ -72,7 +75,8 @@ Windows, <kbd>⌘</kbd> on macOS) to capture. Quit the daemon with
 Or capture directly from a terminal:
 
 ```bash
-rustshot                          # interactive capture (same as `rustshot gui`)
+rustshot                          # start the background daemon with tray icon (default)
+rustshot gui                      # interactive capture
 rustshot gui --clip               # select, annotate, Enter copies to clipboard
 rustshot full --path ~/Pictures   # whole desktop, no editor
 rustshot screen -n 1 --edit       # second monitor, open the editor
