@@ -270,7 +270,6 @@ pub fn toast(f: &mut Fb, ui: &Ui, msg: &str, kind: ToastKind, screen: (f32, f32)
     text(f, ui, 12.0, msg, r.x + lpad + isz + gap, cy, th.text.fade(k));
 }
 
-#[allow(dead_code)] // wired in Task 9
 fn key_cap(f: &mut Fb, ui: &Ui, x: f32, cy: f32, w: f32, s: &str, k: f32) {
     let h = ui.px(18.0);
     let r = round(FRect { x, y: cy - h / 2.0, w, h });
@@ -278,13 +277,42 @@ fn key_cap(f: &mut Fb, ui: &Ui, x: f32, cy: f32, w: f32, s: &str, k: f32) {
     text(f, ui, 11.0, s, x + (w - tw(ui, 11.0, s)) / 2.0, cy, ui.th.key_text.fade(k));
 }
 
-#[allow(dead_code)] // wired in Task 9
 fn key_w(ui: &Ui, s: &str) -> f32 {
     (tw(ui, 11.0, s) + ui.px(10.0)).max(ui.px(18.0))
 }
 
+#[cfg(target_os = "macos")]
+const MOD: &str = "⌘";
+#[cfg(not(target_os = "macos"))]
+const MOD: &str = "Ctrl";
+
+/// Tooltip label and key caps (keys reflect `tool_for_key` / `handle_key`).
+pub fn act_tip(a: Act) -> (&'static str, &'static [&'static str]) {
+    match a {
+        Act::Tool(Tool::Path) => ("Pencil", &["P"]),
+        Act::Tool(Tool::Line) => ("Line", &["L"]),
+        Act::Tool(Tool::Arrow) => ("Arrow", &["A"]),
+        Act::Tool(Tool::Rect) => ("Rectangle", &["R"]),
+        Act::Tool(Tool::Ellipse) => ("Ellipse", &["C"]),
+        Act::Tool(Tool::Marker) => ("Marker", &["M"]),
+        Act::Tool(Tool::Text) => ("Text", &["T"]),
+        Act::Tool(Tool::Pixelate) => ("Pixelate", &["B"]),
+        Act::Tool(Tool::Invert) => ("Invert", &["I"]),
+        Act::Undo => ("Undo", &[MOD, "Z"]),
+        Act::Redo => ("Redo", &[MOD, "⇧", "Z"]),
+        Act::Size(d) if d < 0 => ("Smaller", &["Wheel"]),
+        Act::Size(_) => ("Larger", &["Wheel"]),
+        Act::Palette => ("Color", &[]),
+        Act::Color(_) => ("Use color", &[]),
+        Act::Copy => ("Copy", &[MOD, "C"]),
+        Act::Save => ("Save", &[MOD, "S"]),
+        Act::Upload => ("Upload", &[MOD, "U"]),
+        Act::Exit => ("Close", &["Esc"]),
+        Act::Accept => ("Accept", &["Enter"]),
+    }
+}
+
 /// Dark label + key caps, 8 above `anchor` (below if no room).
-#[allow(dead_code)] // wired in Task 9
 pub fn tooltip(f: &mut Fb, ui: &Ui, anchor: FRect, label: &str, keys: &[&str], screen_w: f32, k: f32) {
     let th = ui.th;
     let (h, gap, kgap) = (ui.px(26.0), ui.px(8.0), ui.px(4.0));
@@ -314,7 +342,6 @@ pub fn tooltip(f: &mut Fb, ui: &Ui, anchor: FRect, label: &str, keys: &[&str], s
 }
 
 /// "Drag to select · Enter to save · Esc to cancel", centred over the dim.
-#[allow(dead_code)] // wired in Task 9
 pub fn hint(f: &mut Fb, ui: &Ui, screen: (f32, f32), k: f32) {
     enum P {
         T(&'static str),
@@ -467,5 +494,14 @@ mod tests {
         let line = px(&d, 100, 19, 30);
         assert!((line[0] as i32 - 0x8B).abs() <= 2 && line[2] > 240, "accent line: {line:?}");
         assert_eq!(px(&d, 100, 20, 20)[0], 255, "handle centre is white");
+    }
+
+    #[test]
+    fn tool_tooltips_match_real_shortcuts() {
+        for t in super::super::toolbar::TOOL_ORDER {
+            let (_, keys) = act_tip(Act::Tool(t));
+            let vk = keys[0].as_bytes()[0] as u32;
+            assert_eq!(super::super::tool_for_key(vk), Some(t), "{t:?}");
+        }
     }
 }

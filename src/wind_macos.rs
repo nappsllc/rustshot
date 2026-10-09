@@ -209,14 +209,15 @@ pub fn publish_hotkeys(hook: HotkeyHook) {
 }
 
 /// Live modifier state via `CGEventSourceFlagsState` (session-state flags:
-/// Shift 1<<17, Control 1<<18, Option 1<<19). `Mods` has no meta field, so
-/// Command is intentionally dropped — same shape as the Windows mapping.
+/// Shift 1<<17, Control 1<<18, Option 1<<19, Command 1<<20). `Mods` has no
+/// meta field, so Command is folded into `ctrl`.
 pub fn current_mods() -> Mods {
     unsafe {
         let f = CGEventSourceFlagsState(1); // kCGEventSourceStateCombinedSessionState
         Mods {
             shift: f & (1 << 17) != 0,
-            ctrl: f & (1 << 18) != 0,
+            // ⌘ (bit 20) works like Ctrl so ⌘Z/⌘C/⌘S/⌘U match native apps.
+            ctrl: f & (1 << 18) != 0 || f & (1 << 20) != 0,
             alt: f & (1 << 19) != 0,
         }
     }
@@ -657,13 +658,13 @@ fn client_pos(p: CGPoint) -> (i32, i32) {
     )
 }
 
-/// NSEventModifierFlag bits: shift 1<<17, control 1<<18, option 1<<19.
-/// Command (1<<20) has no `Mods` field — see the report's shared-change
-/// recommendation.
+/// NSEventModifierFlag bits: shift 1<<17, control 1<<18, option 1<<19,
+/// command 1<<20. `Mods` has no meta field, so Command is folded into `ctrl`
+/// (⌘Z/⌘C/⌘S/⌘U act like Ctrl, as in native apps).
 fn mods_of(flags: u64) -> Mods {
     Mods {
         shift: flags & (1 << 17) != 0,
-        ctrl: flags & (1 << 18) != 0,
+        ctrl: flags & (1 << 18) != 0 || flags & (1 << 20) != 0,
         alt: flags & (1 << 19) != 0,
     }
 }

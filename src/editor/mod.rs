@@ -555,18 +555,7 @@ impl App {
 
         // Tool shortcuts (plain letters, Flameshot-style).
         if !mods.ctrl && !mods.alt && !mods.shift {
-            let tool = match vk {
-                v if v == 'P' as u32 => Some(Tool::Path),
-                v if v == 'D' as u32 || v == 'L' as u32 => Some(Tool::Line),
-                v if v == 'A' as u32 => Some(Tool::Arrow),
-                v if v == 'R' as u32 => Some(Tool::Rect),
-                v if v == 'C' as u32 => Some(Tool::Ellipse),
-                v if v == 'M' as u32 => Some(Tool::Marker),
-                v if v == 'T' as u32 => Some(Tool::Text),
-                v if v == 'B' as u32 => Some(Tool::Pixelate),
-                v if v == 'I' as u32 => Some(Tool::Invert),
-                _ => None,
-            };
+            let tool = tool_for_key(vk);
             if let Some(t) = tool {
                 edit.tool = if edit.tool == Some(t) { None } else { Some(t) };
                 edit.draft = None;
@@ -975,6 +964,17 @@ impl Driver for App {
                 pop_k: 1.0,
             };
             chrome::toolbar(&mut f, &ui, tb, &st, 1.0);
+            if !interacting
+                && edit.hover_at.elapsed() >= Duration::from_millis(400)
+                && let Some(it) = edit.hover.and_then(|i| tb.items.get(i))
+                && let toolbar::Kind::Btn(act) = it.kind
+            {
+                let (label, keys) = chrome::act_tip(act);
+                chrome::tooltip(&mut f, &ui, it.r, label, keys, ww, 1.0);
+            }
+        }
+        if edit.sel.is_none() && !interacting {
+            chrome::hint(&mut f, &ui, (ww, wh), 1.0);
         }
         Some(img)
     }
@@ -1006,6 +1006,22 @@ impl Driver for App {
 // ---------------------------------------------------------------------------
 // The editor
 // ---------------------------------------------------------------------------
+
+/// Plain-letter tool shortcuts (Flameshot-style).
+fn tool_for_key(vk: u32) -> Option<Tool> {
+    match char::from_u32(vk)? {
+        'P' => Some(Tool::Path),
+        'D' | 'L' => Some(Tool::Line),
+        'A' => Some(Tool::Arrow),
+        'R' => Some(Tool::Rect),
+        'C' => Some(Tool::Ellipse),
+        'M' => Some(Tool::Marker),
+        'T' => Some(Tool::Text),
+        'B' => Some(Tool::Pixelate),
+        'I' => Some(Tool::Invert),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool {
