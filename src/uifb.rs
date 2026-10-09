@@ -2,6 +2,7 @@
 //! ab_glyph text rendering. Draw into an unpremultiplied RGBA buffer via [`Fb`].
 
 use crate::pixbuf::PixBuf;
+use crate::raster::Surf;
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -48,6 +49,12 @@ impl<'a> Fb<'a> {
 
     pub fn height(&self) -> i32 {
         self.d.len() as i32 / 4 / self.stride as i32
+    }
+
+    /// The same pixels as an AA raster surface (strokes, polygons).
+    pub fn surf(&mut self) -> Surf<'_> {
+        let h = self.height().max(0) as u32;
+        Surf::new(&mut *self.d, self.stride as u32, h)
     }
 
     /// Blend `c` over the pixel at (x, y).

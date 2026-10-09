@@ -26,7 +26,6 @@ pub struct Surf<'a> {
 }
 
 impl<'a> Surf<'a> {
-    #[cfg(test)]
     pub fn new(data: &'a mut [u8], w: u32, h: u32) -> Self {
         Surf { data, w, h }
     }

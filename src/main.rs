@@ -5,6 +5,8 @@ mod export;
 #[allow(dead_code)] // wired in Task 8
 mod fonts;
 mod hotkey;
+#[allow(dead_code)] // wired in Task 8
+mod icon_path;
 mod icons;
 mod objects;
 mod pixbuf;
