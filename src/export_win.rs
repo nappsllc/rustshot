@@ -162,13 +162,50 @@ pub fn do_upload(png: &[u8], client_id: &str) -> Result<String, String> {
 
 /// Imgur upload over WinHTTP: the OS TLS stack, no Rust HTTP/TLS dependency.
 fn upload_winhttp(png: &[u8], client_id: &str) -> Result<String, String> {
+    let headers = format!(
+        "Authorization: Client-ID {client_id}\r\nContent-Type: application/octet-stream"
+    );
+    let (_status, text) = winhttp(
+        "POST",
+        "api.imgur.com",
+        "/3/image?title=rustshot&description=rustshot%20capture",
+        &headers,
+        png,
+    )?;
+    extract_json_string(&text, "link").ok_or_else(|| format!("no link in response: {text}"))
+}
+
+/// HTTPS GET; a non-2xx status is an `Err("HTTP <code>")`.
+pub fn http_get(host: &str, path: &str, headers: &[(&str, &str)]) -> Result<String, String> {
+    let headers = headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    let (status, text) = winhttp("GET", host, path, &headers, &[])?;
+    if (200..300).contains(&status) {
+        Ok(text)
+    } else {
+        Err(format!("HTTP {status}"))
+    }
+}
+
+/// One HTTPS request over WinHTTP; returns (status code, response body).
+fn winhttp(
+    method: &str,
+    host: &str,
+    path: &str,
+    headers: &str,
+    body: &[u8],
+) -> Result<(u32, String), String> {
     use std::ptr;
     use windows::Win32::Networking::WinHttp::{
-        WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
-        WinHttpQueryDataAvailable, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-        WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE,
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect, WinHttpOpen,
+        WinHttpOpenRequest, WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData,
+        WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
     };
-    use windows::core::{PCWSTR, w};
+    use windows::core::PCWSTR;
 
     struct Handle(*mut std::ffi::c_void);
     impl Drop for Handle {
@@ -202,16 +239,17 @@ fn upload_winhttp(png: &[u8], client_id: &str) -> Result<String, String> {
         }
         let _ = WinHttpSetTimeouts(session.0, 10_000, 10_000, 30_000, 30_000);
 
-        let host = wide("api.imgur.com");
+        let host = wide(host);
         let conn = Handle(WinHttpConnect(session.0, PCWSTR(host.as_ptr()), 443, 0));
         if conn.0.is_null() {
             return Err(err("WinHttpConnect"));
         }
 
-        let object = wide("/3/image?title=rustshot&description=rustshot%20capture");
+        let method = wide(method);
+        let object = wide(path);
         let request = Handle(WinHttpOpenRequest(
             conn.0,
-            PCWSTR(w!("POST").as_ptr()),
+            PCWSTR(method.as_ptr()),
             PCWSTR(object.as_ptr()),
             PCWSTR::null(),
             PCWSTR::null(),
@@ -224,24 +262,31 @@ fn upload_winhttp(png: &[u8], client_id: &str) -> Result<String, String> {
 
         // Counted (not NUL-terminated): windows-rs passes slice.len() as the
         // header block length.
-        let headers: Vec<u16> = format!(
-            "Authorization: Client-ID {client_id}\r\nContent-Type: application/octet-stream"
-        )
-        .encode_utf16()
-        .collect();
-        WinHttpSendRequest(
-            request.0,
-            Some(&headers),
-            Some(png.as_ptr() as *const _),
-            png.len() as u32,
-            png.len() as u32,
-            0,
-        )
-        .map_err(|e| format!("WinHttpSendRequest: {e}"))?;
+        let headers: Vec<u16> = headers.encode_utf16().collect();
+        let headers = if headers.is_empty() { None } else { Some(&headers[..]) };
+        let (data, len) = if body.is_empty() {
+            (None, 0)
+        } else {
+            (Some(body.as_ptr() as *const _), body.len() as u32)
+        };
+        WinHttpSendRequest(request.0, headers, data, len, len, 0)
+            .map_err(|e| format!("WinHttpSendRequest: {e}"))?;
         WinHttpReceiveResponse(request.0, ptr::null_mut())
             .map_err(|e| format!("WinHttpReceiveResponse: {e}"))?;
 
-        let mut body: Vec<u8> = Vec::new();
+        let mut status = 0u32;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        WinHttpQueryHeaders(
+            request.0,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            PCWSTR::null(),
+            Some(&mut status as *mut u32 as *mut _),
+            &mut size,
+            ptr::null_mut(),
+        )
+        .map_err(|e| format!("WinHttpQueryHeaders: {e}"))?;
+
+        let mut out: Vec<u8> = Vec::new();
         loop {
             let mut avail = 0u32;
             WinHttpQueryDataAvailable(request.0, &mut avail)
@@ -257,11 +302,10 @@ fn upload_winhttp(png: &[u8], client_id: &str) -> Result<String, String> {
             if buf.is_empty() {
                 break;
             }
-            body.extend_from_slice(&buf);
+            out.extend_from_slice(&buf);
         }
 
-        let text = String::from_utf8_lossy(&body);
-        extract_json_string(&text, "link").ok_or_else(|| format!("no link in response: {text}"))
+        Ok((status, String::from_utf8_lossy(&out).into_owned()))
     }
 }
 

@@ -34,6 +34,8 @@ pub struct Config {
     /// If true, GUI captures only the monitor under the cursor even when
     /// all monitors share the same scale factor.
     pub capture_active_monitor: bool,
+    /// Let the daemon check GitHub for a newer release once a day.
+    pub check_updates: bool,
 }
 
 impl Default for Config {
@@ -62,6 +64,7 @@ impl Default for Config {
             upload_client_id: "313baf0c7b4d3ff".into(),
             copy_url_after_upload: true,
             capture_active_monitor: false,
+            check_updates: true,
         }
     }
 }
@@ -179,6 +182,9 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
             "capture_active_monitor" => {
                 cfg.capture_active_monitor = as_bool(val).map_err(|e| bad("boolean", &e))?
             }
+            "check_updates" => {
+                cfg.check_updates = as_bool(val).map_err(|e| bad("boolean", &e))?
+            }
             _ => {} // unknown keys are ignored, as with serde's default
         }
     }
@@ -209,7 +215,8 @@ pub fn to_toml(c: &Config) -> String {
          user_colors = [{}]\n\
          upload_client_id = {}\n\
          copy_url_after_upload = {}\n\
-         capture_active_monitor = {}\n",
+         capture_active_monitor = {}\n\
+         check_updates = {}\n",
         q(&c.save_path),
         q(&c.filename_pattern),
         q(&c.ui_color),
@@ -227,6 +234,7 @@ pub fn to_toml(c: &Config) -> String {
         q(&c.upload_client_id),
         c.copy_url_after_upload,
         c.capture_active_monitor,
+        c.check_updates,
     )
 }
 
@@ -387,6 +395,9 @@ mod tests {
         assert_eq!(back.contrast_opacity, 148);
         assert_eq!(back.user_colors.len(), 10);
         assert!(back.copy_url_after_upload);
+        assert!(back.check_updates);
+        let off = to_toml(&Config { check_updates: false, ..Config::default() });
+        assert!(!parse_config(&off).unwrap().check_updates);
     }
 
     #[test]

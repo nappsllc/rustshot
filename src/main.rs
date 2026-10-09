@@ -11,6 +11,7 @@ mod pixbuf;
 mod raster;
 mod theme;
 mod uifb;
+mod update;
 mod wind;
 
 use anyhow::{anyhow, Result};
@@ -35,6 +36,8 @@ enum Cmd {
     },
     /// Run in the background and wait for the global capture hotkey.
     Daemon,
+    /// Check for a newer release and open its download page.
+    Update,
     /// Show or validate the config file.
     Config {
         /// Validate the config file and exit non-zero on errors.
@@ -82,6 +85,7 @@ Commands:
   full      Capture the whole desktop directly (add --edit for the editor)
   screen    Capture a single monitor (0 = first) directly (add --edit for the editor)
   daemon    Run in the background and wait for the global capture hotkey
+  update    Check for a newer release and open its download page
   config    Show or validate the config file (--check)
   help      Print this help
 
@@ -139,6 +143,12 @@ fn parse_from(args: &[String]) -> Result<Parsed, String> {
                 return Err(format!("unexpected argument '{a}'"));
             }
             Some(Cmd::Daemon)
+        }
+        Some("update") => {
+            if let Some(a) = rest.first() {
+                return Err(format!("unexpected argument '{a}'"));
+            }
+            Some(Cmd::Update)
         }
         Some("config") => {
             let mut check = false;
@@ -393,6 +403,27 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Update => {
+            if let Some(channel) = update::managed_install() {
+                println!("rustshot is managed by {channel}; update it there.");
+                return Ok(());
+            }
+            match update::check_now() {
+                Ok(Some(r)) => {
+                    println!("rustshot {} is available: {}", r.version, r.url);
+                    update::open_url(&r.url);
+                    Ok(())
+                }
+                Ok(None) => {
+                    println!("rustshot {} is up to date", env!("CARGO_PKG_VERSION"));
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("error: update check failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Cmd::Daemon => {
             let cfg = config::load();
             let exit_code = Arc::new(AtomicI32::new(0));
@@ -539,6 +570,12 @@ mod cli_tests {
         assert!(matches!(cmd(&["config", "--check"]), Cmd::Config { check: true }));
         assert!(matches!(cmd(&["config"]), Cmd::Config { check: false }));
         assert!(matches!(cmd(&["daemon"]), Cmd::Daemon));
+    }
+
+    #[test]
+    fn update_command() {
+        assert!(matches!(cmd(&["update"]), Cmd::Update));
+        assert!(p(&["update", "x"]).is_err());
     }
 
     #[test]

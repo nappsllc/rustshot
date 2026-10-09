@@ -363,6 +363,23 @@ pub fn do_upload(png: &[u8], client_id: &str) -> Result<String, String> {
     extract_json_string(&text, "link").ok_or_else(|| format!("no link in response: {text}"))
 }
 
+/// HTTPS GET via `curl`; a non-2xx status fails (`-f`).
+pub fn http_get(host: &str, path: &str, headers: &[(&str, &str)]) -> Result<String, String> {
+    use std::process::Command;
+
+    let mut cmd = Command::new("curl");
+    cmd.args(["-fsS", "--max-time", "15"]);
+    for (k, v) in headers {
+        cmd.arg("-H").arg(format!("{k}: {v}"));
+    }
+    cmd.arg(format!("https://{host}{path}"));
+    let out = cmd.output().map_err(|e| format!("spawn curl: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("curl: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Minimal `"key": "value"` extraction; a verbatim copy of export_win's
 /// helper (shared sources are read-only for this change set).
 fn extract_json_string(body: &str, key: &str) -> Option<String> {
