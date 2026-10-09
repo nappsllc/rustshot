@@ -68,7 +68,6 @@ pub fn invalidate(hwnd: HWND) {
 }
 
 /// Re-arm the window timer (same id replaces the old interval).
-#[allow(dead_code)] // wired in Task 10
 pub fn retime(hwnd: HWND, ms: u64) {
     if hwnd.is_invalid() {
         return;

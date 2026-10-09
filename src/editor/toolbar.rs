@@ -88,10 +88,8 @@ pub struct Toolbar {
     pub bar: FRect,
     pub pop: Option<FRect>,
     pub items: Vec<Item>,
-    #[allow(dead_code)] // wired in Task 10
     pub wrapped: bool,
     /// The bar's anchor edge is its bottom (placed above / inside).
-    #[allow(dead_code)] // wired in Task 10
     pub above: bool,
 }
 
@@ -251,7 +249,6 @@ impl Toolbar {
     }
 
     /// A copy scaled by `z` about the anchor edge (scale-in animation).
-    #[allow(dead_code)] // wired in Task 10
     pub fn scaled(&self, z: f32) -> Toolbar {
         let ax = self.bar.x + self.bar.w / 2.0;
         let ay = if self.above { self.bar.y1() } else { self.bar.y };

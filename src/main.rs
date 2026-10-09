@@ -1,4 +1,3 @@
-#[allow(dead_code)] // wired in Task 10
 mod anim;
 mod capture;
 mod config;

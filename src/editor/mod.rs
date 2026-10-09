@@ -1,3 +1,4 @@
+use crate::anim::{self, Tween};
 use crate::capture::{self, Shot};
 use crate::config::{self, Config};
 use crate::export::{self, Task};
@@ -73,8 +74,54 @@ impl Toast {
         now.saturating_duration_since(self.at).as_secs_f32() * 1000.0
     }
 
+    const FADE_IN: f32 = 120.0;
+    const FADE_OUT: f32 = 100.0;
+
     fn expired(&self, now: Instant) -> bool {
-        self.age_ms(now) > self.ttl_ms()
+        self.age_ms(now) > self.ttl_ms() + Self::FADE_OUT
+    }
+
+    /// Fade + rise in over 120 ms, fade out over 100 ms after the TTL.
+    fn opacity(&self, now: Instant) -> f32 {
+        let a = self.age_ms(now);
+        let fade_in = crate::anim::ease_out(a / Self::FADE_IN);
+        let fade_out = (1.0 - (a - self.ttl_ms()) / Self::FADE_OUT).clamp(0.0, 1.0);
+        fade_in.min(fade_out)
+    }
+
+    /// Needs the fast tick (fading in, or close enough to fading out).
+    fn animating(&self, now: Instant) -> bool {
+        let a = self.age_ms(now);
+        a < Self::FADE_IN || a > self.ttl_ms() - 160.0
+    }
+}
+
+/// Overlay animation state (spec "Motion").
+struct Motion {
+    dim: Tween,
+    bar: Tween,
+    pop: Tween,
+    hint: Tween,
+    hover: Tween,
+}
+
+impl Motion {
+    fn new(now: Instant) -> Self {
+        let mut dim = Tween::new(0.0, now);
+        dim.set(1.0, 120, now);
+        let mut hint = Tween::new(0.0, now);
+        hint.set(1.0, 120, now);
+        Motion {
+            dim,
+            bar: Tween::new(0.0, now),
+            pop: Tween::new(0.0, now),
+            hint,
+            hover: Tween::new(1.0, now),
+        }
+    }
+
+    fn active(&self, now: Instant) -> bool {
+        [&self.dim, &self.bar, &self.pop, &self.hint, &self.hover].iter().any(|t| t.active(now))
     }
 }
 
@@ -267,6 +314,7 @@ impl App {
         let accept_now = accept_on_select && sel.is_some();
         let th = theme::resolve(&cfg);
         let mut edit = Edit {
+            mo: Motion::new(Instant::now()),
             shot,
             base,
             composed,
@@ -326,6 +374,7 @@ impl App {
     /// Start the finish sequence: crop now, hide the window, export next
     /// (so a native save dialog is never covered by the overlay).
     fn finish(&mut self, edit: &mut Edit, cancelled: bool) {
+        wind::set_fast_timer(self.hwnd, false);
         if cancelled {
             if self.one_shot() {
                 self.exit_code.store(2, Ordering::SeqCst);
@@ -903,9 +952,25 @@ impl Driver for App {
             })
         });
 
+        let now = Instant::now();
+        let interacting = !matches!(edit.interact, Interact::None);
+        if edit.toolbar.is_some() {
+            edit.mo.bar.set(1.0, 120, now);
+        } else {
+            edit.mo.bar.snap(0.0);
+        }
+        if edit.palette_open {
+            edit.mo.pop.set(1.0, 100, now);
+        } else {
+            edit.mo.pop.snap(0.0);
+        }
+        let hint_on = edit.sel.is_none() && !interacting;
+        edit.mo.hint.set(if hint_on { 1.0 } else { 0.0 }, if hint_on { 120 } else { 100 }, now);
+
         // Compose: base + objects, themed dim outside the selection, draft.
         let mut img = edit.composed.clone();
-        let dim = edit.th.dim.with_alpha(edit.th.dim_alpha(edit.cfg.contrast_opacity));
+        let dim_a = edit.th.dim_alpha(edit.cfg.contrast_opacity) as f32 * edit.mo.dim.value(now);
+        let dim = edit.th.dim.with_alpha(dim_a.round() as u8);
         match edit.sel {
             None => dim_rect(&mut img, 0.0, 0.0, ww, wh, dim),
             Some(sr) => {
@@ -923,7 +988,6 @@ impl Driver for App {
         let stride = img.width() as usize;
         let mut f = Fb::new(img.as_raw_mut(), stride);
         let ui = Ui { th: &edit.th, s, font: edit.ui_font.as_ref() };
-        let interacting = !matches!(edit.interact, Interact::None);
 
         if let Some(sr) = edit.sel {
             chrome::selection(&mut f, &ui, sr, edit.hot_handle, 1.0);
@@ -949,33 +1013,41 @@ impl Driver for App {
             }
         }
         if let Some(t) = edit.notice.as_ref().or(self.notice.as_ref()) {
-            chrome::toast(&mut f, &ui, &t.text, t.kind, (ww, wh), 1.0);
+            chrome::toast(&mut f, &ui, &t.text, t.kind, (ww, wh), t.opacity(now));
         }
         if let Some(tb) = &edit.toolbar {
+            let kb = edit.mo.bar.value(now);
+            let tbz = tb.scaled(0.96 + 0.04 * kb);
             let (value, unit) = edit.size_label();
             let st = chrome::BarState {
                 hover: edit.hover,
-                hover_k: 1.0,
+                hover_k: edit.mo.hover.value(now),
                 pressed: edit.pressed,
                 tool: edit.tool,
                 color: edit.color,
                 value: &value,
                 unit,
-                pop_k: 1.0,
+                pop_k: edit.mo.pop.value(now),
             };
-            chrome::toolbar(&mut f, &ui, tb, &st, 1.0);
+            chrome::toolbar(&mut f, &ui, &tbz, &st, kb);
+            let shown_ms = edit.hover_at.elapsed().as_secs_f32() * 1000.0 - 400.0;
             if !interacting
-                && edit.hover_at.elapsed() >= Duration::from_millis(400)
+                && shown_ms >= 0.0
                 && let Some(it) = edit.hover.and_then(|i| tb.items.get(i))
                 && let toolbar::Kind::Btn(act) = it.kind
             {
                 let (label, keys) = chrome::act_tip(act);
-                chrome::tooltip(&mut f, &ui, it.r, label, keys, ww, 1.0);
+                let tk = anim::ease_out(shown_ms / 80.0);
+                chrome::tooltip(&mut f, &ui, it.r, label, keys, ww, tk);
             }
         }
-        if edit.sel.is_none() && !interacting {
-            chrome::hint(&mut f, &ui, (ww, wh), 1.0);
+        let kh = edit.mo.hint.value(now);
+        if kh > 0.01 {
+            chrome::hint(&mut f, &ui, (ww, wh), kh);
         }
+        let tip_pending = edit.hover.is_some() && edit.hover_at.elapsed() < Duration::from_millis(500);
+        let toast_moving = edit.notice.as_ref().or(self.notice.as_ref()).is_some_and(|t| t.animating(now));
+        wind::set_fast_timer(self.hwnd, edit.mo.active(now) || tip_pending || toast_moving);
         Some(img)
     }
 
@@ -1107,6 +1179,7 @@ struct TextDraft {
 }
 
 struct Edit {
+    mo: Motion,
     shot: Shot,
     base: PixBuf,
     composed: PixBuf,
@@ -1295,6 +1368,9 @@ impl Edit {
         if hover != self.hover {
             self.hover = hover;
             self.hover_at = Instant::now();
+            let now = Instant::now();
+            self.mo.hover = Tween::new(0.0, now);
+            self.mo.hover.set(1.0, 60, now);
         }
         self.hot_handle = hot;
         changed
@@ -1576,6 +1652,7 @@ mod tests {
         let shot = synthetic_shot();
         let base = shot.image.clone();
         let edit = Edit {
+            mo: Motion::new(Instant::now()),
             shot,
             composed: base.clone(),
             base,
@@ -1660,6 +1737,20 @@ mod tests {
         let dir = std::path::PathBuf::from(dir);
         std::fs::create_dir_all(&dir).unwrap();
         let save = |app: &mut App, name: &str| {
+            if let State::Edit(e) = &mut app.st {
+                for t in [&mut e.mo.dim, &mut e.mo.bar, &mut e.mo.pop, &mut e.mo.hint, &mut e.mo.hover] {
+                    t.snap(t.target());
+                }
+                if let Some(n) = e.notice.as_mut() {
+                    n.at = Instant::now() - Duration::from_millis(500);
+                }
+            }
+            app.frame(); // settle: tweens that start in frame() (bar/pop/hint)
+            if let State::Edit(e) = &mut app.st {
+                for t in [&mut e.mo.bar, &mut e.mo.pop, &mut e.mo.hint] {
+                    t.snap(t.target());
+                }
+            }
             let png = app.frame().expect("frame").to_png().unwrap();
             std::fs::write(dir.join(name), png).unwrap();
         };
@@ -1702,6 +1793,19 @@ mod tests {
 
         let mut app = preview_app(theme::DARK, None);
         save(&mut app, "dark-hint.png");
+    }
+
+    #[test]
+    fn toast_fades_in_and_out() {
+        let t = Toast::new("x", ToastKind::Info);
+        let at = t.at;
+        let ms = |n: u64| at + Duration::from_millis(n);
+        assert!(t.opacity(ms(0)) < 0.01);
+        assert_eq!(t.opacity(ms(120)), 1.0);
+        assert!((t.opacity(ms(1650)) - 0.5).abs() < 0.02);
+        assert!(!t.expired(ms(1650)));
+        assert!(t.expired(ms(1701)));
+        assert!(t.animating(ms(10)) && !t.animating(ms(800)) && t.animating(ms(1500)));
     }
 
     #[test]

@@ -29,6 +29,7 @@ impl Tween {
         self.from + (self.to - self.from) * ease_out(t)
     }
 
+    #[cfg(test)] // only the preview test settles tweens this way
     pub fn target(&self) -> f32 {
         self.to
     }

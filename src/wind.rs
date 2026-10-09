@@ -126,19 +126,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Idle cadence (hotkey/upload polling, caret blink).
 pub const SLOW_TICK_MS: u64 = 150;
 /// Cadence while an animation runs.
-#[allow(dead_code)] // wired in Task 10
 pub const FAST_TICK_MS: u64 = 16;
 
-#[allow(dead_code)] // wired in Task 10
 static FAST_TICK: AtomicBool = AtomicBool::new(false);
 
-#[allow(dead_code)] // wired in Task 10
 pub fn tick_ms() -> u64 {
     if FAST_TICK.load(Ordering::Relaxed) { FAST_TICK_MS } else { SLOW_TICK_MS }
 }
 
 /// Switch the window timer between 16 ms (animating) and 150 ms (idle).
-#[allow(dead_code)] // wired in Task 10
 pub fn set_fast_timer(hwnd: Hwnd, on: bool) {
     if FAST_TICK.swap(on, Ordering::Relaxed) != on {
         imp::retime(hwnd, tick_ms());

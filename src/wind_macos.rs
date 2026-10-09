@@ -250,7 +250,6 @@ pub fn invalidate(_hwnd: Hwnd) {
 }
 
 /// The event loop reads `tick_ms()` each pass; nothing to re-arm.
-#[allow(dead_code)] // wired in Task 10
 pub fn retime(_hwnd: Hwnd, _ms: u64) {}
 
 /// Position + show the overlay at an exact rect (points, Quartz space) and
