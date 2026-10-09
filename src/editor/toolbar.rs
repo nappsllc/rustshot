@@ -192,13 +192,15 @@ pub fn layout(inp: &Input) -> Toolbar {
         it.r = FRect { x: x + it.r.x * s, y: y + it.r.y * s, w: it.r.w * s, h: it.r.h * s };
     }
     let bar = FRect { x, y, w: bw, h: bh };
-    let pop = inp.palette.map(|colors| place_palette(colors, bar, &mut items, inp));
+    let pop = inp.palette.map(|colors| place_palette(colors, bar, above, &mut items, inp));
     Toolbar { bar, pop, items, wrapped, above }
 }
 
-/// Popover 6 px above the bar (below if no room), right-aligned to the
-/// swatch button, one row of dots.
-fn place_palette(colors: &[C4], bar: FRect, items: &mut Vec<Item>, inp: &Input) -> FRect {
+/// Popover 6 px from the bar on the side away from the selection (below a
+/// bar that sits below it, above a bar that sits above/inside it), falling
+/// back to the other side when it does not fit; right-aligned to the swatch
+/// button, one row of dots.
+fn place_palette(colors: &[C4], bar: FRect, above: bool, items: &mut Vec<Item>, inp: &Input) -> FRect {
     let s = inp.s;
     let m = MARGIN * s;
     let n = colors.len().max(1) as f32;
@@ -210,10 +212,15 @@ fn place_palette(colors: &[C4], bar: FRect, items: &mut Vec<Item>, inp: &Input) 
         .map(|it| it.r)
         .unwrap_or(bar);
     let px = (anchor.x1() - pw).clamp(inp.area.x + m, (inp.area.x1() - m - pw).max(inp.area.x + m));
-    let mut py = bar.y - POP_GAP * s - ph;
-    if py < inp.area.y + m {
-        py = bar.y1() + POP_GAP * s;
-    }
+    let up = bar.y - POP_GAP * s - ph;
+    let down = bar.y1() + POP_GAP * s;
+    let py = if above {
+        if up < inp.area.y + m { down } else { up }
+    } else if down + ph > inp.area.y1() - m {
+        up
+    } else {
+        down
+    };
     for (i, c) in colors.iter().enumerate() {
         let r = FRect {
             x: px + (PAD + i as f32 * (DOT_BTN + DOT_GAP)) * s,
@@ -400,14 +407,15 @@ mod tests {
     }
 
     #[test]
-    fn palette_pops_above_bar_right_aligned() {
+    fn palette_pops_below_bar_right_aligned() {
         let colors = [C4::rgb(1, 2, 3); 10];
         let mut i = inp(r(100.0, 100.0, 800.0, 300.0));
         i.palette = Some(&colors);
         let tb = layout(&i);
+        assert!(!tb.above);
         let pop = tb.pop.expect("popover");
         assert_eq!((pop.w, pop.h), (328.0, 40.0));
-        assert_eq!(pop.y1(), tb.bar.y - 6.0);
+        assert_eq!(pop.y, tb.bar.y1() + 6.0);
         assert_eq!(pop.x1(), btn(&tb, Act::Palette).x1());
         let dots: Vec<&Item> = tb.items.iter().filter(|it| matches!(it.kind, Kind::Dot(_))).collect();
         assert_eq!(dots.len(), 10);
@@ -416,11 +424,34 @@ mod tests {
     }
 
     #[test]
-    fn palette_drops_below_when_no_room() {
+    fn palette_above_bar_when_bar_flips_above() {
         let colors = [C4::rgb(1, 2, 3); 10];
-        let mut i = inp(r(100.0, 0.0, 800.0, 20.0));
+        let mut i = inp(r(100.0, 700.0, 800.0, 340.0));
         i.palette = Some(&colors);
         let tb = layout(&i);
+        assert!(tb.above);
+        assert_eq!(tb.pop.unwrap().y1(), tb.bar.y - 6.0);
+    }
+
+    #[test]
+    fn palette_above_bar_when_no_room_below_it() {
+        let colors = [C4::rgb(1, 2, 3); 10];
+        let mut i = inp(r(100.0, 100.0, 800.0, 300.0));
+        i.area = r(0.0, 0.0, 1920.0, 464.0); // bar fits (ends at 452) but the popover does not
+        i.palette = Some(&colors);
+        let tb = layout(&i);
+        assert!(!tb.above);
+        assert_eq!(tb.pop.unwrap().y1(), tb.bar.y - 6.0);
+    }
+
+    #[test]
+    fn palette_drops_below_when_no_room_above() {
+        let colors = [C4::rgb(1, 2, 3); 10];
+        let mut i = inp(r(100.0, 10.0, 800.0, 200.0));
+        i.area = r(0.0, 0.0, 1920.0, 68.0);
+        i.palette = Some(&colors);
+        let tb = layout(&i);
+        assert!(tb.above);
         assert_eq!(tb.pop.unwrap().y, tb.bar.y1() + 6.0);
     }
 
