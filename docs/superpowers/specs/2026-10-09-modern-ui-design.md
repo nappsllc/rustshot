@@ -229,3 +229,30 @@ something animates or the caret phase changes.
 Wayland capture/hotkeys, settings UI, custom color picker/eyedropper (palette
 slot reserved but not implemented), keyboard focus ring navigation, `std`
 size trimming.
+
+## Measured
+Windows, `cargo build --release` (default profile):
+- `target/release/rustshot.exe`: 567,296 bytes (554 KiB), budget 655,360 bytes
+  (640 KiB). Within budget.
+- `fdeflate` is still linked at 530 B of `.text` (expected to disappear;
+  it is a small residual). `png` is 4.9 KiB of `.text`.
+
+`cargo bloat --release --crates -n 12` (debug symbols kept for the analysis
+build only; the table is an estimate):
+
+| File .text | Size | Crate |
+|-----------:|-----:|-------|
+| 37.0% | 150.6 KiB | std |
+| 25.9% | 105.7 KiB | rustshot |
+| 17.1% | 69.5 KiB | ttf_parser |
+| 1.9% | 7.8 KiB | anyhow |
+| 1.8% | 7.3 KiB | miniz_oxide |
+| 1.8% | 7.2 KiB | flate2 |
+| 1.3% | 5.4 KiB | ab_glyph_rasterizer |
+| 1.2% | 4.9 KiB | crc32fast |
+| 1.2% | 4.9 KiB | png |
+| 1.1% | 4.6 KiB | enum2$<rustshot |
+| 1.1% | 4.4 KiB | ab_glyph |
+| 0.4% | 2.2 KiB | simd_adler32 |
+
+.text section: 407.5 KiB of a 553.5 KiB file.
