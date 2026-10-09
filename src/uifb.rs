@@ -130,7 +130,7 @@ impl<'a> Fb<'a> {
                 let qy = (cy - y0 - h / 2.0).abs() - h / 2.0;
                 let dx = qx.max(0.0);
                 let dy = qy.max(0.0);
-                let sdf = (dx * dx + dy * dy).sqrt() + qx.min(qy).min(0.0);
+                let sdf = (dx * dx + dy * dy).sqrt() + qx.max(qy).min(0.0);
                 let cov = (half + 0.5 - sdf.abs()).clamp(0.0, 1.0);
                 if cov > 0.0 {
                     let mut col = c;

@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 #[allow(dead_code)] // wired in Task 8
 mod toolbar;
+#[allow(dead_code)] // wired in Task 8
+mod chrome;
 
 // ---------------------------------------------------------------------------
 // Public entry points
