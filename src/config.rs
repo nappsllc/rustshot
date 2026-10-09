@@ -98,9 +98,14 @@ pub fn config_path() -> PathBuf {
 /// Make sure `config.toml` exists (written with defaults if missing); returns its path.
 pub fn ensure_config_file() -> std::io::Result<PathBuf> {
     let path = config_path();
-    if !path.exists() {
-        std::fs::create_dir_all(config_dir())?;
-        std::fs::write(&path, to_toml(&Config::default()))?;
+    std::fs::create_dir_all(config_dir())?;
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(to_toml(&Config::default()).as_bytes())?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
     }
     Ok(path)
 }

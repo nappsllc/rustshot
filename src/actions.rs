@@ -15,11 +15,20 @@ pub fn open_config() {
 pub fn open_path(path: &Path) {
     use std::process::Command;
     #[cfg(windows)]
-    let mut cmd = {
-        let mut c = Command::new("rundll32");
-        c.arg("url.dll,FileProtocolHandler").arg(path);
-        c
-    };
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        use windows::core::{PCWSTR, w};
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let r = unsafe {
+            ShellExecuteW(None, w!("open"), PCWSTR(wide.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL)
+        };
+        if r.0 as isize <= 32 {
+            // No association (e.g. for .toml): fall back to Notepad.
+            let _ = Command::new("notepad.exe").arg(path).spawn();
+        }
+    }
     #[cfg(target_os = "macos")]
     let mut cmd = {
         let mut c = Command::new("open");
@@ -32,6 +41,7 @@ pub fn open_path(path: &Path) {
         c.arg(path);
         c
     };
+    #[cfg(not(windows))]
     let _ = cmd.spawn();
 }
 

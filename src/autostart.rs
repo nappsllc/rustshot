@@ -42,14 +42,21 @@ pub fn launch_agent_plist(exe: &Path) -> String {
 /// Linux XDG autostart entry (`Exec=<exe> daemon`, quoted per the Desktop Entry spec).
 #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
 pub fn autostart_desktop(exe: &Path) -> String {
-    let p = exe.display().to_string();
+    // `%` starts a field code in Exec, so it is always doubled.
+    let p = exe.display().to_string().replace('%', "%%");
     let exec = if p.chars().any(|c| c.is_whitespace() || "\"'\\><~|&;$*?#()`".contains(c)) {
+        // Quoted argument: backslash-escape `"`, `` ` ``, `$`, `\`; the value is also a
+        // string, so every backslash is doubled again (`\` -> 4, `"` -> `\\"`).
         let mut q = String::from("\"");
         for c in p.chars() {
-            if "\"`$\\".contains(c) {
-                q.push('\\');
+            match c {
+                '\\' => q.push_str("\\\\\\\\"),
+                '"' | '`' | '$' => {
+                    q.push_str("\\\\");
+                    q.push(c);
+                }
+                _ => q.push(c),
             }
-            q.push(c);
         }
         q.push('"');
         q
@@ -215,6 +222,8 @@ mod tests {
         assert!(d.starts_with("[Desktop Entry]\n"));
         let q = autostart_desktop(Path::new("/opt/my apps/rustshot"));
         assert!(q.contains("Exec=\"/opt/my apps/rustshot\" daemon\n"));
+        let t = autostart_desktop(Path::new("/o p/100%/a\\b"));
+        assert!(t.contains("Exec=\"/o p/100%%/a\\\\\\\\b\" daemon\n"), "{t}");
     }
 
     #[test]

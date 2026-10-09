@@ -1,5 +1,6 @@
-//! Windows notification-area icon. It lives on the message-only `rustshot_tray`
-//! window owned by `instance.rs`: that window's procedure calls [`handle`], and
+//! Windows notification-area icon. It lives on the hidden top-level `rustshot_tray`
+//! window (never shown; message-only windows get no `TaskbarCreated` broadcast and
+//! cannot become foreground for menu dismissal) owned by `instance.rs`: that window's procedure calls [`handle`], and
 //! its thread calls [`remove`] on shutdown.
 //!
 //! Uses the classic (pre-`NOTIFYICON_VERSION_4`) callback semantics: `lParam` of
@@ -42,10 +43,15 @@ fn send(ev: HotEvent) {
 pub fn spawn(tx: Sender<HotEvent>) {
     *TX.lock().unwrap() = Some(tx);
     unsafe {
-        if let Ok(hwnd) = FindWindowExW(Some(HWND_MESSAGE), None, w!("rustshot_tray"), PCWSTR::null()) {
+        if let Ok(hwnd) = FindWindowW(w!("rustshot_tray"), PCWSTR::null()) {
             let _ = PostMessageW(Some(hwnd), WM_TRAY_INIT, WPARAM(0), LPARAM(0));
         }
     }
+}
+
+/// Drop the event sender (called when the instance guard goes away).
+pub fn clear() {
+    *TX.lock().unwrap() = None;
 }
 
 fn copy_wide<const N: usize>(dst: &mut [u16; N], s: &str) {
@@ -64,6 +70,12 @@ fn base_data(hwnd: HWND) -> NOTIFYICONDATAW {
         uID: ICON_ID,
         ..Default::default()
     }
+}
+
+/// Loaded once; the handle is shared (and intentionally never destroyed).
+fn icon() -> HICON {
+    static ICON: OnceLock<usize> = OnceLock::new();
+    HICON(*ICON.get_or_init(|| unsafe { load_icon().0 as usize }) as *mut _)
 }
 
 unsafe fn load_icon() -> HICON {
@@ -90,7 +102,7 @@ fn add_icon(hwnd: HWND) {
         let mut nid = base_data(hwnd);
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_TRAYICON;
-        nid.hIcon = load_icon();
+        nid.hIcon = icon();
         copy_wide(&mut nid.szTip, "rustshot");
         if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
             eprintln!("rustshot: could not add the notification-area icon");
@@ -164,11 +176,16 @@ fn run(hwnd: HWND, item: MenuItem) {
         MenuItem::CheckUpdates => {
             let h = hwnd.0 as isize;
             std::thread::spawn(move || {
-                let r = crate::actions::check_updates();
-                if let Ok(Some(rel)) = &r {
-                    crate::update::open_url(&rel.url);
-                }
-                *BALLOON.lock().unwrap() = Some(tray::update_message(&r));
+                let msg = if let Some(channel) = crate::update::managed_install() {
+                    format!("rustshot is managed by {channel}; it updates there.")
+                } else {
+                    let r = crate::actions::check_updates();
+                    if let Ok(Some(rel)) = &r {
+                        crate::update::open_url(&rel.url);
+                    }
+                    tray::update_message(&r)
+                };
+                *BALLOON.lock().unwrap() = Some(msg);
                 unsafe {
                     let _ = PostMessageW(Some(HWND(h as *mut _)), WM_TRAY_BALLOON, WPARAM(0), LPARAM(0));
                 }
@@ -205,7 +222,7 @@ mod tests {
 
     fn icon_exists() -> bool {
         unsafe {
-            let hwnd = FindWindowExW(Some(HWND_MESSAGE), None, w!("rustshot_tray"), PCWSTR::null()).unwrap();
+            let hwnd = FindWindowW(w!("rustshot_tray"), PCWSTR::null()).unwrap();
             let mut nid = base_data(hwnd);
             nid.uFlags = NIF_TIP;
             copy_wide(&mut nid.szTip, "rustshot");
@@ -232,8 +249,6 @@ mod tests {
         assert!(icon_exists(), "icon should be present after spawn");
         drop(g);
         // The window is gone after the guard drops, which also removed the icon.
-        assert!(
-            unsafe { FindWindowExW(Some(HWND_MESSAGE), None, w!("rustshot_tray"), PCWSTR::null()) }.is_err()
-        );
+        assert!(unsafe { FindWindowW(w!("rustshot_tray"), PCWSTR::null()) }.is_err());
     }
 }

@@ -432,10 +432,15 @@ fn run() -> Result<()> {
             }
         }
         Cmd::Daemon => {
+            // `_solo` keeps a Solo daemon's lock file locked until the process ends.
+            let mut _solo = None;
             let guard = match instance::acquire_or_signal() {
                 instance::Instance::Signalled => std::process::exit(0),
                 instance::Instance::Primary(g) => Some(g),
-                instance::Instance::Solo => None,
+                instance::Instance::Solo(keep) => {
+                    _solo = Some(keep);
+                    None
+                }
             };
             let cfg = config::load();
             let exit_code = Arc::new(AtomicI32::new(0));

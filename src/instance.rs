@@ -8,7 +8,8 @@ pub enum Instance {
     Primary(Guard),
     Signalled,
     /// Single-instance protection is unavailable: run as the daemon without a guard.
-    Solo,
+    /// The payload keeps any held lock alive for the daemon's lifetime.
+    Solo(#[allow(dead_code)] imp::Keep),
 }
 
 pub fn acquire_or_signal() -> Instance {
@@ -43,6 +44,9 @@ mod imp {
 
     static TX: Mutex<Option<Sender<HotEvent>>> = Mutex::new(None);
 
+    /// Nothing to keep alive on Windows.
+    pub struct Keep;
+
     pub struct Inner {
         mutex: HANDLE,
         thread_id: u32,
@@ -70,6 +74,7 @@ mod imp {
                 }
             }
             *TX.lock().unwrap() = None;
+            crate::tray_win::clear();
         }
     }
 
@@ -86,7 +91,7 @@ mod imp {
         unsafe { DefWindowProcW(h, m, w, l) }
     }
 
-    /// Message-only window on its own thread; returns the thread id once created.
+    /// Hidden top-level window on its own thread; returns the thread id once created.
     fn spawn_window() -> Option<(u32, std::thread::JoinHandle<()>)> {
         let (tx, rx) = mpsc::channel::<Option<u32>>();
         let handle = std::thread::spawn(move || unsafe {
@@ -98,15 +103,15 @@ mod imp {
             wc.lpszClassName = w!("rustshot_tray");
             let _ = RegisterClassExW(&wc);
             let hwnd = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
+                WS_EX_TOOLWINDOW,
                 w!("rustshot_tray"),
                 w!("rustshot"),
-                WINDOW_STYLE(0),
+                WS_POPUP,
                 0,
                 0,
                 0,
                 0,
-                Some(HWND_MESSAGE),
+                None,
                 None,
                 Some(hinst.into()),
                 None,
@@ -133,15 +138,13 @@ mod imp {
             let mutex = match CreateMutexW(None, true, w!("Local\\rustshot-daemon")) {
                 Ok(h) => h,
                 // Cannot tell; behave as the sole instance without a guard.
-                Err(_) => return Instance::Solo,
+                Err(_) => return Instance::Solo(Keep),
             };
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 let _ = CloseHandle(mutex);
                 // The primary may still be creating its window; retry briefly.
                 for _ in 0..20 {
-                    if let Ok(hwnd) =
-                        FindWindowExW(Some(HWND_MESSAGE), None, w!("rustshot_tray"), PCWSTR::null())
-                    {
+                    if let Ok(hwnd) = FindWindowW(w!("rustshot_tray"), PCWSTR::null()) {
                         let _ = PostMessageW(Some(hwnd), WM_CAPTURE, WPARAM(0), LPARAM(0));
                         return Instance::Signalled;
                     }
@@ -150,14 +153,14 @@ mod imp {
                 eprintln!("error: another rustshot is starting but not responding");
                 std::process::exit(1);
             }
-            let (thread_id, thread) = match spawn_window() {
-                Some((id, t)) => (id, Some(t)),
-                None => {
-                    eprintln!("error: could not create the tray window; running without tray or single-instance signalling");
-                    (0, None)
-                }
+            let Some((thread_id, thread)) = spawn_window() else {
+                eprintln!(
+                    "warning: could not create the tray window; running without tray or single-instance signalling"
+                );
+                let _ = CloseHandle(mutex);
+                return Instance::Solo(Keep);
             };
-            Instance::Primary(super::Guard(Inner { mutex, thread_id, thread }))
+            Instance::Primary(super::Guard(Inner { mutex, thread_id, thread: Some(thread) }))
         }
     }
 }
@@ -168,6 +171,7 @@ mod imp {
     use std::fs::{File, OpenOptions};
     use std::io::{BufRead, BufReader, Write};
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::Sender;
@@ -196,6 +200,9 @@ mod imp {
             cfg!(target_os = "macos"),
         )
     }
+
+    /// Lock file kept open (and locked) by a Solo daemon.
+    pub struct Keep(#[allow(dead_code)] Option<File>);
 
     pub struct Inner {
         listener: UnixListener,
@@ -255,7 +262,7 @@ mod imp {
     }
 
     fn try_lock(path: &Path) -> Lock {
-        let file = match OpenOptions::new().create(true).truncate(false).write(true).open(path) {
+        let file = match OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(path) {
             Ok(f) => f,
             Err(e) => return Lock::Unavailable(e),
         };
@@ -274,9 +281,9 @@ mod imp {
         UnixStream::connect(path).and_then(|mut s| s.write_all(b"capture\n")).is_ok()
     }
 
-    fn solo(err: impl std::fmt::Display) -> Option<Instance> {
+    fn solo(err: impl std::fmt::Display, lock: Option<File>) -> Option<Instance> {
         eprintln!("warning: single-instance socket unavailable ({err}); running without it");
-        Some(Instance::Solo)
+        Some(Instance::Solo(Keep(lock)))
     }
 
     /// `None` = another primary exists but could not be signalled.
@@ -289,7 +296,7 @@ mod imp {
                     Ok(listener) => {
                         Some(Instance::Primary(super::Guard(Inner { listener, path: path.to_path_buf(), _lock: lock })))
                     }
-                    Err(e) => solo(e),
+                    Err(e) => solo(e, Some(lock)),
                 }
             }
             Lock::Busy => {
@@ -302,7 +309,7 @@ mod imp {
                 }
                 None
             }
-            Lock::Unavailable(e) => solo(e),
+            Lock::Unavailable(e) => solo(e, None),
         }
     }
 
@@ -383,7 +390,7 @@ mod imp {
             // Path longer than sun_path: lock file opens fine, bind fails.
             let long = dir.join("x".repeat(200)).join("s.sock");
             std::fs::create_dir_all(long.parent().unwrap()).unwrap();
-            assert!(matches!(acquire_at(&long), Some(Instance::Solo)));
+            assert!(matches!(acquire_at(&long), Some(Instance::Solo(_))));
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
