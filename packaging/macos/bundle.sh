@@ -6,6 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+build="${BUILD_NUMBER:-$version}"
 
 # Build both architectures when possible; fall back to the host arch.
 rustup target add x86_64-apple-darwin aarch64-apple-darwin >/dev/null 2>&1 || true
@@ -41,18 +42,20 @@ cat > "$app/Contents/Info.plist" <<EOF
 <plist version="1.0">
 <dict>
   <key>CFBundleExecutable</key><string>rustshot</string>
-  <key>CFBundleIdentifier</key><string>com.nappsllc.rustshot</string>
+  <key>CFBundleIdentifier</key><string>io.github.nappsllc.rustshot</string>
   <key>CFBundleName</key><string>rustshot</string>
   <key>CFBundleDisplayName</key><string>rustshot</string>
   <key>CFBundleIconFile</key><string>rustshot</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
-  <key>CFBundleVersion</key><string>$version</string>
+  <key>CFBundleVersion</key><string>$build</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>LSHighResolutionCapable</key><true/>
   <key>LSUIElement</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>NSHumanReadableCopyright</key><string>GPL-3.0-only</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
+  <key>ITSAppUsesNonExemptEncryption</key><false/>
 </dict>
 </plist>
 EOF

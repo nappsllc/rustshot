@@ -85,7 +85,40 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Bundle
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
         run: bash packaging/macos/bundle.sh
+      # Mac App Store build — runs only when the MAS secrets are configured.
+      - name: Mac App Store package
+        env:
+          MAS_APP_CERT_P12: ${{ secrets.MAS_APP_CERT_P12 }}
+          MAS_INSTALLER_CERT_P12: ${{ secrets.MAS_INSTALLER_CERT_P12 }}
+          MAS_CERT_PASSWORD: ${{ secrets.MAS_CERT_PASSWORD }}
+          MAS_PROVISION_PROFILE: ${{ secrets.MAS_PROVISION_PROFILE }}
+          MAS_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$MAS_APP_CERT_P12" ]; then
+            echo "MAS secrets not configured — skipping Mac App Store package"
+            exit 0
+          fi
+          set -euo pipefail
+          kc="$RUNNER_TEMP/mas-keychain"
+          security create-keychain -p ci "$kc"
+          security set-keychain-settings "$kc"
+          security unlock-keychain -p ci "$kc"
+          for v in MAS_APP_CERT_P12 MAS_INSTALLER_CERT_P12; do
+            echo "${!v}" | base64 --decode > "$RUNNER_TEMP/$v.p12"
+            security import "$RUNNER_TEMP/$v.p12" -k "$kc" -P "$MAS_CERT_PASSWORD"               -T /usr/bin/codesign -T /usr/bin/productbuild
+            rm -f "$RUNNER_TEMP/$v.p12"
+          done
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci "$kc"
+          security list-keychains -d user -s "$kc"
+          export MAS_APP_IDENTITY=$(security find-identity -v -p codesigning "$kc" | sed -n 's/.*"\(Apple Distribution[^"]*\)".*/\1/p' | head -n1)
+          export MAS_INSTALLER_IDENTITY=$(security find-identity -v "$kc" | sed -n 's/.*"\(3rd Party Mac Developer Installer[^"]*\)".*/\1/p' | head -n1)
+          export MAS_PROFILE="$RUNNER_TEMP/rustshot.provisionprofile"
+          echo "$MAS_PROVISION_PROFILE" | base64 --decode > "$MAS_PROFILE"
+          bash packaging/macos/mas.sh
+          security delete-keychain "$kc"
       # Signs + notarizes when Apple secrets are configured in the repo;
       # without them the build stays unsigned (fine for local use — other
       # Macs need right-click → Open).
@@ -129,6 +162,7 @@ jobs:
           path: |
             dist/*.zip
             dist/*.dmg
+            dist/*-mas.pkg
 
   windows:
     runs-on: windows-latest
