@@ -992,7 +992,12 @@ impl Driver for App {
 
         if let Some(sr) = edit.sel {
             chrome::selection(&mut f, &ui, sr, edit.hot_handle, 1.0);
-            chrome::size_label(&mut f, &ui, sr, !interacting, area, 1.0);
+            let avoid = edit
+                .toolbar
+                .as_ref()
+                .filter(|t| t.above && t.bar.y1() <= sr.y)
+                .map(|t| t.pop.map_or(t.bar, |p| toolbar::union(t.bar, p)));
+            chrome::size_label(&mut f, &ui, sr, !interacting, area, avoid, 1.0);
         }
         if let Some(td) = &edit.text {
             let r = text_box_rect(ww, td, edit.sizes.font, edit.font.as_ref(), s);

@@ -184,7 +184,7 @@ pub fn layout(inp: &Input) -> Toolbar {
     } else if sel.y - g - bh >= area.y + m {
         (sel.y - g - bh, true)
     } else if sel.h > INSIDE_MIN_H * s {
-        (sel.y1() - g - bh, true)
+        ((sel.y1() - g - bh).clamp(area.y + m, (area.y1() - m - bh).max(area.y + m)), true)
     } else {
         ((sel.y1() + g).clamp(area.y + m, (area.y1() - m - bh).max(area.y + m)), false)
     };
@@ -265,15 +265,30 @@ impl Toolbar {
 }
 
 /// Size label: 8 above the selection's top-left, or 8 inside it when there
-/// is less than 30 px of the work area above.
-pub fn label_rect(sel: FRect, w: f32, s: f32, area: FRect) -> FRect {
+/// is less than 30 px of the work area above or the placement above would
+/// overlap `avoid` (the toolbar and popover when they sit above).
+pub fn label_rect(sel: FRect, w: f32, s: f32, area: FRect, avoid: Option<FRect>) -> FRect {
     let h = LABEL_H * s;
-    let (x, y) = if sel.y - area.y < LABEL_MIN_ROOM * s {
-        (sel.x + LABEL_GAP * s, sel.y + LABEL_GAP * s)
+    let inside = (sel.x + LABEL_GAP * s, sel.y + LABEL_GAP * s);
+    let (mut x, mut y) = if sel.y - area.y < LABEL_MIN_ROOM * s {
+        inside
     } else {
         (sel.x, sel.y - LABEL_GAP * s - h)
     };
-    FRect { x: x.clamp(area.x, (area.x1() - w).max(area.x)), y, w, h }
+    x = x.clamp(area.x, (area.x1() - w).max(area.x));
+    if let Some(a) = avoid {
+        let hits = x < a.x1() && x + w > a.x && y < a.y1() && y + h > a.y;
+        if hits {
+            (x, y) = inside;
+            x = x.clamp(area.x, (area.x1() - w).max(area.x));
+        }
+    }
+    FRect { x, y, w, h }
+}
+
+pub(super) fn union(a: FRect, b: FRect) -> FRect {
+    let (x, y) = (a.x.min(b.x), a.y.min(b.y));
+    FRect { x, y, w: a.x1().max(b.x1()) - x, h: a.y1().max(b.y1()) - y }
 }
 
 pub fn hit(r: FRect, p: Pt) -> bool {
@@ -343,7 +358,7 @@ mod tests {
     #[test]
     fn goes_inside_fullscreen_selection() {
         let tb = layout(&inp(r(0.0, 0.0, 1920.0, 1080.0)));
-        assert_eq!(tb.bar.y1(), 1072.0);
+        assert_eq!(tb.bar.y1(), 1068.0, "clamped to the 12 px margin");
         assert_eq!(tb.bar.x1(), 1908.0, "clamped to the 12 px margin");
     }
 
@@ -411,9 +426,9 @@ mod tests {
 
     #[test]
     fn label_above_or_inside() {
-        let l = label_rect(r(240.0, 140.0, 960.0, 540.0), 120.0, 1.0, AREA);
+        let l = label_rect(r(240.0, 140.0, 960.0, 540.0), 120.0, 1.0, AREA, None);
         assert_eq!((l.x, l.y, l.h), (240.0, 110.0, 22.0));
-        let l = label_rect(r(300.0, 0.0, 664.0, 110.0), 120.0, 1.0, AREA);
+        let l = label_rect(r(300.0, 0.0, 664.0, 110.0), 120.0, 1.0, AREA, None);
         assert_eq!((l.x, l.y), (308.0, 8.0));
     }
 
@@ -431,8 +446,19 @@ mod tests {
     #[test]
     fn label_inside_when_no_room_in_area() {
         let area = r(0.0, 200.0, 1920.0, 880.0);
-        let l = label_rect(r(300.0, 210.0, 664.0, 300.0), 120.0, 1.0, area);
+        let l = label_rect(r(300.0, 210.0, 664.0, 300.0), 120.0, 1.0, area, None);
         assert_eq!((l.x, l.y), (308.0, 218.0));
+    }
+
+    #[test]
+    fn label_moves_inside_when_bar_above_covers_it() {
+        let sel = r(900.0, 950.0, 200.0, 100.0);
+        let tb = layout(&inp(sel));
+        assert!(tb.above && tb.bar.y1() <= sel.y);
+        let l = label_rect(sel, 120.0, 1.0, AREA, Some(tb.bar));
+        assert_eq!((l.x, l.y), (908.0, 958.0));
+        let l = label_rect(sel, 120.0, 1.0, AREA, None);
+        assert_eq!((l.x, l.y), (900.0, 920.0));
     }
 
     #[test]

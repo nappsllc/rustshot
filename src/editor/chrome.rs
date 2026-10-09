@@ -228,7 +228,7 @@ pub fn selection(f: &mut Fb, ui: &Ui, sr: FRect, hot: Option<usize>, k: f32) {
 }
 
 /// "W × H" (and "x, y" when not dragging) above the selection.
-pub fn size_label(f: &mut Fb, ui: &Ui, sr: FRect, show_pos: bool, area: FRect, k: f32) {
+pub fn size_label(f: &mut Fb, ui: &Ui, sr: FRect, show_pos: bool, area: FRect, avoid: Option<FRect>, k: f32) {
     let size = format!("{} × {}", sr.w.round() as i32, sr.h.round() as i32);
     let pos = format!("{}, {}", sr.x.round() as i32, sr.y.round() as i32);
     let pad = ui.px(8.0);
@@ -236,7 +236,7 @@ pub fn size_label(f: &mut Fb, ui: &Ui, sr: FRect, show_pos: bool, area: FRect, k
     if show_pos {
         w += pad + tw(ui, 11.0, &pos);
     }
-    let r = label_rect(sr, w, ui.s, area);
+    let r = label_rect(sr, w, ui.s, area, avoid);
     surface(f, ui, r, 6.0, &SMALL_LAYERS, k);
     let cy = r.y + r.h / 2.0;
     let x = r.x + pad + text(f, ui, 12.0, &size, r.x + pad, cy, ui.th.text.fade(k));
