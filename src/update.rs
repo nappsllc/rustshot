@@ -8,6 +8,15 @@ pub struct Release {
 
 const RELEASES_HOST: &str = "api.github.com";
 const RELEASES_PATH: &str = "/repos/nappsllc/rustshot/releases/latest";
+pub const RELEASES_PREFIX: &str = "https://github.com/nappsllc/rustshot/";
+
+/// Only release pages of this repo may be printed or opened: no other scheme,
+/// host, control characters or whitespace (argv injection, terminal escapes).
+fn is_safe_release_url(u: &str) -> bool {
+    u.starts_with(RELEASES_PREFIX)
+        && !u.chars().any(|c| c.is_control() || c.is_whitespace())
+        && u.len() <= 512
+}
 
 /// Parse `x.y.z` with an optional leading `v`; anything else is not comparable.
 pub fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
@@ -95,7 +104,7 @@ pub fn parse_latest(json: &str) -> Option<Release> {
     let tag = json_string(json, "tag_name")?;
     parse_version(&tag)?;
     // GitHub emits the release's own html_url before the nested author's.
-    let url = json_string(json, "html_url")?;
+    let url = json_string(json, "html_url").filter(|u| is_safe_release_url(u))?;
     Some(Release { version: tag.strip_prefix('v').unwrap_or(&tag).to_string(), url })
 }
 
@@ -222,6 +231,10 @@ pub fn check_now() -> Result<Option<Release>, String> {
 /// Open a URL in the default browser (best effort).
 pub fn open_url(url: &str) {
     use std::process::Command;
+    if !is_safe_release_url(url) {
+        eprintln!("refusing to open an unexpected URL");
+        return;
+    }
     #[cfg(windows)]
     let mut cmd = {
         let mut c = Command::new("rundll32");
@@ -254,8 +267,7 @@ mod tests {
 
     #[test]
     fn stamp_parsing_tolerates_garbage() {
-        assert_eq!(parse_stamp("1700000000
-"), Some(1_700_000_000));
+        assert_eq!(parse_stamp("1700000000\n"), Some(1_700_000_000));
         assert_eq!(parse_stamp(""), None);
         assert_eq!(parse_stamp("nope"), None);
     }
@@ -320,6 +332,32 @@ mod tests {
         );
         assert!(parse_latest(&FIXTURE.replace("v0.2.0\",\n  \"draft", "nightly\",\n  \"draft")).is_none());
         assert!(parse_latest("{}").is_none());
+    }
+
+    #[test]
+    fn release_url_guard() {
+        assert!(is_safe_release_url("https://github.com/nappsllc/rustshot/releases/tag/v0.2.0"));
+        assert!(!is_safe_release_url("https://github.com/nappsllc/rustshot/x y"));
+        assert!(!is_safe_release_url("https://github.com/nappsllc/rustshot/\u{1b}[2J"));
+        assert!(!is_safe_release_url("-https://github.com/nappsllc/rustshot/"));
+        let long = format!("{RELEASES_PREFIX}{}", "a".repeat(512));
+        assert!(!is_safe_release_url(&long));
+    }
+
+    #[test]
+    fn latest_rejects_unsafe_urls() {
+        const HTML_URL: &str =
+            "\"html_url\": \"https://github.com/nappsllc/rustshot/releases/tag/v0.2.0\"";
+        for bad in [
+            "C:\\\\Windows\\\\System32\\\\calc.exe",
+            "file:///etc/passwd",
+            "https://evil.example/nappsllc/rustshot/x",
+            "https://github.com/nappsllc/rustshot/releases/tag/v9.9.9\\n",
+        ] {
+            let json = FIXTURE.replace(HTML_URL, &format!("\"html_url\": \"{bad}\""));
+            assert_ne!(json, FIXTURE, "fixture was not patched");
+            assert!(parse_latest(&json).is_none(), "accepted {bad}");
+        }
     }
 
     #[test]
