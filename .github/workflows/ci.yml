@@ -121,3 +121,15 @@ jobs:
         with:
           name: rustshot-windows-installer
           path: dist/*-setup.exe
+      - name: MSIX
+        env:
+          MSIX_IDENTITY_NAME: ${{ vars.MSIX_IDENTITY_NAME }}
+          MSIX_PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
+          MSIX_PUBLISHER_DISPLAY: ${{ vars.MSIX_PUBLISHER_DISPLAY }}
+          MSIX_SIGN_PFX: ${{ secrets.MSIX_SIGN_PFX }}
+          MSIX_SIGN_PASSWORD: ${{ secrets.MSIX_SIGN_PASSWORD }}
+        run: packaging\windows\msix.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustshot-windows-msix
+          path: dist/*.msix
