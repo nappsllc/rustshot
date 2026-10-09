@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod actions;
 mod anim;
 mod autostart;
@@ -373,7 +375,45 @@ fn editor_main(cfg: Config, kind: RunKind, pending: Pending) -> i32 {
     code
 }
 
+/// GUI-subsystem builds start without a console; attach to the parent's so CLI
+/// output shows in a terminal. Redirected (valid) std handles are kept as-is.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        SetStdHandle,
+    };
+    use windows::core::w;
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
+            return;
+        }
+        for std in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let cur = GetStdHandle(std).unwrap_or_default();
+            if (cur.is_invalid() || cur == INVALID_HANDLE_VALUE)
+                && let Ok(h) = CreateFileW(
+                    w!("CONOUT$"),
+                    (GENERIC_READ | GENERIC_WRITE).0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    None,
+                )
+            {
+                let _ = SetStdHandle(std, h);
+            }
+        }
+    }
+}
+
 fn main() {
+    #[cfg(windows)]
+    attach_parent_console();
     if let Err(e) = run() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
