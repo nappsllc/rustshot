@@ -33,4 +33,8 @@ modules:
           - target
           - dist
           - _flameshot
+          - .git
+          - .flatpak-builder
+          - flatpak_app
+          - .superpowers
       - cargo-sources.json

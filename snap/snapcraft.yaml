@@ -31,6 +31,7 @@ parts:
     parse-info: [usr/share/metainfo/io.github.nappsllc.rustshot.metainfo.xml]
     override-build: |
       craftctl default
+      craftctl set version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' "$CRAFT_PART_SRC/Cargo.toml" | head -n1)"
       install -Dm644 packaging/linux/io.github.nappsllc.rustshot.desktop \
         "$CRAFT_PART_INSTALL/usr/share/applications/io.github.nappsllc.rustshot.desktop"
       install -Dm644 packaging/linux/io.github.nappsllc.rustshot.metainfo.xml \
