@@ -17,6 +17,10 @@ mod pixbuf;
 #[cfg(windows)]
 mod proc_win;
 mod raster;
+// Screen recording pipeline; the platform capture and the UI that start it
+// come in later tasks, so nothing outside its tests calls it yet.
+#[allow(dead_code)]
+mod rec;
 mod settings_ui;
 mod sha256;
 mod text;

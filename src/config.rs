@@ -56,6 +56,36 @@ pub struct Config {
     /// only changed rects repainted; the default) or "software" (whole
     /// frame composed in memory). Linux/macOS always use software.
     pub renderer: String,
+    /// Recording: default format, "mp4" or "gif".
+    pub rec_format: String,
+    /// Recording: MP4 frame rate, 30 or 60.
+    pub rec_fps: u32,
+    /// Recording: GIF frame rate, 10 or 15.
+    pub rec_gif_fps: u32,
+    /// Recording: MP4 quality, "low", "medium" or "high".
+    pub rec_quality: String,
+    /// Recording: capture system sound (MP4 only).
+    pub rec_system_audio: bool,
+    /// Recording: capture the microphone (MP4 only).
+    pub rec_mic: bool,
+    /// Recording: microphone device id; empty = the default device.
+    pub rec_mic_device: String,
+    /// Recording: show the camera bubble.
+    pub rec_camera: bool,
+    /// Recording: camera device id; empty = the default camera.
+    pub rec_camera_device: String,
+    /// Recording: bubble shape, "circle", "rounded" or "square".
+    pub rec_camera_shape: String,
+    /// Recording: bubble size, "s", "m" or "l" (160/240/320 logical px).
+    pub rec_camera_size: String,
+    /// Recording: mirror the camera image.
+    pub rec_camera_mirror: bool,
+    /// Recording: 3-2-1 countdown before the first frame.
+    pub rec_countdown: bool,
+    /// Global hotkey that starts (and stops) a recording.
+    pub record_hotkey: String,
+    /// Linux MP4 encoder: "auto", "ffmpeg" or "openh264".
+    pub rec_linux_encoder: String,
     /// Editor shortcut overrides from the `[shortcuts]` table
     /// (`action id -> "Ctrl+Shift+S"`; see `keymap`).
     pub shortcuts: BTreeMap<String, String>,
@@ -95,6 +125,21 @@ impl Default for Config {
             check_updates: true,
             skip_version: String::new(),
             renderer: "gdi".into(),
+            rec_format: "mp4".into(),
+            rec_fps: 30,
+            rec_gif_fps: 15,
+            rec_quality: "medium".into(),
+            rec_system_audio: true,
+            rec_mic: false,
+            rec_mic_device: String::new(),
+            rec_camera: false,
+            rec_camera_device: String::new(),
+            rec_camera_shape: "circle".into(),
+            rec_camera_size: "m".into(),
+            rec_camera_mirror: true,
+            rec_countdown: true,
+            record_hotkey: "Meta+Shift+R".into(),
+            rec_linux_encoder: "auto".into(),
             shortcuts: BTreeMap::new(),
         }
     }
@@ -441,6 +486,29 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
                 cfg.skip_version = as_string(val).map_err(|e| bad("string", &e))?
             }
             "renderer" => cfg.renderer = as_string(val).map_err(|e| bad("string", &e))?,
+            "rec_format" => cfg.rec_format = one_of(val, &["mp4", "gif"]).map_err(|e| bad("value", &e))?,
+            "rec_fps" => cfg.rec_fps = fps_of(val, &[30, 60]).map_err(|e| bad("number", &e))?,
+            "rec_gif_fps" => cfg.rec_gif_fps = fps_of(val, &[10, 15]).map_err(|e| bad("number", &e))?,
+            "rec_quality" => {
+                cfg.rec_quality = one_of(val, &["low", "medium", "high"]).map_err(|e| bad("value", &e))?
+            }
+            "rec_system_audio" => cfg.rec_system_audio = as_bool(val).map_err(|e| bad("boolean", &e))?,
+            "rec_mic" => cfg.rec_mic = as_bool(val).map_err(|e| bad("boolean", &e))?,
+            "rec_mic_device" => cfg.rec_mic_device = as_string(val).map_err(|e| bad("string", &e))?,
+            "rec_camera" => cfg.rec_camera = as_bool(val).map_err(|e| bad("boolean", &e))?,
+            "rec_camera_device" => cfg.rec_camera_device = as_string(val).map_err(|e| bad("string", &e))?,
+            "rec_camera_shape" => {
+                cfg.rec_camera_shape =
+                    one_of(val, &["circle", "rounded", "square"]).map_err(|e| bad("value", &e))?
+            }
+            "rec_camera_size" => cfg.rec_camera_size = one_of(val, &["s", "m", "l"]).map_err(|e| bad("value", &e))?,
+            "rec_camera_mirror" => cfg.rec_camera_mirror = as_bool(val).map_err(|e| bad("boolean", &e))?,
+            "rec_countdown" => cfg.rec_countdown = as_bool(val).map_err(|e| bad("boolean", &e))?,
+            "record_hotkey" => cfg.record_hotkey = as_string(val).map_err(|e| bad("string", &e))?,
+            "rec_linux_encoder" => {
+                cfg.rec_linux_encoder =
+                    one_of(val, &["auto", "ffmpeg", "openh264"]).map_err(|e| bad("value", &e))?
+            }
             _ => {} // unknown keys are ignored, as with serde's default
         }
     }
@@ -478,7 +546,22 @@ pub fn to_toml(c: &Config) -> String {
          capture_active_monitor = {}\n\
          check_updates = {}\n\
          skip_version = {}\n\
-         renderer = {}\n",
+         renderer = {}\n\
+         rec_format = {}\n\
+         rec_fps = {}\n\
+         rec_gif_fps = {}\n\
+         rec_quality = {}\n\
+         rec_system_audio = {}\n\
+         rec_mic = {}\n\
+         rec_mic_device = {}\n\
+         rec_camera = {}\n\
+         rec_camera_device = {}\n\
+         rec_camera_shape = {}\n\
+         rec_camera_size = {}\n\
+         rec_camera_mirror = {}\n\
+         rec_countdown = {}\n\
+         record_hotkey = {}\n\
+         rec_linux_encoder = {}\n",
         q(&c.save_path),
         c.save_subfolder,
         q(&c.subfolder_pattern),
@@ -504,6 +587,21 @@ pub fn to_toml(c: &Config) -> String {
         c.check_updates,
         q(&c.skip_version),
         q(&c.renderer),
+        q(&c.rec_format),
+        c.rec_fps,
+        c.rec_gif_fps,
+        q(&c.rec_quality),
+        c.rec_system_audio,
+        c.rec_mic,
+        q(&c.rec_mic_device),
+        c.rec_camera,
+        q(&c.rec_camera_device),
+        q(&c.rec_camera_shape),
+        q(&c.rec_camera_size),
+        c.rec_camera_mirror,
+        c.rec_countdown,
+        q(&c.record_hotkey),
+        q(&c.rec_linux_encoder),
     );
     if !c.shortcuts.is_empty() {
         out.push_str("
@@ -579,6 +677,27 @@ fn as_string(v: &str) -> Result<String, String> {
         }
     }
     Ok(out)
+}
+
+/// A quoted string that is one of `allowed` (trimmed, case-insensitive);
+/// returned lowercase.
+fn one_of(v: &str, allowed: &[&str]) -> Result<String, String> {
+    let s = as_string(v)?.trim().to_ascii_lowercase();
+    if allowed.contains(&s.as_str()) {
+        Ok(s)
+    } else {
+        Err(format!("{v} (expected one of {})", allowed.join(", ")))
+    }
+}
+
+/// A frame rate that is one of `allowed`.
+fn fps_of(v: &str, allowed: &[u32]) -> Result<u32, String> {
+    let n = as_u64(v)?;
+    allowed
+        .iter()
+        .copied()
+        .find(|&a| u64::from(a) == n)
+        .ok_or_else(|| format!("{v} (expected one of {allowed:?})"))
 }
 
 fn as_u64(v: &str) -> Result<u64, String> {
@@ -955,6 +1074,85 @@ bogus = 1
         assert!(parse_config("jpeg_quality = 0").is_err());
         assert!(parse_config("jpeg_quality = 101").is_err());
         assert!(parse_config("save_subfolder = 1").is_err());
+    }
+
+    #[test]
+    fn recording_keys_defaults_and_roundtrip() {
+        let d = Config::default();
+        assert_eq!((d.rec_format.as_str(), d.rec_fps, d.rec_gif_fps, d.rec_quality.as_str()), ("mp4", 30, 15, "medium"));
+        assert!(d.rec_system_audio && !d.rec_mic && d.rec_mic_device.is_empty());
+        assert!(!d.rec_camera && d.rec_camera_device.is_empty());
+        assert_eq!((d.rec_camera_shape.as_str(), d.rec_camera_size.as_str()), ("circle", "m"));
+        assert!(d.rec_camera_mirror && d.rec_countdown);
+        assert_eq!(d.record_hotkey, "Meta+Shift+R");
+        assert!(crate::keymap::Chord::parse(&d.record_hotkey).is_some());
+        assert_eq!(d.rec_linux_encoder, "auto");
+        assert_eq!(parse_config(&to_toml(&d)).unwrap(), d);
+        let c = Config {
+            rec_format: "gif".into(),
+            rec_fps: 60,
+            rec_gif_fps: 10,
+            rec_quality: "high".into(),
+            rec_system_audio: false,
+            rec_mic: true,
+            rec_mic_device: "{0.0.1.00000000}.{abc} \"Mic\"".into(),
+            rec_camera: true,
+            rec_camera_device: "\\\\?\\usb#cam".into(),
+            rec_camera_shape: "rounded".into(),
+            rec_camera_size: "l".into(),
+            rec_camera_mirror: false,
+            rec_countdown: false,
+            record_hotkey: "Ctrl+Alt+R".into(),
+            rec_linux_encoder: "openh264".into(),
+            ..Config::default()
+        };
+        assert_eq!(parse_config(&to_toml(&c)).unwrap(), c);
+        assert!(!rewrite_loses(&to_toml(&c)));
+        // Enumerations are trimmed and case-folded.
+        let t = parse_config(concat!(
+            "rec_format = \" GIF \"\n",
+            "rec_quality = \"Low\"\n",
+            "rec_camera_shape = \"SQUARE\"\n",
+            "rec_camera_size = \"S\"\n",
+            "rec_linux_encoder = \"FFmpeg\"\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            [t.rec_format, t.rec_quality, t.rec_camera_shape, t.rec_camera_size, t.rec_linux_encoder],
+            ["gif", "low", "square", "s", "ffmpeg"]
+        );
+    }
+
+    #[test]
+    fn recording_keys_reject_bad_values() {
+        for bad in [
+            "rec_format = \"webm\"",
+            "rec_format = mp4",
+            "rec_fps = 25",
+            "rec_fps = 15",
+            "rec_fps = \"30\"",
+            "rec_gif_fps = 30",
+            "rec_gif_fps = -1",
+            "rec_quality = \"ultra\"",
+            "rec_system_audio = 1",
+            "rec_mic = \"yes\"",
+            "rec_mic_device = 3",
+            "rec_camera = 0",
+            "rec_camera_device = x",
+            "rec_camera_shape = \"hexagon\"",
+            "rec_camera_size = \"xl\"",
+            "rec_camera_mirror = on",
+            "rec_countdown = 1",
+            "record_hotkey = R",
+            "rec_linux_encoder = \"vaapi\"",
+        ] {
+            let e = parse_config(bad).expect_err(bad);
+            let key = bad.split(' ').next().unwrap();
+            assert!(e.contains(&format!("'{key}'")), "{bad}: {e}");
+        }
+        for ok in ["rec_fps = 60", "rec_gif_fps = 10", "rec_camera_shape = \"circle\"", "rec_linux_encoder = \"auto\""] {
+            assert!(parse_config(ok).is_ok(), "{ok}");
+        }
     }
 
     #[test]

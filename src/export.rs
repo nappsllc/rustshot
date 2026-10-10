@@ -190,6 +190,12 @@ fn file_stem(pattern: &str, now: Tm, epoch: u64) -> String {
 /// `save_dir / [subfolder_pattern] / filename_pattern.ext`. The subfolder
 /// pattern may nest with `/`; each level is sanitised and `..` dropped.
 pub fn auto_save_path(cfg: &Config, now: Tm) -> PathBuf {
+    auto_save_path_ext(cfg, now, Format::from_config(cfg).ext())
+}
+
+/// [`auto_save_path`] with an explicit extension (`"mp4"`, `"gif"`) in
+/// place of the screenshot format's: recordings land beside captures.
+pub fn auto_save_path_ext(cfg: &Config, now: Tm, ext: &str) -> PathBuf {
     let epoch = unix_now();
     let mut dir = default_save_dir(cfg);
     if cfg.save_subfolder {
@@ -200,7 +206,6 @@ pub fn auto_save_path(cfg: &Config, now: Tm) -> PathBuf {
             }
         }
     }
-    let ext = Format::from_config(cfg).ext();
     dir.join(format!("{}.{ext}", file_stem(&cfg.filename_pattern, now, epoch)))
 }
 
@@ -618,6 +623,12 @@ mod tests {
             auto_save_path(&custom, NOW),
             base.join("2026").join("03").join("x-y").join("shot 09-05-02.bmp")
         );
+        // Recordings: same folder and stem, their own extension.
+        assert_eq!(
+            auto_save_path_ext(&cfg, NOW, "mp4"),
+            base.join("2026-03-07").join("2026-03-07_09-05.mp4")
+        );
+        assert_eq!(auto_save_path_ext(&flat, NOW, "gif"), base.join("2026-03-07_09-05.gif"));
         let empty = Config { filename_pattern: "".into(), subfolder_pattern: "..".into(), ..cfg };
         assert_eq!(auto_save_path(&empty, NOW), base.join("capture.png"));
     }

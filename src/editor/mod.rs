@@ -1284,6 +1284,8 @@ fn act_of(a: Action) -> Option<Act> {
         Action::Redo => Act::Redo,
         Action::TogglePalette => Act::Palette,
         Action::SelectAll | Action::Accept | Action::Cancel => return None,
+        // Recording is wired up with the recording UI.
+        Action::Record | Action::StopRecording => return None,
     })
 }
 
