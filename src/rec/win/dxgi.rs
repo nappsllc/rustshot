@@ -26,9 +26,12 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::*;
 
-/// Tests force [`DxgiSource::open`] to fail to exercise the GDI fallback.
 #[cfg(test)]
-pub(crate) static FORCE_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    /// Tests force [`DxgiSource::open`] to fail (on their own thread only)
+    /// to exercise the GDI fallback.
+    pub(crate) static FORCE_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// How long to wait before trying to re-create a lost duplication again.
 const RETRY: Duration = Duration::from_millis(250);
@@ -46,6 +49,8 @@ struct Output {
     isect: IRect,
     staging: Option<ID3D11Texture2D>,
     retry_at: Instant,
+    /// A failure other than lost access was reported (once per output).
+    logged: bool,
 }
 
 #[derive(Default)]
@@ -125,6 +130,15 @@ fn create_device(adapter: &IDXGIAdapter1) -> Result<(ID3D11Device, ID3D11DeviceC
 }
 
 impl Output {
+    /// Report a capture failure on this output, the first time only (the
+    /// source keeps retrying and repeats the last frame meanwhile).
+    fn log(&mut self, e: &str) {
+        if !self.logged {
+            self.logged = true;
+            eprintln!("rustshot: desktop duplication failed ({e}); retrying");
+        }
+    }
+
     /// (Re-)duplicate the output named `self.name` on its adapter.
     fn duplicate(&mut self, area: IRect) -> Result<()> {
         self.dup = None;
@@ -168,7 +182,7 @@ impl DxgiSource {
     /// pixels). Fails when any of them cannot be duplicated (or is rotated).
     pub fn open(area: IRect) -> Result<DxgiSource> {
         #[cfg(test)]
-        if FORCE_FAIL.load(std::sync::atomic::Ordering::Relaxed) {
+        if FORCE_FAIL.with(|f| f.get()) {
             bail!("desktop duplication disabled by the test");
         }
         if area.2 == 0 || area.3 == 0 {
@@ -205,6 +219,7 @@ impl DxgiSource {
                     isect: (0, 0, 0, 0),
                     staging: None,
                     retry_at: Instant::now(),
+                    logged: false,
                 };
                 o.duplicate(area)?;
                 outs.push(o);
@@ -238,7 +253,10 @@ impl DxgiSource {
         let area = self.area;
         let o = &mut self.outs[i];
         let Some(dup) = o.dup.clone() else {
-            if Instant::now() >= o.retry_at && o.duplicate(area).is_err() {
+            if Instant::now() >= o.retry_at
+                && let Err(e) = o.duplicate(area)
+            {
+                o.log(&format!("{e:#}"));
                 o.retry_at = Instant::now() + RETRY;
             }
             return;
@@ -249,9 +267,15 @@ impl DxgiSource {
             Ok(()) => {}
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return,
             Err(e) => {
-                // Access lost (desktop switch, mode change) or worse: start over.
-                let lost = e.code() == DXGI_ERROR_ACCESS_LOST;
-                if !lost || o.duplicate(area).is_err() {
+                // Access lost (desktop switch, mode change): re-duplicate at
+                // once. Anything else: log it (once) and retry every RETRY.
+                let again = if e.code() == DXGI_ERROR_ACCESS_LOST {
+                    o.duplicate(area).map_err(|e| format!("{e:#}"))
+                } else {
+                    Err(format!("{e}"))
+                };
+                if let Err(e) = again {
+                    o.log(&e);
                     o.dup = None;
                     o.retry_at = Instant::now() + RETRY;
                 }

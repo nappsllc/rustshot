@@ -277,8 +277,8 @@ jobs:
           cargo test --bin rustshot -- --ignored --test-threads=1 --nocapture             live_monitor_capture live_desktop_capture live_window_lifecycle             interactive_window_renders_rect window_smoke present_colors_round_trip             live_icon_added_and_removed live_clipboard_roundtrip             2>&1 | tee "$RUNNER_TEMP/test-logs/live-desktop.log"
       # Screen recording on the real desktop: a test window recorded to MP4
       # (Media Foundation) and GIF, the GDI fallback, WASAPI loopback (each
-      # skips with a message when the runner has no Media Foundation or no
-      # audio device).
+      # skips with a "SKIP:" line, turned into a warning, when the runner has
+      # no Media Foundation, no H.264/AAC encoder or no audio device).
       - name: Live recording tests
         timeout-minutes: 8
         shell: bash
@@ -286,6 +286,12 @@ jobs:
           set -o pipefail
           mkdir -p "$RUNNER_TEMP/test-logs"
           timeout 400 cargo test --bin rustshot -- --ignored --test-threads=1 --nocapture live_rec_             2>&1 | tee "$RUNNER_TEMP/test-logs/live-rec.log"
+          # A skipped test passes; make it visible on the run.
+          if grep -q "SKIP:" "$RUNNER_TEMP/test-logs/live-rec.log"; then
+            grep -o "SKIP:.*" "$RUNNER_TEMP/test-logs/live-rec.log" | sort -u | while read -r line; do
+              echo "::warning title=Live recording test skipped::$line"
+            done
+          fi
       # The e2e suite drives the release exe with posted input. Its daemons
       # use their own instance name, and every launch its own APPDATA.
       - name: End-to-end

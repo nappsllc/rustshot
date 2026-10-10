@@ -498,6 +498,24 @@ fn wait_pid_window(pid: u32, ms: u64) -> Option<HWND> {
     }
 }
 
+/// Row of `action` in the Settings shortcut table, which lists
+/// `keymap::Action::ALL` in order (read from the source, so new actions
+/// anywhere in the list keep this right).
+fn action_row(action: &str) -> usize {
+    let src = include_str!("../src/keymap.rs");
+    let all = &src[src.find("pub const ALL").expect("Action::ALL")..];
+    let all = &all[all.find("= [").expect("Action::ALL list") + 3..];
+    let all = &all[..all.find("];").expect("end of Action::ALL")];
+    let want = format!("Action::{action}");
+    all.split(',').map(str::trim).filter(|e| !e.is_empty()).position(|e| e == want).unwrap_or_else(|| panic!("{want} not in Action::ALL"))
+}
+
+#[test]
+fn action_rows_follow_the_keymap() {
+    assert_eq!(action_row("ToolPencil"), 0);
+    assert!(action_row("Accept") > 0 && action_row("Cancel") == action_row("Accept") + 1);
+}
+
 /// Keys posted one by one with a short pause (each is its own frame).
 fn keys(hwnd: HWND, vks: &[u32]) {
     for &vk in vks {
@@ -571,8 +589,10 @@ fn settings_window_saves_and_the_daemon_reloads() {
         assert_eq!(wait_exit(&mut run(&["settings"]).spawn().unwrap(), 5000), Some(0));
         let w = wait_pid_window(pid, 5000).expect("settings window again");
         std::thread::sleep(Duration::from_millis(500));
-        // tabs → Shortcuts, table: End (Cancel), Up (Accept), rebind box: record K.
-        keys(w, &[TAB, 0x27, 0x27, TAB, 0x23, 0x26, TAB, RET, 'K' as u32]);
+        // tabs → Shortcuts, table: Home, Down to Accept's row, rebind box: record K.
+        keys(w, &[TAB, 0x27, 0x27, TAB, 0x24]);
+        keys(w, &vec![0x28; action_row("Accept")]);
+        keys(w, &[TAB, RET, 'K' as u32]);
         keys(w, &[TAB, TAB, RET]); // Reset all, OK
         assert!(wait_gone(pid, 5000), "OK closes the window");
         let text = std::fs::read_to_string(&cfg).unwrap();

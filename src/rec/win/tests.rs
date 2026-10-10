@@ -7,7 +7,6 @@ use super::*;
 use crate::rec::gif::GifEncoder;
 use crate::rec::{AudioSource, Quality, RecFormat, RecSpec, Session, VideoEncoder};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use windows::core::{w, PCWSTR};
@@ -137,9 +136,22 @@ fn record(
     (s.stop().unwrap(), kind)
 }
 
-fn skip_without_mf() -> bool {
+/// Whether to skip an MP4 test: Media Foundation, its H.264 encoder or
+/// (with `aac`) its AAC encoder is missing. Prints a `SKIP:` line, which
+/// CI turns into a warning. Failures past this point (creating the
+/// encoder, writing) fail the test.
+fn skip_without_mf(aac: bool) -> bool {
     if !mf::available() {
         eprintln!("SKIP: Media Foundation is not available on this system");
+        return true;
+    }
+    let (has_h264, has_aac) = mf::encoders_available();
+    if !has_h264 {
+        eprintln!("SKIP: no H.264 encoder (MFT) is registered on this system");
+        return true;
+    }
+    if aac && !has_aac {
+        eprintln!("SKIP: no AAC encoder (MFT) is registered on this system");
         return true;
     }
     false
@@ -157,15 +169,16 @@ fn distinct(ys: &[u8]) -> usize {
 #[ignore = "records the real desktop"]
 fn live_rec_mp4_of_a_changing_window() {
     crate::capture::enable_dpi_awareness();
-    if skip_without_mf() {
+    if skip_without_mf(false) {
         return;
     }
     let win = TestWindow::open(200, 200, 320, 240, 100);
     let dir = out_dir();
     let spec = spec(RecFormat::Mp4, 30, win.rect(), dir.join("window.mp4"));
     let (path, kind) = record(spec, vec![], 2.0, |p, w, h| {
+        let t = Instant::now();
         let e = MfEncoder::create(p, w, h, 30, Quality::Medium, false).unwrap();
-        eprintln!("encoder: {:?} hardware={}", e.encoder_name(), e.hardware());
+        eprintln!("encoder: {:?} hardware={}, created in {:?}", e.encoder_name(), e.hardware(), t.elapsed());
         Box::new(e)
     });
     drop(win);
@@ -232,9 +245,9 @@ fn live_rec_gif_of_a_changing_window() {
 fn live_rec_dxgi_failure_falls_back_to_gdi() {
     crate::capture::enable_dpi_awareness();
     let win = TestWindow::open(260, 260, 160, 120, 100);
-    dxgi::FORCE_FAIL.store(true, Ordering::Relaxed);
+    dxgi::FORCE_FAIL.with(|f| f.set(true));
     let r = open_source(win.rect());
-    dxgi::FORCE_FAIL.store(false, Ordering::Relaxed);
+    dxgi::FORCE_FAIL.with(|f| f.set(false));
     let (mut src, kind) = r.unwrap();
     assert_eq!(kind, SourceKind::Gdi);
     assert_eq!(src.size(), (160, 120));
@@ -308,19 +321,28 @@ fn live_rec_wasapi_loopback_tone() {
     got.clear();
     let t0 = Instant::now();
     play(&img);
-    let mut heard = None;
+    let (mut heard, mut captured) = (None, None);
     let end = t0 + Duration::from_millis(900);
     while Instant::now() < end {
         let from = got.len();
-        lb.read(&mut got);
-        if heard.is_none() && got[from..].iter().any(|s| s.abs() > 0.05) {
+        let (_, at) = lb.read_timed(&mut got);
+        if heard.is_none()
+            && let Some(k) = got[from..].iter().position(|s| s.abs() > 0.05)
+        {
             heard = Some(t0.elapsed());
+            let frame = (k / usize::from(lb.channels())) as u64;
+            captured = at.map(|a| a + Duration::from_nanos(frame * 1_000_000_000 / u64::from(lb.rate())) - t0);
         }
         std::thread::sleep(Duration::from_millis(2));
     }
     stop_sound();
     let peak = got.iter().fold(0f32, |m, &s| m.max(s.abs()));
-    eprintln!("loopback: {} samples, peak {peak:.4}; first loud packet read {heard:?} after PlaySound", got.len());
+    eprintln!(
+        "loopback: {} samples, peak {peak:.4}; first loud sample read {heard:?}, captured {captured:?} after PlaySound",
+        got.len()
+    );
+    let captured = captured.expect("the tone has a capture timestamp");
+    assert!(captured <= heard.unwrap(), "captured before it was read");
     assert!(got.len() > lb.rate() as usize / 4, "samples arrive while the tone plays");
     assert!(peak > 0.005, "the tone is heard (peak {peak})");
     // The default microphone opens and delivers (nothing is kept).
@@ -377,6 +399,66 @@ fn audio_onset(path: &Path, threshold: f32) -> Option<Duration> {
     }
 }
 
+/// Where the AAC round trip (encode, then decode with the source reader)
+/// puts a tone that starts at exactly 1 s: the codec's own delay, which
+/// the capture-placement test below sees on top of its own error.
+fn aac_delay() -> Duration {
+    let dir = out_dir();
+    let path = dir.join("aac.mp4");
+    let mut e = MfEncoder::create(&path, 64, 64, 30, Quality::Low, true).unwrap();
+    let black = crate::rec::Frame { w: 64, h: 64, bgra: vec![0; 64 * 64 * 4], ts: Duration::ZERO };
+    for i in 0..60u64 {
+        e.push_video(&crate::rec::Frame { ts: Duration::from_millis(i * 1000 / 30), ..black.clone() }).unwrap();
+        if i % 3 == 0 {
+            // 100 ms of audio per 3 frames: silence, the tone from 1 s on.
+            let t0 = i * 1000 / 30;
+            let pcm: Vec<f32> = (0..4800u64)
+                .flat_map(|k| {
+                    let n = t0 * 48 + k;
+                    let v = if n >= 48_000 { (n as f64 * 440.0 * std::f64::consts::TAU / 48_000.0).sin() * 0.2 } else { 0.0 };
+                    [v as f32; 2]
+                })
+                .collect();
+            e.push_audio(&pcm, Duration::from_millis(t0)).unwrap();
+        }
+    }
+    Box::new(e).finish().unwrap();
+    let onset = audio_onset(&path, 0.05).expect("the tone is in the MP4");
+    let _ = std::fs::remove_dir_all(&dir);
+    onset.saturating_sub(Duration::from_secs(1))
+}
+
+/// Passes a source through, noting when its first loud sample (above
+/// 0.05) was captured, by the source's own timestamps.
+struct Spy<S> {
+    inner: S,
+    loud: std::sync::Arc<std::sync::Mutex<Option<Instant>>>,
+}
+
+impl<S: AudioSource> AudioSource for Spy<S> {
+    fn rate(&self) -> u32 {
+        self.inner.rate()
+    }
+    fn channels(&self) -> u16 {
+        self.inner.channels()
+    }
+    fn read(&mut self, out: &mut Vec<f32>) -> usize {
+        self.read_timed(out).0
+    }
+    fn read_timed(&mut self, out: &mut Vec<f32>) -> (usize, Option<Instant>) {
+        let from = out.len();
+        let (n, at) = self.inner.read_timed(out);
+        let mut loud = self.loud.lock().unwrap();
+        if loud.is_none()
+            && let (Some(at), Some(k)) = (at, out[from..].iter().position(|s| s.abs() > 0.05))
+        {
+            let frame = (k / usize::from(self.channels())) as u64;
+            *loud = Some(at + Duration::from_nanos(frame * 1_000_000_000 / u64::from(self.rate())));
+        }
+        (n, at)
+    }
+}
+
 /// MP4 with system sound: a tone starts after 2 s of silence; the AAC
 /// track must hold it close to when it was played (loopback sends no
 /// packets during the silence, so this checks gap placement).
@@ -384,7 +466,7 @@ fn audio_onset(path: &Path, threshold: f32) -> Option<Duration> {
 #[ignore = "records the real desktop and plays sound"]
 fn live_rec_mp4_audio_after_silence() {
     crate::capture::enable_dpi_awareness();
-    if skip_without_mf() {
+    if skip_without_mf(true) {
         return;
     }
     let lb = match WasapiLoopback::open() {
@@ -403,8 +485,12 @@ fn live_rec_mp4_audio_after_silence() {
     let (src, _) = open_source(spec.area).unwrap();
     let (w, h) = src.size();
     let enc = MfEncoder::create(&spec.part_path(), w, h, 30, Quality::Low, true).unwrap();
-    let s = Session::start(spec, src, vec![Box::new(lb)], Box::new(enc)).unwrap();
+    let loud = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let spy = Spy { inner: lb, loud: loud.clone() };
+    // The session clock starts inside `start` (spawning two threads, well
+    // under a millisecond).
     let started = Instant::now();
+    let s = Session::start(spec, src, vec![Box::new(spy)], Box::new(enc)).unwrap();
     std::thread::sleep(Duration::from_secs(2));
     let played = started.elapsed();
     play(&img);
@@ -420,10 +506,21 @@ fn live_rec_mp4_audio_after_silence() {
     assert!((3.3..=3.8).contains(&p.duration.as_secs_f64()), "duration {:?}", p.duration);
     let onset = onset.expect("the tone is in the MP4");
     let off = onset.as_secs_f64() - played.as_secs_f64();
-    eprintln!("tone played at {played:?} (session time), heard in the MP4 at {onset:?}: offset {:+.1} ms", off * 1000.0);
-    // PlaySound's own start-up and the device period come on top of the
-    // capture placement; anything inside 0..250 ms is in step.
-    assert!((-0.02..=0.25).contains(&off), "onset offset {off:.3} s");
+    let captured = loud.lock().unwrap().expect("the tone was captured").saturating_duration_since(started);
+    let placed = onset.as_secs_f64() - captured.as_secs_f64();
+    let codec = aac_delay();
+    eprintln!(
+        "tone played at {played:?} (session time), captured at {captured:?}, in the MP4 at {onset:?}: {:+.1} ms after PlaySound, {:+.1} ms after its capture (AAC round trip alone: {codec:?})",
+        off * 1000.0,
+        placed * 1000.0
+    );
+    // The tone is placed by its capture timestamp, give or take a few
+    // samples of AAC smearing around the threshold.
+    assert!(codec < Duration::from_millis(5), "AAC delay {codec:?}");
+    assert!((-0.005..=0.010).contains(&placed), "placed {placed:.4} s after its capture");
+    // PlaySound's own start-up (to the sound reaching the render engine,
+    // 7-85 ms here) comes on top of that.
+    assert!((-0.02..=0.12).contains(&off), "onset offset {off:.3} s");
 }
 
 #[test]

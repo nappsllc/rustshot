@@ -45,6 +45,10 @@ impl GdiPollSource {
                 bail!("no screen DC");
             }
             let mem = CreateCompatibleDC(Some(screen));
+            if mem.is_invalid() {
+                ReleaseDC(None, screen);
+                bail!("no memory DC");
+            }
             let mut bmi = BITMAPINFO::default();
             bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
             bmi.bmiHeader.biWidth = w as i32;

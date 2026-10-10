@@ -99,6 +99,32 @@ fn clock_counts_pauses() {
     assert_eq!((c.pauses(), c.last_pause()), (2, Duration::from_millis(800)));
 }
 
+#[test]
+fn clock_maps_capture_instants() {
+    let t0 = Instant::now() + Duration::from_secs(10);
+    let s = |ms: u64| t0 + Duration::from_millis(ms);
+    let ms = |v: i128| Some(v * 1_000_000);
+    let mut c = Clock::start_at(t0);
+    assert_eq!(c.time_of(s(250)), ms(250));
+    assert_eq!(c.time_of(t0 - Duration::from_millis(30)), ms(-30), "before the start: negative");
+    c.pause_at(s(1000));
+    assert_eq!(c.time_of(s(999)), ms(999));
+    assert_eq!(c.time_of(s(1000)), None, "captured while paused");
+    assert_eq!(c.time_of(s(5000)), None);
+    c.resume_at(s(1500));
+    assert_eq!(c.time_of(s(990)), ms(990), "before the pause: as it was");
+    assert_eq!(c.time_of(s(1200)), None, "during the pause");
+    assert_eq!(c.time_of(s(1500)), ms(1000));
+    assert_eq!(c.time_of(s(2000)), ms(1500));
+    // Same as `now_at` for instants after the latest resume.
+    assert_eq!(c.time_of(s(2000)), Some(c.now_at(s(2000)).as_nanos() as i128));
+    c.pause_at(s(3000));
+    c.resume_at(s(3100));
+    assert_eq!(c.time_of(s(2900)), ms(2400));
+    assert_eq!(c.time_of(s(3050)), None);
+    assert_eq!(c.time_of(s(3200)), ms(2600));
+}
+
 /// The session's time: `base` plus what the test set.
 #[derive(Clone)]
 struct TestTime {

@@ -6,6 +6,21 @@
 //! "N" editions ship without them (until the Media Feature Pack is
 //! installed) and the program must still start there.
 //!
+//! Hardware first: a hardware H.264 MFT can accept its media types and
+//! then fail on the first sample (driver or session-limit trouble), which
+//! would lose the recording. So when the system has one, [`MfEncoder::create`]
+//! first encodes two black frames with it into a scratch file and uses the
+//! software encoder if that fails. That adds about 300 ms to the start of
+//! the first recording of each size (an NVIDIA encoder; opening it is most
+//! of the cost); a size that passed is not tried again in the process.
+//! A failure later in a recording is not covered: the encoder is poisoned
+//! and the recording fails.
+//!
+//! Rate control is set through `ICodecAPI` where the encoder supports it
+//! (best effort): peak-constrained VBR at the [`bitrate`] mean and twice
+//! that peak (static screens cost little, motion gets room), and a GOP of
+//! two seconds.
+//!
 //! Timestamps are the frame / audio timestamps in 100-ns units. Video times
 //! that do not increase are nudged 1 ms past the previous frame. The audio
 //! track is kept contiguous: overlaps are trimmed and gaps filled with
@@ -22,7 +37,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use windows::core::{Interface, GUID, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Media::MediaFoundation::*;
+use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToUInt64};
 use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::Variant::{VARIANT, VT_UI4};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
 
 /// Audio sample rate and channels the encoder takes (the mixer's output).
@@ -54,6 +71,14 @@ type FnCreate = unsafe extern "system" fn(*mut *mut c_void) -> HRESULT;
 type FnCreateMemoryBuffer = unsafe extern "system" fn(u32, *mut *mut c_void) -> HRESULT;
 type FnCreateSinkWriter = unsafe extern "system" fn(PCWSTR, *mut c_void, *mut c_void, *mut *mut c_void) -> HRESULT;
 type FnCreateSourceReader = unsafe extern "system" fn(PCWSTR, *mut c_void, *mut *mut c_void) -> HRESULT;
+type FnTEnumEx = unsafe extern "system" fn(
+    GUID,
+    u32,
+    *const MFT_REGISTER_TYPE_INFO,
+    *const MFT_REGISTER_TYPE_INFO,
+    *mut *mut *mut c_void,
+    *mut u32,
+) -> HRESULT;
 
 /// The Media Foundation entry points used here.
 struct Api {
@@ -63,6 +88,7 @@ struct Api {
     create_memory_buffer: FnCreateMemoryBuffer,
     create_sink_writer: FnCreateSinkWriter,
     create_source_reader: FnCreateSourceReader,
+    mft_enum_ex: FnTEnumEx,
 }
 
 /// Load the DLLs and call `MFStartup` once per process (never shut down).
@@ -95,6 +121,7 @@ unsafe fn load() -> std::result::Result<Api, String> {
             create_memory_buffer: sym!(plat, "MFCreateMemoryBuffer", FnCreateMemoryBuffer),
             create_sink_writer: sym!(rw, "MFCreateSinkWriterFromURL", FnCreateSinkWriter),
             create_source_reader: sym!(rw, "MFCreateSourceReaderFromURL", FnCreateSourceReader),
+            mft_enum_ex: sym!(plat, "MFTEnumEx", FnTEnumEx),
         };
         startup(MF_VERSION, MFSTARTUP_FULL).ok().map_err(|e| format!("MFStartup: {e}"))?;
         Ok(api)
@@ -104,6 +131,44 @@ unsafe fn load() -> std::result::Result<Api, String> {
 /// Whether Media Foundation can be loaded on this system.
 pub fn available() -> bool {
     api().is_ok()
+}
+
+/// Encoder MFTs registered for (`category`, output `major`/`subtype`)
+/// with `flags` (`MFT_ENUM_FLAG_*`).
+fn count_encoders(api: &Api, category: GUID, major: GUID, subtype: GUID, flags: MFT_ENUM_FLAG) -> u32 {
+    let out = MFT_REGISTER_TYPE_INFO { guidMajorType: major, guidSubtype: subtype };
+    let (mut arr, mut n) = (std::ptr::null_mut::<*mut c_void>(), 0u32);
+    unsafe {
+        if (api.mft_enum_ex)(category, flags.0 as u32, std::ptr::null(), &out, &mut arr, &mut n).is_err() || arr.is_null() {
+            return 0;
+        }
+        for i in 0..n as usize {
+            let p = *arr.add(i);
+            if !p.is_null() {
+                drop(IMFActivate::from_raw(p));
+            }
+        }
+        CoTaskMemFree(Some(arr as *const c_void));
+    }
+    n
+}
+
+/// Whether the system has an H.264 video encoder and an AAC audio
+/// encoder (any kind: hardware, software, async). Media Foundation can be
+/// present without them (Windows Server without its media feature).
+pub fn encoders_available() -> (bool, bool) {
+    let Ok(api) = api() else { return (false, false) };
+    in_mta(|| {
+        let h264 = count_encoders(api, MFT_CATEGORY_VIDEO_ENCODER, MFMediaType_Video, MFVideoFormat_H264, MFT_ENUM_FLAG_ALL);
+        let aac = count_encoders(api, MFT_CATEGORY_AUDIO_ENCODER, MFMediaType_Audio, MFAudioFormat_AAC, MFT_ENUM_FLAG_ALL);
+        (h264 > 0, aac > 0)
+    })
+}
+
+/// Whether a hardware H.264 encoder MFT is registered.
+fn hardware_h264(api: &Api) -> bool {
+    let flags = MFT_ENUM_FLAG(MFT_ENUM_FLAG_HARDWARE.0 | MFT_ENUM_FLAG_SORTANDFILTER.0);
+    count_encoders(api, MFT_CATEGORY_VIDEO_ENCODER, MFMediaType_Video, MFVideoFormat_H264, flags) > 0
 }
 
 /// Call a creator that writes an interface pointer and wrap it.
@@ -146,6 +211,8 @@ fn video_type(api: &Api, subtype: &GUID, w: u32, h: u32, fps: u32) -> Result<IMF
         t.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
         t.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
         t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
+        // nv12's chroma is the mean of each 2x2 block: centred (MPEG-1).
+        t.SetUINT32(&MF_MT_VIDEO_CHROMA_SITING, MFVideoChromaSubsampling_MPEG1.0 as u32)?;
     }
     Ok(t)
 }
@@ -205,7 +272,13 @@ impl MfEncoder {
         let (out_w, out_h) = nv12::fit(w, h);
         let path = path.to_path_buf();
         let made = in_mta(move || -> Result<SendWriter> {
-            match open_writer(api, &path, out_w, out_h, fps, quality, audio, true) {
+            let hw = if hardware_h264(api) {
+                trial(api, out_w, out_h, fps, quality)
+                    .and_then(|()| open_writer(api, &path, out_w, out_h, fps, quality, audio, true))
+            } else {
+                Err(anyhow!("no hardware H.264 encoder"))
+            };
+            match hw {
                 Ok(s) => Ok(s),
                 Err(hw) => open_writer(api, &path, out_w, out_h, fps, quality, audio, false)
                     .map_err(|e| e.context(format!("hardware encoder: {hw:#}"))),
@@ -249,20 +322,7 @@ impl MfEncoder {
     }
 
     fn sample(&self, bytes: &[u8], time: i64, dur: i64) -> Result<IMFSample> {
-        let api = api()?;
-        unsafe {
-            let buf: IMFMediaBuffer = make(|p| (api.create_memory_buffer)(bytes.len() as u32, p))?;
-            let mut data = std::ptr::null_mut();
-            buf.Lock(&mut data, None, None)?;
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
-            buf.Unlock()?;
-            buf.SetCurrentLength(bytes.len() as u32)?;
-            let s: IMFSample = make(|p| (api.create_sample)(p))?;
-            s.AddBuffer(&buf)?;
-            s.SetSampleTime(time)?;
-            s.SetSampleDuration(dur)?;
-            Ok(s)
-        }
+        sample(api()?, bytes, time, dur)
     }
 
     fn write(&mut self, stream: u32, s: &IMFSample) -> Result<()> {
@@ -310,6 +370,83 @@ impl MfEncoder {
     }
 }
 
+/// A sample holding a copy of `bytes`.
+fn sample(api: &Api, bytes: &[u8], time: i64, dur: i64) -> Result<IMFSample> {
+    unsafe {
+        let buf: IMFMediaBuffer = make(|p| (api.create_memory_buffer)(bytes.len() as u32, p))?;
+        let mut data = std::ptr::null_mut();
+        buf.Lock(&mut data, None, None)?;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
+        buf.Unlock()?;
+        buf.SetCurrentLength(bytes.len() as u32)?;
+        let s: IMFSample = make(|p| (api.create_sample)(p))?;
+        s.AddBuffer(&buf)?;
+        s.SetSampleTime(time)?;
+        s.SetSampleDuration(dur)?;
+        Ok(s)
+    }
+}
+
+/// Encode two black frames with the hardware encoder into a scratch file
+/// (removed after): a hardware MFT that takes its media types can still
+/// fail on the first sample or at the end. About 300 ms with an NVIDIA
+/// encoder (opening it costs most of that), so a size and rate that passed
+/// once in this process is not tried again.
+fn trial(api: &Api, w: u32, h: u32, fps: u32, quality: Quality) -> Result<()> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
+    static N: AtomicU32 = AtomicU32::new(0);
+    static PASSED: Mutex<Vec<(u32, u32, u32)>> = Mutex::new(Vec::new());
+    let passed = || PASSED.lock().unwrap_or_else(|e| e.into_inner());
+    if passed().contains(&(w, h, fps)) {
+        return Ok(());
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("rustshot-h264-trial-{}-{n}.mp4", std::process::id()));
+    let r = (|| -> Result<()> {
+        let SendWriter(writer, video, _, _, hw) = open_writer(api, &path, w, h, fps, quality, false, true)?;
+        if !hw {
+            return Ok(()); // a software encoder was picked anyway: nothing to try
+        }
+        let (y, uv) = (w as usize * h as usize, w as usize * h as usize / 2);
+        let black: Vec<u8> = std::iter::repeat_n(16u8, y).chain(std::iter::repeat_n(128u8, uv)).collect();
+        let dur = HNS / i64::from(fps);
+        for i in 0..2 {
+            let s = sample(api, &black, i * dur, dur)?;
+            unsafe { writer.WriteSample(video, &s) }.context("trial frame")?;
+        }
+        unsafe { writer.Finalize() }.context("finish the trial")
+    })();
+    let _ = std::fs::remove_file(&path);
+    if r.is_ok() {
+        passed().push((w, h, fps));
+    }
+    r.context("hardware encoder trial")
+}
+
+/// Best-effort rate control through the encoder's `ICodecAPI`:
+/// peak-constrained VBR (mean `bitrate`, peak twice that) and a GOP of
+/// two seconds. Encoders without these settings keep their defaults.
+fn configure_encoder(writer: &IMFSinkWriter, stream: u32, fps: u32, bitrate: u32) {
+    let mut p = std::ptr::null_mut();
+    if unsafe { writer.GetServiceForStream(stream, &GUID::zeroed(), &ICodecAPI::IID, &mut p) }.is_err() || p.is_null() {
+        return;
+    }
+    let codec = unsafe { ICodecAPI::from_raw(p) };
+    let set = |key: &GUID, v: u32| {
+        let mut var = VARIANT::default();
+        unsafe {
+            (*var.Anonymous.Anonymous).vt = VT_UI4;
+            (*var.Anonymous.Anonymous).Anonymous.ulVal = v;
+            let _ = codec.SetValue(key, &var);
+        }
+    };
+    set(&CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32);
+    set(&CODECAPI_AVEncCommonMeanBitRate, bitrate);
+    set(&CODECAPI_AVEncCommonMaxBitRate, bitrate.saturating_mul(2));
+    set(&CODECAPI_AVEncMPVGOPSize, fps * 2);
+}
+
 /// What [`open_writer`] hands back across the MTA thread.
 struct SendWriter(IMFSinkWriter, u32, Option<u32>, String, bool);
 // SAFETY: see `MfEncoder`.
@@ -336,12 +473,14 @@ fn open_writer(
     };
     unsafe {
         let out = video_type(api, &MFVideoFormat_H264, w, h, fps)?;
-        out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate(w, h, fps, quality))?;
+        let rate = bitrate(w, h, fps, quality);
+        out.SetUINT32(&MF_MT_AVG_BITRATE, rate)?;
         out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)?;
         let video = writer.AddStream(&out).context("add the H.264 stream")?;
         let input = video_type(api, &MFVideoFormat_NV12, w, h, fps)?;
         input.SetUINT32(&MF_MT_DEFAULT_STRIDE, w)?;
         writer.SetInputMediaType(video, &input, None).context("set the NV12 input")?;
+        configure_encoder(&writer, video, fps, rate);
         let audio = if audio {
             let out = audio_type(api, &MFAudioFormat_AAC, AAC_BYTES_PER_SEC)?;
             let a = writer.AddStream(&out).context("add the AAC stream")?;
@@ -494,9 +633,9 @@ pub fn probe(path: &Path) -> Result<Probe> {
         let reader = open_reader(&path)?;
         let mut out = Probe::default();
         let mut pv = reader.GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)?;
-        let hns = windows::Win32::System::Com::StructuredStorage::PropVariantToUInt64(&pv)?;
-        let _ = windows::Win32::System::Com::StructuredStorage::PropVariantClear(&mut pv);
-        out.duration = Duration::from_nanos(hns * 100);
+        let hns = PropVariantToUInt64(&pv);
+        let _ = PropVariantClear(&mut pv);
+        out.duration = Duration::from_nanos(hns? * 100);
         let first_video = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
         out.has_audio = reader.GetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32).is_ok();
         let want = media_type(api)?;
@@ -506,7 +645,8 @@ pub fn probe(path: &Path) -> Result<Probe> {
         let cur = reader.GetCurrentMediaType(first_video)?;
         let fs = cur.GetUINT64(&MF_MT_FRAME_SIZE)?;
         out.size = ((fs >> 32) as u32, fs as u32);
-        let stride = cur.GetUINT32(&MF_MT_DEFAULT_STRIDE).map_or(out.size.0 as usize, |s| s as i32 as usize);
+        // A negative stride is a bottom-up image: same row length.
+        let stride = cur.GetUINT32(&MF_MT_DEFAULT_STRIDE).map_or(out.size.0 as usize, |s| (s as i32).unsigned_abs() as usize);
         loop {
             let mut flags = 0u32;
             let mut sample = None;

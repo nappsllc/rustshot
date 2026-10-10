@@ -51,6 +51,10 @@ pub struct Clock {
     pauses: u64,
     /// Clock time at the latest pause.
     last_pause: Duration,
+    /// When the latest pause began and ended (`None` while it lasts), and
+    /// the paused time before it: [`Clock::time_of`] maps instants around it.
+    pause_span: Option<(Instant, Option<Instant>)>,
+    paused_before: Duration,
 }
 
 impl Clock {
@@ -85,7 +89,15 @@ impl Clock {
     }
 
     fn start_at(t: Instant) -> Clock {
-        Clock { started: t, paused_at: None, paused_total: Duration::ZERO, pauses: 0, last_pause: Duration::ZERO }
+        Clock {
+            started: t,
+            paused_at: None,
+            paused_total: Duration::ZERO,
+            pauses: 0,
+            last_pause: Duration::ZERO,
+            pause_span: None,
+            paused_before: Duration::ZERO,
+        }
     }
 
     fn pause_at(&mut self, t: Instant) {
@@ -93,13 +105,38 @@ impl Clock {
             self.last_pause = self.now_at(t);
             self.paused_at = Some(t);
             self.pauses += 1;
+            self.pause_span = Some((t, None));
+            self.paused_before = self.paused_total;
         }
     }
 
     fn resume_at(&mut self, t: Instant) {
         if let Some(p) = self.paused_at.take() {
             self.paused_total += t.saturating_duration_since(p);
+            self.pause_span = Some((p, Some(t)));
         }
+    }
+
+    /// Clock time of the instant `t` in nanoseconds, negative before the
+    /// start; `None` when `t` falls in a pause (the current or the latest
+    /// one: what was captured then is not recorded). Used for capture
+    /// timestamps, which come a little after the fact. Instants before the
+    /// latest pause are mapped with the paused time up to it (one before an
+    /// earlier pause, which nothing delivers that late, would map as if
+    /// that pause had not happened).
+    pub fn time_of(&self, t: Instant) -> Option<i128> {
+        let since = if t >= self.started {
+            (t - self.started).as_nanos() as i128
+        } else {
+            -((self.started - t).as_nanos() as i128)
+        };
+        let paused = match self.pause_span {
+            None => Duration::ZERO,
+            Some((p, _)) if t < p => self.paused_before,
+            Some((_, Some(r))) if t >= r => self.paused_total,
+            Some(_) => return None,
+        };
+        Some(since - paused.as_nanos() as i128)
     }
 
     fn now_at(&self, t: Instant) -> Duration {
@@ -132,12 +169,16 @@ pub trait AudioSource: Send {
     /// Append the samples available now (interleaved f32) to `out`, without
     /// blocking; returns how many samples were appended.
     fn read(&mut self, out: &mut Vec<f32>) -> usize;
-    /// [`AudioSource::read`], plus the recording clock's time at which the
-    /// first appended sample was captured, when the source knows it (e.g.
-    /// from the device's capture timestamps). The mixer uses it to place
-    /// input that ends a gap; `None` (the default) makes it assume the
-    /// input ends at the time it was read.
-    fn read_timed(&mut self, out: &mut Vec<f32>) -> (usize, Option<Duration>) {
+    /// [`AudioSource::read`], plus the instant at which the first appended
+    /// sample was captured, when the source knows it (e.g. from the
+    /// device's capture timestamps). A source with timestamps must not hand
+    /// out samples across a discontinuity in one read (what follows one
+    /// comes in the next read, with its own timestamp). The mixer maps it
+    /// with the recording [`Clock`] to place input that ends a gap, and to
+    /// re-place input whose timestamp disagrees with where it would follow
+    /// on (see [`mix`]); `None` (the default) makes it assume the input
+    /// ends at the time it was read.
+    fn read_timed(&mut self, out: &mut Vec<f32>) -> (usize, Option<Instant>) {
         (self.read(out), None)
     }
 }
@@ -645,18 +686,18 @@ fn encode_loop(
                     // after. The discard comes before the push, so input
                     // read after the push is never dropped.
                     pauses = c.pauses();
-                    let (ts, pcm) = flush(m, c.last_pause());
+                    let (ts, pcm) = flush(m, c.last_pause(), &c);
                     m.discard();
                     push_pcm(enc.as_mut(), &pcm, ts)?;
                 }
                 let now = c.now_at(time());
                 if closed {
-                    let (ts, pcm) = flush(m, now);
+                    let (ts, pcm) = flush(m, now, &c);
                     push_pcm(enc.as_mut(), &pcm, ts)?;
                 } else if c.is_paused() {
                     m.discard(); // sound while paused is not recorded
                 } else {
-                    m.feed(now);
+                    m.feed(now, &c);
                     let ts = m.position();
                     let pcm = m.pull(now.saturating_sub(AUDIO_LAG));
                     push_pcm(enc.as_mut(), &pcm, ts)?;
@@ -690,14 +731,14 @@ fn push_pcm(enc: &mut dyn VideoEncoder, pcm: &[f32], ts: Duration) -> Result<()>
 /// it has anything more (what it does send during the wait is still placed
 /// by its capture time and mixed). With only such sources there is no wait
 /// at all.
-fn flush(m: &mut Mixer, until: Duration) -> (Duration, Vec<f32>) {
+fn flush(m: &mut Mixer, until: Duration, clock: &Clock) -> (Duration, Vec<f32>) {
     let ts = m.position();
-    m.feed(until);
+    m.feed(until, clock);
     let mut pcm = m.pull(until.saturating_sub(AUDIO_LAG));
     let give_up = Instant::now() + AUDIO_LAG;
     while !m.covered(until) && Instant::now() < give_up {
         std::thread::sleep(Duration::from_millis(5));
-        m.feed(until);
+        m.feed(until, clock);
     }
     pcm.extend(m.pull(until));
     (ts, pcm)

@@ -45,6 +45,16 @@ pub fn open_source(area: IRect) -> Result<(Box<dyn FrameSource>, SourceKind)> {
 
 /// Join the multithreaded COM apartment on this thread (once). Only called
 /// on threads the recorder owns, so a caller's STA is never touched.
+///
+/// The apartment reference is deliberately never released (no
+/// `CoUninitialize`). Objects outlive the thread that made them: [`in_mta`]
+/// threads create sink writers and source readers and exit while the
+/// encode thread keeps using them. If such a thread uninitialised and its
+/// reference was the last one, the MTA would be torn down under live
+/// objects. Releasing it from a thread-local destructor would not help
+/// either: those run in no set order, possibly before the COM objects on
+/// the thread are dropped. The cost is one MTA reference per recorder
+/// thread, which keeps the process's MTA alive for its lifetime.
 pub(crate) fn com_init() {
     thread_local! {
         static INIT: () = {

@@ -10,10 +10,12 @@
 //!
 //! When it runs dry (everything it gave was played) it is in a *gap*: it
 //! adds silence, and the first input read after the gap is placed by when
-//! it was captured. A source that knows that passes it from
-//! [`AudioSource::read_timed`]; otherwise the input is assumed to *end* at
-//! the clock time it was read ([`Mixer::feed`]'s `now`), i.e. to start one
-//! input-length before it. That one rule covers both ways a gap ends:
+//! it was captured. A source that knows that passes the capture instant
+//! from [`AudioSource::read_timed`], mapped to clock time with
+//! [`Clock::time_of`] (input captured during a pause is dropped);
+//! otherwise the input is assumed to *end* at the clock time it was read
+//! ([`Mixer::feed`]'s `now`), i.e. to start one input-length before it.
+//! That one rule covers both ways a gap ends:
 //!
 //! - after a true gap (WASAPI loopback sends nothing while nothing plays),
 //!   real-time packets start one packet before their read, about when they
@@ -29,13 +31,19 @@
 //! instead of everything after it shifting late. A backlog no longer than
 //! the lag is never cut this way.
 //!
-//! Known limitation: placement is by the recording clock (`Instant`), and
-//! a continuous source then just follows on, so a device whose sample clock
-//! drifts against it (tens of ppm are common) slowly runs ahead or behind
-//! until a gap re-places it. Over a long recording that can show as A/V
-//! offset; a source with capture timestamps (Task 2) may compensate.
+//! Timestamped input that does not end a gap still follows on, unless its
+//! timestamp is more than [`REPLACE_NS`] away from where it would follow
+//! on: then it is re-placed by the timestamp (silence inserted when it is
+//! late, its head dropped when it overlaps what is pending). That covers a
+//! discontinuity the source reports (a device glitch, its ring dropping
+//! samples) and a device sample clock that drifts against the recording
+//! clock (corrected in steps of about the tolerance).
+//!
+//! Known limitation: a source without timestamps just follows on, so a
+//! device whose sample clock drifts against the recording clock (tens of
+//! ppm are common) slowly runs ahead or behind until a gap re-places it.
 
-use super::AudioSource;
+use super::{AudioSource, Clock};
 use std::time::Duration;
 
 /// Output sample rate.
@@ -46,6 +54,10 @@ pub const CHANNELS: usize = 2;
 /// At most this much input (in seconds) is held per source; a source that
 /// runs ahead of the clock loses its oldest samples instead of growing.
 const MAX_AHEAD_SECS: usize = 1;
+
+/// Timestamped input more than this (ns) away from where it would follow
+/// on is re-placed by its timestamp.
+const REPLACE_NS: f64 = 15_000_000.0;
 
 struct Input {
     src: Box<dyn AudioSource>,
@@ -62,11 +74,12 @@ struct Input {
 }
 
 /// Where output frame `produced` (48 kHz) falls in input that starts at
-/// `start`, in input frames at `rate` (negative = lead silence before it).
-/// Exact for whole frames, so float error never skips a sample.
-fn place(produced: u64, start: Duration, rate: u32) -> f64 {
+/// `start_ns` (clock time, may be negative), in input frames at `rate`
+/// (negative = lead silence before it). Exact for whole frames, so float
+/// error never skips a sample.
+fn place(produced: u64, start_ns: i128, rate: u32) -> f64 {
     let (rate, out) = (i128::from(rate), i128::from(RATE));
-    let num = i128::from(produced) * rate * 1_000_000_000 - start.as_nanos() as i128 * out * rate;
+    let num = i128::from(produced) * rate * 1_000_000_000 - start_ns * out * rate;
     let den = out * 1_000_000_000;
     num.div_euclid(den) as f64 + num.rem_euclid(den) as f64 / den as f64
 }
@@ -74,11 +87,16 @@ fn place(produced: u64, start: Duration, rate: u32) -> f64 {
 impl Input {
     /// Read what the source has and append it to `buf` as stereo frames.
     /// Input that ends a gap is placed by its capture time (see the module
-    /// docs); `now` is the clock time of the read and `produced` the output
-    /// position in output frames.
-    fn read(&mut self, now: Duration, produced: u64) {
+    /// docs); `now` is the clock time of the read, `produced` the output
+    /// position in output frames, and `clock` maps capture instants.
+    fn read(&mut self, now: Duration, produced: u64, clock: &Clock) {
         self.scratch.clear();
         let (_, ts) = self.src.read_timed(&mut self.scratch);
+        let stamp = match ts.map(|t| clock.time_of(t)) {
+            Some(None) => return, // captured during a pause: not recorded
+            Some(Some(ns)) => Some(ns),
+            None => None,
+        };
         let before = self.buf.len();
         let ch = usize::from(self.src.channels().max(1));
         if ch == 1 {
@@ -91,9 +109,10 @@ impl Input {
         let added = self.buf.len() - before;
         let rate = self.src.rate().max(1);
         if self.gap && added > 0 {
-            let start = ts.unwrap_or_else(|| {
-                let len = Duration::from_nanos((added as u128 * 1_000_000_000 / u128::from(rate)) as u64);
-                now.saturating_sub(len)
+            // Untimed input from before time zero starts at zero; timed
+            // input captured before the start loses that part.
+            let start = stamp.unwrap_or_else(|| {
+                (now.as_nanos() as i128 - (added as i128 * 1_000_000_000 / i128::from(rate))).max(0)
             });
             self.pos = place(produced, start, rate);
             if self.pos >= self.buf.len() as f64 {
@@ -108,6 +127,18 @@ impl Input {
                 let past = self.pos as usize;
                 self.buf.drain(..past);
                 self.pos -= past as f64;
+            }
+        } else if let Some(start) = stamp
+            && added > 0
+        {
+            // Where it would follow on: the output time of `buf[before]`.
+            let at = produced as f64 * 1e9 / f64::from(RATE) + (before as f64 - self.pos) * 1e9 / f64::from(rate);
+            let off = start as f64 - at;
+            let frames = (off.abs() * f64::from(rate) / 1e9).round() as usize;
+            if off > REPLACE_NS {
+                self.buf.splice(before..before, std::iter::repeat_n([0.0; 2], frames));
+            } else if off < -REPLACE_NS {
+                self.buf.drain(before..before + frames.min(added));
             }
         }
         let cap = rate as usize * MAX_AHEAD_SECS;
@@ -201,10 +232,11 @@ impl Mixer {
 
     /// Read what every source has now; `now` is the recording clock's time
     /// of this read, where input that ends a gap (and has no timestamp)
-    /// ends. Input placed before [`Mixer::position`] loses that part.
-    pub fn feed(&mut self, now: Duration) {
+    /// ends, and `clock` maps capture timestamps to clock time. Input
+    /// placed before [`Mixer::position`] loses that part.
+    pub fn feed(&mut self, now: Duration, clock: &Clock) {
         for s in &mut self.inputs {
-            s.read(now, self.produced);
+            s.read(now, self.produced, clock);
         }
     }
 
@@ -231,7 +263,8 @@ impl Mixer {
     /// then in a gap, so what it sends next is placed by its capture time.
     pub fn discard(&mut self) {
         for s in &mut self.inputs {
-            s.read(Duration::ZERO, 0);
+            s.scratch.clear();
+            s.src.read_timed(&mut s.scratch);
             s.buf.clear();
             s.pos = 0.0;
             s.gap = true;
@@ -252,6 +285,7 @@ impl Mixer {
 mod tests {
     use super::super::AUDIO_LAG;
     use super::*;
+    use std::time::Instant;
 
     /// Hands out `data` (interleaved) in pieces of `chunk` samples per read.
     struct Fake {
@@ -286,8 +320,18 @@ mod tests {
     /// A mixer over `sources` that has read all of them at time zero.
     fn fed(sources: Vec<Box<dyn AudioSource>>) -> Mixer {
         let mut m = Mixer::new(sources);
-        m.feed(Duration::ZERO);
+        m.feed(Duration::ZERO, &clock());
         m
+    }
+
+    /// The tests' recording clock: started at [`base`], never paused.
+    fn clock() -> Clock {
+        Clock::start_at(base())
+    }
+
+    fn base() -> Instant {
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *BASE.get_or_init(|| Instant::now() + Duration::from_secs(10))
     }
 
     fn sine(rate: u32, hz: f64, secs: f64) -> Vec<f32> {
@@ -323,10 +367,10 @@ mod tests {
         // Feed ahead of the pulls (as the session's audio lag does).
         let mut got = Vec::new();
         for ms in (10u64..=500).step_by(10) {
-            parts.feed(Duration::from_millis(ms - 10));
+            parts.feed(Duration::from_millis(ms - 10), &clock());
             got.extend(parts.pull(Duration::from_millis(ms - 10)));
         }
-        parts.feed(Duration::from_millis(500)); // the next samples, to interpolate towards
+        parts.feed(Duration::from_millis(500), &clock()); // the next samples, to interpolate towards
         got.extend(parts.pull(Duration::from_millis(500)));
         assert_eq!(got.len(), one.len());
         let worst = got.iter().zip(&one).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -424,7 +468,7 @@ mod tests {
                 q.lock().unwrap().append(&mut held);
             }
             let t = Duration::from_millis(ms);
-            m.feed(t);
+            m.feed(t, &clock());
             out.extend(m.pull(t.saturating_sub(AUDIO_LAG)));
         }
         (out, captured)
@@ -506,7 +550,7 @@ mod tests {
         let mut out = Vec::new();
         for ms in (10..=10_200).step_by(10) {
             let t = Duration::from_millis(ms);
-            m.feed(t);
+            m.feed(t, &clock());
             out.extend(m.pull(t.saturating_sub(AUDIO_LAG)));
         }
         let edges = |ch: usize| -> Vec<usize> {
@@ -524,7 +568,7 @@ mod tests {
 
     /// Hands out what the test queued, stamped with the time it gave.
     #[allow(clippy::type_complexity)]
-    struct Timed(std::sync::Arc<std::sync::Mutex<(Vec<f32>, Option<Duration>)>>);
+    struct Timed(std::sync::Arc<std::sync::Mutex<(Vec<f32>, Option<Instant>)>>);
 
     impl AudioSource for Timed {
         fn rate(&self) -> u32 {
@@ -536,7 +580,7 @@ mod tests {
         fn read(&mut self, out: &mut Vec<f32>) -> usize {
             self.read_timed(out).0
         }
-        fn read_timed(&mut self, out: &mut Vec<f32>) -> (usize, Option<Duration>) {
+        fn read_timed(&mut self, out: &mut Vec<f32>) -> (usize, Option<Instant>) {
             let mut q = self.0.lock().unwrap();
             let n = q.0.len();
             out.append(&mut q.0);
@@ -549,43 +593,92 @@ mod tests {
         let q = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), None)));
         let mut m = Mixer::new(vec![Box::new(Timed(q.clone()))]);
         let ms = Duration::from_millis;
-        m.feed(ms(0));
+        m.feed(ms(0), &clock());
         assert!(m.pull(ms(1000)).iter().all(|&v| v == 0.0));
         // 100 ms captured from 0.95 s, read at 1.2 s (the end anchor would
         // say 1.1 s): the 50 ms before the position are dropped.
-        *q.lock().unwrap() = (vec![0.5; 4800], Some(ms(950)));
-        m.feed(ms(1200));
+        *q.lock().unwrap() = (vec![0.5; 4800], Some(base() + ms(950)));
+        m.feed(ms(1200), &clock());
         let o = m.pull(ms(1100));
         assert!(o[..4800].iter().all(|&v| v == 0.5) && o[4800..].iter().all(|&v| v == 0.0));
         // Stamped ahead of the position: lead silence up to it.
-        *q.lock().unwrap() = (vec![0.25; 480], Some(ms(1300)));
-        m.feed(ms(1150));
+        *q.lock().unwrap() = (vec![0.25; 480], Some(base() + ms(1300)));
+        m.feed(ms(1150), &clock());
         let o = m.pull(ms(1400));
         assert!(o[..19_200].iter().all(|&v| v == 0.0) && o[19_200..20_160].iter().all(|&v| v == 0.25));
         assert!(o[20_160..].iter().all(|&v| v == 0.0));
         // Entirely before the position: dropped, still in a gap.
-        *q.lock().unwrap() = (vec![0.75; 480], Some(ms(1000)));
-        m.feed(ms(1450));
+        *q.lock().unwrap() = (vec![0.75; 480], Some(base() + ms(1000)));
+        m.feed(ms(1450), &clock());
         assert!(m.covered(ms(1500)));
         assert!(m.pull(ms(1500)).iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn timed_input_follows_on_and_is_replaced_when_its_stamp_jumps() {
+        // A real-time device in 10 ms packets whose stamps jitter by a few
+        // ms; it loses 40 ms at 1.0 s (its next stamp jumps ahead) and at
+        // 2.0 s hands over 30 ms it had already sent (stamped back).
+        let q = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), None)));
+        let mut m = Mixer::new(vec![Box::new(Timed(q.clone()))]);
+        let ms = Duration::from_millis;
+        let mut out = Vec::new();
+        for t in (10..=3000u64).step_by(10) {
+            let jitter = [0i64, 3, -2, 1][((t / 10 + 3) % 4) as usize];
+            let (from, stamp) = match t - 10 {
+                1000..1040 => (None, 0),
+                _ if t == 2000 => (Some(1960), 1960),
+                s => (Some(s), (s as i64 + jitter) as u64),
+            };
+            if let Some(from) = from {
+                *q.lock().unwrap() = ((from * 48..t * 48).map(saw).collect(), Some(base() + ms(stamp)));
+            }
+            m.feed(ms(t), &clock());
+            out.extend(m.pull(ms(t).saturating_sub(AUDIO_LAG)));
+        }
+        let o = offsets(&out);
+        assert!(o.iter().all(|&(_, d)| d == 0), "every sample at its capture time; worst {:?}", worst(&o));
+        assert_eq!(o.len(), 48 * (2900 - 40), "only the lost 40 ms are silent");
+        assert!(o.iter().all(|&(k, _)| !(48 * 1000..48 * 1040).contains(&k)));
+    }
+
+    #[test]
+    fn timed_input_captured_during_a_pause_is_dropped() {
+        let q = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), None)));
+        let mut m = Mixer::new(vec![Box::new(Timed(q.clone()))]);
+        let ms = Duration::from_millis;
+        let mut c = clock();
+        c.pause_at(base() + ms(1000));
+        c.resume_at(base() + ms(2000));
+        m.feed(ms(0), &c);
+        assert!(m.pull(ms(900)).iter().all(|&v| v == 0.0));
+        *q.lock().unwrap() = (vec![0.5; 480], Some(base() + ms(1500)));
+        m.feed(ms(1000), &c);
+        assert!(m.covered(ms(2000)), "nothing pending: still in a gap");
+        // After the resume: clock time 1.1 s.
+        *q.lock().unwrap() = (vec![0.25; 480], Some(base() + ms(2100)));
+        m.feed(ms(1120), &c);
+        let o = m.pull(ms(1200));
+        assert!(o[..19_200].iter().all(|&v| v == 0.0) && o[19_200..20_160].iter().all(|&v| v == 0.25));
+        assert!(o[20_160..].iter().all(|&v| v == 0.0));
     }
 
     #[test]
     fn input_after_running_dry_lands_at_its_capture_time() {
         let q = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut m = Mixer::new(vec![Box::new(Queued(q.clone()))]);
-        m.feed(Duration::ZERO);
+        m.feed(Duration::ZERO, &clock());
         assert!(m.pull(Duration::from_millis(50)).iter().all(|&v| v == 0.0));
         assert!(m.covered(Duration::from_millis(60)), "a source in a gap is not waited for");
         // 100 ms read at 150 ms: it ends there, so it starts at the position.
         q.lock().unwrap().extend((0..4800).map(|i| if i < 2400 { 0.25f32 } else { 0.75 }));
-        m.feed(Duration::from_millis(150));
+        m.feed(Duration::from_millis(150), &clock());
         assert!(m.covered(Duration::from_millis(150)) && !m.covered(Duration::from_millis(151)));
         let o = m.pull(Duration::from_millis(150));
         assert!(o[..4800].iter().all(|&v| v == 0.25) && o[4800..].iter().all(|&v| v == 0.75), "all of it, in order");
         // 10 ms read at 170 ms, ahead of the position: 160..170 ms.
         q.lock().unwrap().extend([0.5f32; 480]);
-        m.feed(Duration::from_millis(170));
+        m.feed(Duration::from_millis(170), &clock());
         let o = m.pull(Duration::from_millis(180));
         assert!(o[..960].iter().all(|&v| v == 0.0) && o[960..1920].iter().all(|&v| v == 0.5));
         assert!(o[1920..].iter().all(|&v| v == 0.0));
