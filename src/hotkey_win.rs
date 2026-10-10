@@ -12,10 +12,11 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn start(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>) -> Worker {
+    /// Register `specs` on a new thread; `done` gets which registered.
+    pub fn start(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>, done: mpsc::Sender<Registered>) -> Worker {
         let tid = Arc::new(AtomicU32::new(0));
         let t = tid.clone();
-        let join = std::thread::spawn(move || hotkey_thread(specs, tx, &t));
+        let join = std::thread::spawn(move || hotkey_thread(specs, tx, &t, done));
         Worker { join, tid }
     }
 
@@ -39,7 +40,7 @@ impl Worker {
     }
 }
 
-fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>, tid: &AtomicU32) {
+fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>, tid: &AtomicU32, done: mpsc::Sender<Registered>) {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
     };
@@ -71,6 +72,7 @@ fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>
                 None => eprintln!("warning: invalid hotkey {spec:?}"),
             }
         }
+        let _ = done.send(std::array::from_fn(|i| specs[i].1.trim().is_empty() || registered.contains(&specs[i].0)));
 
         loop {
             let mut msg = MSG::default();

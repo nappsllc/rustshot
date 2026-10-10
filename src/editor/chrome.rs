@@ -300,23 +300,27 @@ fn key_w(ui: &Ui, s: &str) -> f32 {
     (tw(ui, 11.0, s) + ui.px(10.0)).max(ui.px(18.0))
 }
 
+// Key caps: words everywhere but macOS, where the glyphs are the norm.
 #[cfg(target_os = "macos")]
 const MOD: &str = "⌘";
 #[cfg(not(target_os = "macos"))]
 const MOD: &str = "Ctrl";
-
 #[cfg(target_os = "macos")]
 const ALT: &str = "⌥";
 #[cfg(not(target_os = "macos"))]
 const ALT: &str = "Alt";
 #[cfg(target_os = "macos")]
+const SHIFT: &str = "⇧";
+#[cfg(not(target_os = "macos"))]
+const SHIFT: &str = "Shift";
+#[cfg(target_os = "macos")]
 const META: &str = "⌘";
 #[cfg(not(target_os = "macos"))]
-const META: &str = "Win";
+const META: &str = crate::keymap::META_NAME;
 
 /// Key caps for a chord: modifiers, then the key.
 pub(crate) fn chord_caps(c: &Chord) -> Vec<String> {
-    let mut out: Vec<String> = [(c.ctrl, MOD), (c.alt, ALT), (c.shift, "⇧"), (c.meta, META)]
+    let mut out: Vec<String> = [(c.ctrl, MOD), (c.alt, ALT), (c.shift, SHIFT), (c.meta, META)]
         .iter()
         .filter(|(on, _)| *on)
         .map(|(_, s)| s.to_string())
@@ -631,7 +635,7 @@ mod tests {
             let a = km.resolve(vk, Default::default()).and_then(super::super::act_of);
             assert_eq!(a, Some(Act::Tool(t)), "{t:?}");
         }
-        assert_eq!(act_tip(Act::Redo, &km).1, [MOD, "⇧", "Z"]);
+        assert_eq!(act_tip(Act::Redo, &km).1, [MOD, SHIFT, "Z"]);
         assert_eq!(act_tip(Act::Save, &km).1, [MOD, "S"]);
         assert_eq!(act_tip(Act::Exit, &km).1, ["Esc"]);
         let (km, _) = Keymap::from_config(&[("save".to_string(), "Alt+F2".to_string())].into_iter().collect());

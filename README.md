@@ -72,8 +72,8 @@ rustshot          # or `rustshot daemon`
 Launching Rustshot again while it is running triggers a capture in the running
 instance instead of starting a second one.
 
-Then press <kbd>Meta</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> (<kbd>Win</kbd> on
-Windows, <kbd>⌘</kbd> on macOS) to capture. Quit the daemon with
+Then press <kbd>Shift</kbd>+<kbd>Meta</kbd>+<kbd>X</kbd> (Meta is <kbd>Win</kbd> on
+Windows, <kbd>Super</kbd> on Linux, <kbd>⌘</kbd> on macOS) to capture. Quit the daemon with
 <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>Q</kbd>.
 
 Or capture directly from a terminal:
@@ -106,8 +106,16 @@ daemon opens its window; otherwise the window opens on its own). Three tabs:
 **OK** saves and closes, **Apply** saves and keeps the window open,
 **Cancel** (or <kbd>Esc</kbd>) discards. The running daemon picks the new
 settings up at once: the next capture uses them and the hotkeys are
-re-registered. Saving rewrites `config.toml`: if the file has comments or
-keys Rustshot does not know, the first save asks before removing them.
+re-registered; a hotkey another app already uses is reported (in the
+window, or as a tray notification) and the previous one is kept. Saving
+rewrites `config.toml`: if the file has comments or keys Rustshot does not
+know, the first save asks before removing them. A `config.toml` with an
+error is never overwritten silently: the window shows the error and offers
+*Open config file* or *Reset to defaults…* (after a second question; the
+old file is kept as `config.toml.bak`).
+
+On Linux, *Browse…* needs `zenity` or `kdialog`, and pasting into the text
+fields needs `wl-paste` (Wayland), `xclip` or `xsel`.
 On macOS the window is not available yet; Settings opens `config.toml`
 in your editor instead.
 
@@ -169,7 +177,9 @@ On macOS, <kbd>⌘</kbd> works wherever <kbd>Ctrl</kbd> is listed.
 The keys above (except arrows, the mouse wheel and hold-while-drawing
 modifiers) can be remapped in Settings › Shortcuts: select an action, press
 its new keys (<kbd>Backspace</kbd> unbinds it), and **Reset all** goes back
-to the defaults. Keys bound to two actions are shown in red with a note;
+to the defaults. Rebinding sets a single chord; an action with two (Redo's
+<kbd>Ctrl</kbd>+<kbd>Y</kbd>) gets its second one back with **Reset all**, or
+list several in `config.toml`. Keys bound to two actions are shown in red with a note;
 the first action in the list wins. In `config.toml` the same lives in a
 `[shortcuts]` table at the end (one or more chords separated by commas,
 `""` unbinds; `rustshot config --check` reports unknown actions and chords
@@ -214,7 +224,7 @@ draw_font_size = 16.0
 undo_limit = 100
 user_colors = ["#f04438", "#ff8a1f", "#ffc532", "#2dc06f", "#19b5d6",
                "#3b82f6", "#8b5cf6", "#ec4899", "#ffffff", "#111318"]
-capture_hotkey = "Meta+Shift+X"
+capture_hotkey = "Shift+Meta+X"
 quit_hotkey = "Ctrl+Alt+Shift+Q"
 copy_url_after_upload = true
 capture_active_monitor = false    # true = only the monitor under the cursor

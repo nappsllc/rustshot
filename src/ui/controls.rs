@@ -130,6 +130,18 @@ impl TableState {
         (y + rh > b.y && y < b.y1()).then_some(FRect { x: b.x, y, w: b.w, h: rh })
     }
 
+    /// Scroll so row `i` is in view in a table `h` logical px tall
+    /// (header included), as [`Ui::table`] will draw it.
+    pub fn reveal(&mut self, i: usize, h: f32) {
+        let (top, bot) = (i as f32 * ITEM_H, (i + 1) as f32 * ITEM_H);
+        let vh = h - ITEM_H;
+        if top < self.scroll || vh <= 0.0 {
+            self.scroll = top;
+        } else if bot > self.scroll + vh {
+            self.scroll = bot - vh;
+        }
+    }
+
     fn scroll_px(&self, rh: f32) -> f32 {
         self.scroll * rh / ITEM_H
     }
@@ -452,12 +464,18 @@ impl Ui<'_> {
         let lh = self.px(4.0).round();
         let track = FRect { x: x0 - kr / 2.0, y: cy - lh / 2.0, w: x1 - x0 + kr, h: lh };
         fill(self, track, 2.0, th.text_muted.fade(0.35 * k));
-        fill(self, FRect { w: kx - track.x, ..track }, 2.0, th.accent.fade(k));
+        // Disabled: no accent at all (a faded accent still reads as "on",
+        // most of all on the light theme), a flat knob without shadow.
+        let on = if self.enabled { th.accent } else { th.text_muted };
+        fill(self, FRect { w: kx - track.x, ..track }, 2.0, on.fade(k));
         let grab = self.focus.active == Some(id) && self.input.held;
         let kr2 = if grab || hov { kr + self.px(1.0) } else { kr };
-        self.fb.fill_circle(kx, cy + self.px(1.0), kr2 + self.px(0.5), C4::new(0, 0, 0, 50).fade(k));
-        self.fb.fill_circle(kx, cy, kr2, C4::rgb(255, 255, 255).fade(k));
-        self.fb.stroke_circle(kx, cy, kr2 - self.px(0.5), self.px(1.0), th.accent.fade(0.6 * k));
+        if self.enabled {
+            self.fb.fill_circle(kx, cy + self.px(1.0), kr2 + self.px(0.5), C4::new(0, 0, 0, 50));
+        }
+        let knob = if self.enabled { C4::rgb(255, 255, 255) } else { mix(th.surface.with_alpha(255), th.text_muted.with_alpha(255), 0.25) };
+        self.fb.fill_circle(kx, cy, kr2, knob);
+        self.fb.stroke_circle(kx, cy, kr2 - self.px(0.5), self.px(1.0), on.fade(0.6 * k));
         if show_focus(self, id) {
             let lw = self.px(2.0).round();
             self.fb.stroke_circle(kx, cy, kr2 + self.px(2.0) + lw / 2.0, lw, th.accent.fade(0.7));
@@ -624,6 +642,10 @@ impl Ui<'_> {
         let px = self.px(text_size());
         let first = (scroll / rh) as usize;
         let ui_k = self.k;
+        // Rows in a conflict: red text and an alert icon after the first cell.
+        let isz = self.px(14.0).round();
+        let gap = self.px(6.0);
+        let first_w: Vec<f32> = rows.iter().map(|r| if r.error { text_width(font, px, r.cells.first().copied().unwrap_or("")) } else { 0.0 }).collect();
         // Highlights stop short of the scroll thumb (4 px + 3 px margin).
         let right = if max_scroll > 0.0 { 4.0 + 4.0 + 3.0 } else { 4.0 };
         super::clipped(&mut self.fb, body, |fb| {
@@ -641,6 +663,10 @@ impl Ui<'_> {
                     let Some(&cx) = xs.get(j) else { break };
                     let ty = (cy - text_height(font, px) / 2.0).round();
                     fb.draw_text(font, px, cell, (cx + pad).round(), ty, c.fade(k));
+                }
+                if row.error {
+                    let ix = (xs[0] + pad + first_w[i] + gap).round();
+                    draw_icon(fb, "triangle-alert", ix, (cy - isz / 2.0).round(), isz, th.error.fade(k));
                 }
             }
         });
@@ -677,7 +703,7 @@ impl Ui<'_> {
     /// modifier keys alone wait for the key. Esc is recorded like any key.
     /// Returns whether `chord` changed.
     pub fn key_capture(&mut self, id: &str, chord: &mut Option<Chord>) -> bool {
-        let r = self.alloc(Some(140.0), H);
+        let r = self.alloc(Some(200.0), H);
         let id = id_of(id);
         let focused = self.focusable(id);
         let old = *chord;

@@ -51,6 +51,15 @@ pub fn spawn(tx: Sender<HotEvent>) {
     let _ = tx; // macOS / Linux backends arrive in later tasks.
 }
 
+/// Tell the user `text` outside any window: a tray balloon on Windows,
+/// stderr elsewhere (for now).
+pub fn notify(text: &str) {
+    #[cfg(windows)]
+    crate::tray_win::notify(text);
+    #[cfg(not(windows))]
+    eprintln!("rustshot: {text}");
+}
+
 /// Tray glyph on a 16-unit grid: four rounded corner brackets (stroked) and a centre dot.
 const GLYPH_PATH: &str = "M1.5 6V3.5a2 2 0 0 1 2-2H6 M10 1.5h2.5a2 2 0 0 1 2 2V6 M14.5 10v2.5a2 2 0 0 1-2 2H10 M6 14.5H3.5a2 2 0 0 1-2-2V10";
 const GLYPH_STROKE: f32 = 1.6;

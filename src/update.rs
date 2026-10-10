@@ -3,6 +3,7 @@
 //! `SHA256SUMS` and a verified download.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -821,36 +822,64 @@ fn unix_now() -> u64 {
 /// A release equal to the config's `skip_version` (re-read each time) is not
 /// reported.
 pub fn spawn_checker(enabled: bool) -> Option<std::sync::mpsc::Receiver<Release>> {
+    // Every call starts a new generation: an older checker (one that was
+    // turned off and on again while it slept) sees it and stops before it
+    // checks or writes the day's stamp.
+    let generation = CHECKER_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     if !enabled || managed_install().is_some() {
         return None;
     }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let dir = crate::config::config_dir();
-        let stamp = dir.join(STAMP_FILE);
-        std::thread::sleep(FIRST_DELAY);
-        loop {
-            // Turned off in Settings meanwhile (a new checker starts when
-            // it is turned on again).
-            if !crate::config::load().check_updates {
-                return;
-            }
-            let last = std::fs::read_to_string(&stamp).ok().and_then(|t| parse_stamp(&t));
-            let (new_stamp, release) = tick(last, unix_now(), check_now);
-            if let Some(t) = new_stamp {
-                let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(&stamp, t.to_string());
-            }
-            let release = release.filter(|r| !is_skipped(r, &crate::config::load().skip_version));
-            if let Some(r) = release
-                && tx.send(r).is_err()
-            {
-                return;
-            }
-            std::thread::sleep(RECHECK);
-        }
+        let stamp = crate::config::config_dir().join(STAMP_FILE);
+        // Also stops when turned off in Settings meanwhile (a new checker
+        // starts when it is turned on again).
+        let alive = || CHECKER_GEN.load(Ordering::SeqCst) == generation && crate::config::load().check_updates;
+        let skip = || crate::config::load().skip_version;
+        run_checker(alive, &stamp, check_now, std::thread::sleep, |r| tx.send(r).is_ok(), skip);
     });
     Some(rx)
+}
+
+/// The checker generation [`spawn_checker`] last started.
+static CHECKER_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// The daily checker's loop: wait, then check whenever due while `alive`
+/// (re-asked right before every check and before the stamp is written),
+/// persisting the stamp and sending a release `skip` does not name;
+/// returns once `alive` is false or `send` fails.
+fn run_checker(
+    alive: impl Fn() -> bool,
+    stamp: &Path,
+    mut check: impl FnMut() -> Result<Option<Release>, String>,
+    mut sleep: impl FnMut(std::time::Duration),
+    mut send: impl FnMut(Release) -> bool,
+    skip: impl Fn() -> String,
+) {
+    sleep(FIRST_DELAY);
+    loop {
+        if !alive() {
+            return;
+        }
+        let last = std::fs::read_to_string(stamp).ok().and_then(|t| parse_stamp(&t));
+        let (new_stamp, release) = tick(last, unix_now(), &mut check);
+        if !alive() {
+            return; // replaced while checking: the new checker owns the stamp
+        }
+        if let Some(t) = new_stamp {
+            if let Some(dir) = stamp.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(stamp, t.to_string());
+        }
+        let release = release.filter(|r| !is_skipped(r, &skip()));
+        if let Some(r) = release
+            && !send(r)
+        {
+            return;
+        }
+        sleep(RECHECK);
+    }
 }
 
 /// Ask GitHub for the latest release; `Some` only if newer than this build.
@@ -918,6 +947,55 @@ mod tests {
     #[test]
     fn spawn_checker_disabled_is_none() {
         assert!(spawn_checker(false).is_none());
+    }
+
+    /// Turning the check off and on while the old checker sleeps: the old
+    /// one stops without checking or taking the day's stamp, and a live
+    /// checker checks, stamps and sends.
+    #[test]
+    fn replaced_checker_leaves_the_stamp_alone() {
+        let dir = std::env::temp_dir().join(format!("rustshot-chk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let stamp = dir.join(STAMP_FILE);
+        let generation = AtomicU64::new(1);
+        let alive = || generation.load(Ordering::SeqCst) == 1;
+        let replace = |_: std::time::Duration| {
+            generation.fetch_add(1, Ordering::SeqCst);
+        };
+        run_checker(alive, &stamp, || panic!("a stale checker must not check"), replace, |_| true, String::new);
+        assert!(!stamp.exists(), "the stamp is left for the new checker");
+        // Replaced during the check itself: no stamp either.
+        let generation = AtomicU64::new(1);
+        let alive = || generation.load(Ordering::SeqCst) == 1;
+        let check = || {
+            generation.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        };
+        run_checker(alive, &stamp, check, |_| {}, |_| true, String::new);
+        assert!(!stamp.exists());
+        // A live checker: checks once, writes the stamp, sends; it stops
+        // when replaced during its long sleep.
+        let generation = AtomicU64::new(1);
+        let alive = || generation.load(Ordering::SeqCst) == 1;
+        let mut sent = Vec::new();
+        let sleep = |d: std::time::Duration| {
+            if d == RECHECK {
+                generation.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        let rel = Release { version: "9.9.9".into(), ..Default::default() };
+        run_checker(alive, &stamp, || Ok(Some(rel.clone())), sleep, |r| { sent.push(r); true }, String::new);
+        assert_eq!(sent.len(), 1);
+        assert!(parse_stamp(&std::fs::read_to_string(&stamp).unwrap()).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every spawn (on or off) retires the checkers before it.
+    #[test]
+    fn spawning_bumps_the_generation() {
+        let before = CHECKER_GEN.load(Ordering::SeqCst);
+        assert!(spawn_checker(false).is_none());
+        assert!(CHECKER_GEN.load(Ordering::SeqCst) > before);
     }
 
     #[test]

@@ -53,8 +53,12 @@ pub fn tray_class() -> windows::core::PCWSTR {
     windows::core::PCWSTR(w.as_ptr())
 }
 
-/// Ask a running daemon to open its Settings window; false when none
-/// answers (no daemon, or one too old to know the request).
+/// Ask a running daemon to open its Settings window; false only when no
+/// daemon is reachable (then the caller opens the window itself). True
+/// means the request was delivered, not that a window opened: a daemon
+/// older than the Settings window accepts it and ignores it (Windows: the
+/// tray window drops the unknown `WM_SETTINGS`; Unix: the listener drops
+/// the unknown `settings` line), so nothing opens until it is updated.
 pub fn signal_settings() -> bool {
     imp::signal_settings()
 }

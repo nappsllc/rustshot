@@ -80,7 +80,7 @@ impl Default for Config {
             draw_pixelate_size: 12.0,
             draw_font_size: 16.0,
             undo_limit: 100,
-            capture_hotkey: "Meta+Shift+X".into(),
+            capture_hotkey: "Shift+Meta+X".into(),
             quit_hotkey: "Ctrl+Alt+Shift+Q".into(),
             user_colors: [
                 "#f04438", "#ff8a1f", "#ffc532", "#2dc06f", "#19b5d6", "#3b82f6", "#8b5cf6",
@@ -161,6 +161,19 @@ pub fn load() -> Config {
             }
         },
         Err(_) => Config::default(),
+    }
+}
+
+/// The config file at `path` (normally [`config_path`]): `Ok(None)` when
+/// there is none, `Err` (e.g. "line 3: expected key = value") when it
+/// cannot be read or does not parse. Unlike [`load`] it never falls back
+/// to the defaults, so a caller cannot write them over a broken file.
+pub fn read_at(path: &std::path::Path) -> Result<Option<Config>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_config(&text).map(Some),
+        // A file where a folder of the path should be: no config there either.
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => Ok(None),
+        Err(e) => Err(format!("cannot read it: {e}")),
     }
 }
 
@@ -643,6 +656,24 @@ pub fn parse_color(s: &str) -> Option<(u8, u8, u8, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_at_never_falls_back_to_defaults() {
+        let dir = std::env::temp_dir().join(format!("rustshot-readat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(read_at(&p), Ok(None), "missing");
+        std::fs::write(&p, "theme = \"dark\"
+").unwrap();
+        assert_eq!(read_at(&p).unwrap().unwrap().theme, "dark");
+        std::fs::write(&p, "theme = \"dark\"
+oops
+").unwrap();
+        assert_eq!(read_at(&p), Err("line 2: expected key = value".into()));
+        assert!(read_at(&dir).is_err(), "a directory cannot be read");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn skip_version_edits_only_its_line() {

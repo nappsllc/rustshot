@@ -28,22 +28,128 @@ pub struct Hotkeys {
     /// The registration thread (stopped and replaced by `reload`).
     #[cfg(not(target_os = "macos"))]
     worker: Option<imp::Worker>,
-    /// The specs registered now.
+    /// The startup registration's result, not read yet.
+    #[cfg(not(target_os = "macos"))]
+    started: Option<Receiver<Registered>>,
+    /// The specs registered now (capture, quit); "" where none is.
     specs: [String; 2],
 }
 
-/// Registration specs for `cfg`: capture (id 1) and quit (id 2).
-fn specs_of(cfg: &Config) -> [(i32, String, HotEvent); 2] {
-    [(1, cfg.capture_hotkey.clone(), HotEvent::Capture), (2, cfg.quit_hotkey.clone(), HotEvent::Quit)]
+/// Per slot (capture, quit): registered, or nothing to register.
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: hotkeys apply after a restart
+pub type Registered = [bool; 2];
+
+/// How long `reload` waits for a registration thread's result.
+#[cfg(not(target_os = "macos"))]
+const RESULT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What the slots are called in messages.
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: hotkeys apply after a restart
+const ACTIONS: [&str; 2] = ["Capture", "Quit Rustshot"];
+
+/// Registration specs for `[capture, quit]`: capture (id 1) and quit (id 2).
+fn specs_for(s: &[String; 2]) -> [(i32, String, HotEvent); 2] {
+    [(1, s[0].clone(), HotEvent::Capture), (2, s[1].clone(), HotEvent::Quit)]
+}
+
+fn wanted(cfg: &Config) -> [String; 2] {
+    [cfg.capture_hotkey.trim().to_string(), cfg.quit_hotkey.trim().to_string()]
+}
+
+/// A hotkey `reload` could not register.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failure {
+    /// "Capture" or "Quit Rustshot".
+    pub action: &'static str,
+    pub wanted: String,
+    /// The previous chord, registered again in its place.
+    pub kept: Option<String>,
+}
+
+impl Failure {
+    /// "Couldn't register Ctrl+Alt+F9 — it's in use by another app; kept Shift+Win+X."
+    pub fn message(&self) -> String {
+        let mut s = format!("Couldn't register {} — it's in use by another app", chord_label(&self.wanted));
+        if let Some(k) = &self.kept {
+            s.push_str(&format!("; kept {}", chord_label(k)));
+        }
+        s.push('.');
+        s
+    }
+}
+
+/// `spec` as the Settings window shows it (Win/Super/Cmd for Meta); left
+/// as written when it does not parse.
+pub fn chord_label(spec: &str) -> String {
+    crate::keymap::Chord::parse(spec).map_or_else(|| spec.trim().to_string(), |c| c.label())
+}
+
+/// Move from the registered `old` specs to `want`. `register` replaces
+/// every registration with the specs it is given and says which worked.
+/// A failed slot gets its old chord back (unless a working slot took that
+/// chord); afterwards a slot holds its spec only where the registration
+/// worked, so saving the same settings again retries the failed one.
+/// Returns the specs registered now and the failures.
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: hotkeys apply after a restart
+pub fn plan_reload(
+    old: &[String; 2],
+    want: &[String; 2],
+    mut register: impl FnMut(&[String; 2]) -> Registered,
+) -> ([String; 2], Vec<Failure>) {
+    if want == old {
+        return (old.clone(), Vec::new());
+    }
+    let ok = register(want);
+    let mut now = held(want, ok);
+    if ok.contains(&false) {
+        let retry: [String; 2] = std::array::from_fn(|i| {
+            if ok[i] {
+                want[i].clone()
+            } else if (0..2).any(|j| ok[j] && j != i && !want[j].is_empty() && same_chord(&want[j], &old[i])) {
+                String::new() // the other slot holds that chord now
+            } else {
+                old[i].clone()
+            }
+        });
+        if retry != *want {
+            now = held(&retry, register(&retry));
+        }
+    }
+    let failures = (0..2)
+        .filter(|&i| !ok[i])
+        .map(|i| Failure {
+            action: ACTIONS[i],
+            wanted: want[i].clone(),
+            kept: (!now[i].is_empty() && now[i] != want[i]).then(|| now[i].clone()),
+        })
+        .collect();
+    (now, failures)
+}
+
+/// The specs of `tried` that registered.
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: hotkeys apply after a restart
+fn held(tried: &[String; 2], ok: Registered) -> [String; 2] {
+    std::array::from_fn(|i| if ok[i] { tried[i].clone() } else { String::new() })
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: hotkeys apply after a restart
+fn same_chord(a: &str, b: &str) -> bool {
+    match (parse_hotkey(a), parse_hotkey(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.trim().eq_ignore_ascii_case(b.trim()),
+    }
 }
 
 impl Hotkeys {
     pub fn new(cfg: &Config) -> Self {
         let (tx, rx) = mpsc::channel();
-        let specs = specs_of(cfg);
-        let now = [specs[0].1.clone(), specs[1].1.clone()];
+        let now = wanted(cfg);
+        let specs = specs_for(&now);
         #[cfg(not(target_os = "macos"))]
-        let worker = Some(imp::Worker::start(specs, tx.clone()));
+        let (worker, started) = {
+            let (done, started) = mpsc::channel();
+            (Some(imp::Worker::start(specs, tx.clone(), done)), Some(started))
+        };
         #[cfg(target_os = "macos")]
         {
             let hot_tx = tx.clone();
@@ -54,29 +160,50 @@ impl Hotkeys {
             tx,
             #[cfg(not(target_os = "macos"))]
             worker,
+            #[cfg(not(target_os = "macos"))]
+            started,
             specs: now,
         }
     }
 
     /// Register `cfg`'s hotkeys instead of the current ones (no-op when
     /// they are unchanged). The old registrations are released first, so
-    /// a chord can move between capture and quit.
-    pub fn reload(&mut self, cfg: &Config) {
-        let specs = specs_of(cfg);
-        let want = [specs[0].1.clone(), specs[1].1.clone()];
-        if want == self.specs {
-            return;
-        }
+    /// a chord can move between capture and quit. A chord that cannot be
+    /// registered keeps the previous one ([`plan_reload`]); the failures
+    /// are returned for the user.
+    pub fn reload(&mut self, cfg: &Config) -> Vec<Failure> {
+        let want = wanted(cfg);
         #[cfg(not(target_os = "macos"))]
         {
-            if let Some(w) = self.worker.take() {
-                w.stop();
+            if let Some(started) = self.started.take()
+                && let Ok(ok) = started.recv_timeout(RESULT_WAIT)
+            {
+                self.specs = held(&self.specs, ok);
             }
-            self.worker = Some(imp::Worker::start(specs, self.tx.clone()));
-            self.specs = want;
+            let old = self.specs.clone();
+            let (now, failures) = plan_reload(&old, &want, |s| self.restart(s));
+            self.specs = now;
+            failures
         }
         #[cfg(target_os = "macos")]
-        eprintln!("rustshot: new global hotkeys take effect after a restart");
+        {
+            if want != self.specs {
+                eprintln!("rustshot: new global hotkeys take effect after a restart");
+            }
+            Vec::new()
+        }
+    }
+
+    /// Replace the registration thread with one for `specs`; its result.
+    #[cfg(not(target_os = "macos"))]
+    fn restart(&mut self, specs: &[String; 2]) -> Registered {
+        if let Some(w) = self.worker.take() {
+            w.stop();
+        }
+        let (done, result) = mpsc::channel();
+        self.worker = Some(imp::Worker::start(specs_for(specs), self.tx.clone(), done));
+        // No answer in time: assume it worked (nothing to report).
+        result.recv_timeout(RESULT_WAIT).unwrap_or([true; 2])
     }
 
     /// Another producer of events (single-instance listener, tray).
@@ -100,7 +227,7 @@ mod imp;
 #[path = "hotkey_macos.rs"]
 mod imp;
 
-/// Parse things like `Meta+Shift+X`, `Ctrl+Alt+Shift+Q`, `PrintScreen`.
+/// Parse things like `Shift+Meta+X`, `Ctrl+Alt+Shift+Q`, `PrintScreen`.
 /// Returns `(modifier flags, virtual-key code)` for `RegisterHotKey`.
 pub fn parse_hotkey(spec: &str) -> Option<(u32, u32)> {
     // Win32 modifier flags: MOD_ALT=1, MOD_CONTROL=2, MOD_SHIFT=4, MOD_WIN=8.
@@ -214,7 +341,7 @@ mod tests {
 
     #[test]
     fn parses_custom_specs() {
-        assert_eq!(parse_hotkey("Meta+Shift+X"), Some((0x0008 | 0x0004, 0x58)));
+        assert_eq!(parse_hotkey("Shift+Meta+X"), Some((0x0008 | 0x0004, 0x58)));
         assert_eq!(
             parse_hotkey("Ctrl+Alt+Shift+Q"),
             Some((0x0002 | 0x0001 | 0x0004, 0x51))
@@ -225,6 +352,81 @@ mod tests {
         assert_eq!(parse_hotkey(""), None);
         assert_eq!(parse_hotkey("A+B"), None);
         assert_eq!(parse_hotkey("Shift"), None);
+    }
+
+    fn s2(a: &str, b: &str) -> [String; 2] {
+        [a.to_string(), b.to_string()]
+    }
+
+    /// A fake registrar: chords in `taken` belong to another app.
+    fn registrar<'a>(taken: &'a [&'a str], calls: &'a mut Vec<[String; 2]>) -> impl FnMut(&[String; 2]) -> Registered + 'a {
+        move |s: &[String; 2]| {
+            calls.push(s.clone());
+            std::array::from_fn(|i| s[i].is_empty() || !taken.iter().any(|t| same_chord(t, &s[i])))
+        }
+    }
+
+    #[test]
+    fn reload_plan_unchanged_registers_nothing() {
+        let mut calls = Vec::new();
+        let old = s2("Shift+Meta+X", "Ctrl+Alt+Shift+Q");
+        let (now, f) = plan_reload(&old, &old.clone(), registrar(&[], &mut calls));
+        assert_eq!((now, f), (old, vec![]));
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn reload_plan_success_and_swap() {
+        let mut calls = Vec::new();
+        let old = s2("Shift+Meta+X", "Ctrl+Alt+Shift+Q");
+        // Capture and quit trade places: one registration, both work.
+        let want = s2("Ctrl+Alt+Shift+Q", "Shift+Meta+X");
+        let (now, f) = plan_reload(&old, &want, registrar(&[], &mut calls));
+        assert_eq!((now, f), (want.clone(), vec![]));
+        assert_eq!(calls, [want]);
+    }
+
+    #[test]
+    fn reload_plan_failure_keeps_the_old_chord() {
+        let mut calls = Vec::new();
+        let old = s2("Shift+Meta+X", "Ctrl+Alt+Shift+Q");
+        let want = s2("Ctrl+Alt+F9", "Ctrl+Alt+Shift+Q");
+        let (now, f) = plan_reload(&old, &want, registrar(&["ctrl+alt+f9"], &mut calls));
+        assert_eq!(now, old, "the old capture chord is back");
+        assert_eq!(calls, [want.clone(), old.clone()]);
+        assert_eq!(f, [Failure { action: "Capture", wanted: "Ctrl+Alt+F9".into(), kept: Some("Shift+Meta+X".into()) }]);
+        #[cfg(windows)]
+        assert_eq!(f[0].message(), "Couldn't register Ctrl+Alt+F9 — it's in use by another app; kept Shift+Win+X.");
+        // Saving the same settings again retries (the specs differ).
+        let mut calls = Vec::new();
+        let (again, _) = plan_reload(&now, &want, registrar(&[], &mut calls));
+        assert_eq!((again, calls.len()), (want, 1));
+    }
+
+    #[test]
+    fn reload_plan_without_a_fallback() {
+        // No previous chord, or the previous one is gone too: the slot is
+        // left empty (so a later save retries) and nothing is "kept".
+        let mut calls = Vec::new();
+        let old = s2("", "Ctrl+Alt+Shift+Q");
+        let want = s2("Ctrl+Alt+F9", "Ctrl+Alt+Shift+Q");
+        let (now, f) = plan_reload(&old, &want, registrar(&["Ctrl+Alt+F9"], &mut calls));
+        assert_eq!(now, s2("", "Ctrl+Alt+Shift+Q"));
+        assert_eq!(f[0].kept, None);
+        assert_eq!(f[0].message(), "Couldn't register Ctrl+Alt+F9 — it's in use by another app.");
+        let mut calls = Vec::new();
+        let old = s2("Shift+Meta+X", "Ctrl+Alt+Shift+Q");
+        let (now, f) = plan_reload(&old, &want, registrar(&["Ctrl+Alt+F9", "Meta+Shift+X"], &mut calls));
+        assert_eq!(now, s2("", "Ctrl+Alt+Shift+Q"));
+        assert_eq!(f[0].kept, None);
+        // The quit slot took the old capture chord: capture is not given
+        // it back (it would knock quit out).
+        let mut calls = Vec::new();
+        let want = s2("Ctrl+Alt+F9", "Shift+Meta+X");
+        let (now, f) = plan_reload(&old, &want, registrar(&["Ctrl+Alt+F9"], &mut calls));
+        assert_eq!(now, s2("", "Shift+Meta+X"));
+        assert_eq!(calls, [want.clone(), s2("", "Shift+Meta+X")]);
+        assert_eq!((f.len(), f[0].kept.clone()), (1, None));
     }
 
     #[test]

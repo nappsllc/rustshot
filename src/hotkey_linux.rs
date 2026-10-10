@@ -122,10 +122,11 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn start(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>) -> Worker {
+    /// Grab `specs` on a new thread; `done` gets which were grabbed.
+    pub fn start(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>, done: mpsc::Sender<Registered>) -> Worker {
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let s = stop.clone();
-        let join = std::thread::spawn(move || hotkey_thread(specs, tx, &s));
+        let join = std::thread::spawn(move || hotkey_thread(specs, tx, &s, done));
         Worker { join, stop }
     }
 
@@ -139,12 +140,13 @@ impl Worker {
 /// Serve `specs` until the receiver goes away or `stop` is set. Mirrors
 /// hotkey_win: register everything, loop on events, warn (never die) when
 /// a grab is refused.
-fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>, stop: &AtomicBool) {
+fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>, stop: &AtomicBool, done: mpsc::Sender<Registered>) {
     crate::wind::init_x11();
     unsafe {
         let dpy = XOpenDisplay(core::ptr::null());
         if dpy.is_null() {
             eprintln!("warning: cannot open X display; global hotkeys disabled");
+            let _ = done.send(std::array::from_fn(|i| specs[i].1.trim().is_empty()));
             return;
         }
         let root = XRootWindow(dpy, XDefaultScreen(dpy));
@@ -207,6 +209,7 @@ fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>
             }
         }
         XSetErrorHandler(prev);
+        let _ = done.send(std::array::from_fn(|i| specs[i].1.trim().is_empty() || grabs.iter().any(|g| g.2 == i)));
 
         // Passive grabs deliver KeyPress/KeyRelease here. `held` drops the
         // server's auto-repeat press/release pairs (MOD_NOREPEAT parity).

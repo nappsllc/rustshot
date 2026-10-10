@@ -49,6 +49,16 @@ pub fn spawn(tx: Sender<HotEvent>) {
     }
 }
 
+/// Show `text` as a tray balloon (from any thread; the tray window shows it).
+pub fn notify(text: &str) {
+    *BALLOON.lock().unwrap() = Some(text.to_string());
+    unsafe {
+        if let Ok(hwnd) = FindWindowW(crate::instance::tray_class(), PCWSTR::null()) {
+            let _ = PostMessageW(Some(hwnd), WM_TRAY_BALLOON, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
 /// Drop the event sender (called when the instance guard goes away).
 pub fn clear() {
     *TX.lock().unwrap() = None;

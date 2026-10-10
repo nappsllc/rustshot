@@ -342,7 +342,11 @@ impl App {
                 self.updating = false;
                 self.idle_reply = None;
             }
-            HotEvent::ReloadConfig => self.reload_config(crate::config::load()),
+            // A file that stopped parsing is not taken as "all defaults".
+            HotEvent::ReloadConfig => match crate::config::read_at(&crate::config::config_path()) {
+                Ok(cfg) => self.reload_config(cfg.unwrap_or_default()),
+                Err(e) => eprintln!("rustshot: config.toml not reloaded: {e}"),
+            },
             // No new capture while an update installs or restarts us.
             HotEvent::Capture if self.updating || self.restart_pending => {
                 eprintln!("rustshot: an update is installing; capture ignored");
@@ -358,11 +362,20 @@ impl App {
     /// `check_updates`. An open capture keeps the config it started with.
     fn reload_config(&mut self, cfg: Config) {
         if let Some(h) = self.hot.as_mut() {
-            h.reload(&cfg);
+            let failed = h.reload(&cfg);
+            if !failed.is_empty() {
+                let text = failed.iter().map(|f| f.message()).collect::<Vec<_>>().join("
+");
+                eprintln!("rustshot: {text}");
+                // In the Settings window when it is open, else a tray balloon.
+                if !crate::settings_ui::notify(&text) {
+                    crate::tray::notify(&text);
+                }
+            }
         }
         if cfg.check_updates != self.cfg.check_updates && self.kind == RunKind::Daemon {
-            // Dropping the receiver ends the old checker; it also re-reads
-            // `check_updates` before every check.
+            // A new checker generation: the old one stops before its next
+            // check (and never takes the day's stamp).
             self.updates = crate::update::spawn_checker(cfg.check_updates);
         }
         self.cfg = cfg;

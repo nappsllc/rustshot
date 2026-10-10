@@ -101,6 +101,15 @@ impl Action {
     }
 }
 
+/// What the Meta modifier is called here: the Windows key, Super on
+/// Linux, ⌘ (Cmd) on macOS.
+#[cfg(windows)]
+pub const META_NAME: &str = "Win";
+#[cfg(target_os = "macos")]
+pub const META_NAME: &str = "Cmd";
+#[cfg(not(any(windows, target_os = "macos")))]
+pub const META_NAME: &str = "Super";
+
 /// One key plus modifiers. `vk` uses the Win32 numbering of `wind::key`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
 pub struct Chord {
@@ -131,6 +140,13 @@ impl Chord {
         }
         out.push_str(&hotkey::key_name(self.vk).unwrap_or_else(|| format!("0x{:X}", self.vk)));
         out
+    }
+
+    /// [`display`](Chord::display) with this OS's name for Meta
+    /// ([`META_NAME`]), for messages: `"Shift+Win+X"`.
+    pub fn label(&self) -> String {
+        let s = self.display();
+        if self.meta { s.replacen("Meta", META_NAME, 1) } else { s }
     }
 
     /// The key name alone ("S", "Space"), for key caps.
@@ -295,6 +311,11 @@ mod tests {
         }
         assert_eq!(Chord::parse("shift+ctrl+s").unwrap().display(), "Ctrl+Shift+S");
         assert_eq!(Chord::parse("Win+delete").unwrap().display(), "Meta+Del");
+        assert_eq!(Chord::parse("Meta+Shift+X").unwrap().label(), format!("Shift+{META_NAME}+X"));
+        assert_eq!(Chord::parse("Ctrl+S").unwrap().label(), "Ctrl+S");
+        // The default capture hotkey is written in the display order.
+        let def = crate::config::Config::default().capture_hotkey;
+        assert_eq!(Chord::parse(&def).unwrap().display(), def);
         let c = Chord::parse("Meta+X").unwrap();
         assert!(c.meta && !c.ctrl && c.vk == 'X' as u32);
         assert_eq!(Chord::parse("Del").unwrap().vk, key::DELETE);

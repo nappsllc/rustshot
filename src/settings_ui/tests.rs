@@ -176,13 +176,174 @@ fn conflicts_are_marked() {
 }
 
 fn settings_at(path: &Path) -> Settings {
-    let cfg = std::fs::read_to_string(path).ok().and_then(|t| config::parse_config(&t).ok()).unwrap_or_default();
-    let mut s = Settings::new(cfg, None, path.to_path_buf());
+    let mut s = Settings::open(path.to_path_buf(), None);
     s.set_autostart = |_| Err("not in tests".into());
     s
 }
 
-use std::path::Path;
+/// After a save the form is rebuilt from what was written: nothing stale
+/// or dirty, the folder trimmed.
+#[test]
+fn apply_rebuilds_the_form() {
+    let dir = scratch("rebuild");
+    let p = dir.join("config.toml");
+    config::save_at(&p, &Config::default()).unwrap();
+    let mut s = settings_at(&p);
+    s.form.folder.set(r"  E:\caps  ");
+    assert!(s.dirty());
+    assert!(matches!(&s.on(Click::Apply)[..], [Act::Saved(c)] if c.save_path == r"E:\caps"));
+    assert_eq!(s.form.folder.text, r"E:\caps");
+    assert!(!s.dirty());
+    // Only spaces around it: not a change.
+    s.form.folder.set(r" E:\caps ");
+    assert!(!s.dirty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const BROKEN: &str = "theme = \"dark\"\noops\n";
+
+/// A file that does not parse opens in the error state: nothing can be
+/// written over it, only opened, reset or closed.
+#[test]
+fn broken_file_is_never_written() {
+    let dir = scratch("broken");
+    let p = dir.join("config.toml");
+    std::fs::write(&p, BROKEN).unwrap();
+    let mut s = settings_at(&p);
+    assert_eq!(s.modal, Some(Modal::Broken("line 2: expected key = value".into())));
+    assert_eq!(broken_text("line 2: expected key = value"), "config.toml has an error (line 2: expected key = value). Fix it or reset it.");
+    s.form.theme = 2; // as if edited anyway
+    for c in [Click::Ok, Click::Apply, Click::Enter, Click::Save, Click::Back, Click::Restore, Click::ResetAll, Click::Replace] {
+        assert_eq!(s.on(c), vec![], "{c:?}");
+        assert!(s.broken(), "{c:?}");
+    }
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), BROKEN);
+    assert!(!backup_path(&p).exists());
+    assert_eq!(s.on(Click::OpenConfig), vec![Act::OpenConfig]);
+    assert_eq!(s.on(Click::Close), vec![Act::Close]);
+    assert_eq!(s.on(Click::Escape), vec![Act::Close]);
+    assert_eq!(s.on(Click::Cancel), vec![Act::Close], "the window's close button");
+    // Fixed in an editor: the window reads it again and works.
+    std::fs::write(&p, "theme = \"light\"\n").unwrap();
+    assert!(s.recheck());
+    assert_eq!((s.modal.clone(), s.form.theme, s.stale), (None, 2, false));
+    assert!(!s.dirty(), "the form is the fixed file's");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reset to defaults asks again; Replace keeps the old file as
+/// config.toml.bak and writes the defaults; Cancel goes back.
+#[test]
+fn reset_writes_defaults_and_a_backup() {
+    let dir = scratch("reset");
+    let p = dir.join("config.toml");
+    std::fs::write(&p, BROKEN).unwrap();
+    let mut s = settings_at(&p);
+    assert_eq!(s.on(Click::ResetDefaults), vec![]);
+    assert_eq!(s.modal, Some(Modal::Reset("line 2: expected key = value".into())));
+    assert_eq!(s.on(Click::Enter), vec![], "no reset by a stray Enter");
+    assert_eq!(s.on(Click::Escape), vec![]);
+    assert!(matches!(s.modal, Some(Modal::Broken(_))), "Esc goes back to the error");
+    s.on(Click::ResetDefaults);
+    assert_eq!(s.on(Click::Back), vec![]);
+    assert!(matches!(s.modal, Some(Modal::Broken(_))));
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), BROKEN);
+    s.on(Click::ResetDefaults);
+    let acts = s.on(Click::Replace);
+    assert!(matches!(&acts[..], [Act::Saved(c)] if **c == Config::default()), "{acts:?}");
+    assert_eq!(s.modal, None);
+    assert_eq!(std::fs::read_to_string(backup_path(&p)).unwrap(), BROKEN);
+    assert_eq!(backup_path(&p), dir.join("config.toml.bak"));
+    assert_eq!(config::read_at(&p), Ok(Some(Config::default())));
+    // The window works on the new file.
+    assert!(!s.dirty());
+    s.form.ask = true;
+    assert!(matches!(&s.on(Click::Apply)[..], [Act::Saved(c)] if c.save_dialog));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The file breaks while the window is open: Save refuses to write
+/// (never merges onto the defaults) and shows the error; the edits stay
+/// and save once the file is fixed.
+#[test]
+fn file_broken_before_save_is_not_written() {
+    let dir = scratch("broken-later");
+    let p = dir.join("config.toml");
+    config::save_at(&p, &Config { theme: "dark".into(), ..Config::default() }).unwrap();
+    let mut s = settings_at(&p);
+    s.form.format = 1;
+    std::fs::write(&p, BROKEN).unwrap();
+    assert_eq!(s.on(Click::Ok), vec![]);
+    assert!(matches!(&s.modal, Some(Modal::Broken(e)) if e.starts_with("line 2")));
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), BROKEN);
+    // Broken between the rewrite question and its Save, too.
+    std::fs::write(&p, "# hand-edited\ntheme = \"dark\"\n").unwrap();
+    assert!(s.recheck());
+    assert_eq!(s.form.format, 1, "the edit is kept");
+    assert_eq!(s.on(Click::Apply), vec![]);
+    assert_eq!(s.modal, Some(Modal::Rewrite { close: false }));
+    std::fs::write(&p, BROKEN).unwrap();
+    assert_eq!(s.on(Click::Save), vec![]);
+    assert!(s.broken());
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), BROKEN);
+    // Fixed: it saves onto the fixed file.
+    std::fs::write(&p, "theme = \"light\"\n").unwrap();
+    assert!(s.recheck());
+    let acts = s.on(Click::Apply);
+    assert!(matches!(&acts[..], [Act::Saved(c)] if c.save_format == "jpg" && c.theme == "light"), "{acts:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A message (a hotkey the daemon could not register) shows at once, or
+/// after the open question.
+#[test]
+fn notes_show_in_the_window() {
+    let mut s = sample();
+    s.notify("one".into());
+    assert_eq!(s.modal, Some(Modal::Error("one".into())));
+    s.notify("two".into());
+    assert_eq!(s.modal, Some(Modal::Error("one\ntwo".into())));
+    s.on(Click::Back);
+    s.modal = Some(Modal::Rewrite { close: false });
+    s.notify("three".into());
+    assert_eq!(s.modal, Some(Modal::Rewrite { close: false }));
+    s.on(Click::Back);
+    assert_eq!(s.modal, Some(Modal::Error("three".into())));
+}
+
+#[test]
+fn folder_notes() {
+    assert_eq!(folder_note(""), None);
+    assert!(folder_note("shots").unwrap().contains("relative"));
+    assert!(folder_note(r"shots\x").unwrap().contains("relative"));
+    let here = std::env::temp_dir().display().to_string();
+    assert_eq!(folder_note(&here), None);
+    #[cfg(windows)]
+    {
+        assert!(folder_note(r"\shots").unwrap().contains("relative"), "no drive");
+        // A drive letter that is not there (the last one free, if any).
+        if let Some(d) = ('D'..='Z').rev().find(|d| !Path::new(&format!(r"{d}:\")).exists()) {
+            assert_eq!(folder_note(&format!(r"{d}:\shots")), Some(format!("Drive {d}: is not on this computer.")));
+        }
+        assert_eq!(folder_note(r"\\server\share\x"), None, "shares are not probed");
+    }
+    #[cfg(unix)]
+    assert_eq!(folder_note("/no-such-root-rustshot/x"), Some("/no-such-root-rustshot does not exist.".into()));
+}
+
+/// A conflict scrolls its first row into view.
+#[test]
+fn conflict_scrolls_into_view() {
+    let mut s = sample();
+    s.tab = 2;
+    let mut focus = FocusState::default();
+    render(&mut s, &DARK, 1.0, &Input::default(), &mut focus);
+    assert_eq!(s.table.scroll, 0.0);
+    s.form.keys.set(Action::Accept, vec![Chord::parse("Esc").unwrap()]);
+    render(&mut s, &DARK, 1.0, &Input::default(), &mut focus);
+    let r = s.table.row_rect(17).unwrap_or_else(|| panic!("Accept is visible: {:?} {:?}", s.table, s.conflict_row));
+    assert!(r.h > 0.0 && s.table.scroll > 0.0);
+}
 
 #[test]
 fn apply_and_ok_save_only_when_dirty() {
@@ -252,8 +413,10 @@ fn first_save_over_comments_asks_once() {
 #[test]
 fn save_errors_show_in_the_window() {
     let dir = scratch("err");
-    // The config path is a directory: the write fails.
-    let mut s = settings_at(&dir);
+    // The config's folder cannot be created (a file is in the way).
+    std::fs::write(dir.join("blocker"), "").unwrap();
+    let mut s = settings_at(&dir.join("blocker").join("sub").join("config.toml"));
+    assert_eq!(s.modal, None, "no file there yet");
     s.form.theme = 1;
     assert_eq!(s.on(Click::Ok), vec![]);
     assert!(matches!(&s.modal, Some(Modal::Error(e)) if e.starts_with("Could not save")));
@@ -327,11 +490,11 @@ fn preview_settings_pngs() {
         focus.record("rebind");
         let (img, _) = render(&mut s, th, 1.0, &Input::default(), &mut focus);
         preview::save(&format!("settings-rebind-{tname}.png"), &img);
-        // A conflict.
+        // A conflict (Accept → Esc, also Cancel's): scrolled into view.
         let mut s = sample();
         s.tab = 2;
-        s.form.keys.set(Action::Cancel, vec![Chord::parse("P").unwrap()]);
-        s.table.selected = Some(18);
+        s.form.keys.set(Action::Accept, vec![Chord::parse("Esc").unwrap()]);
+        s.table.selected = Some(17);
         let (img, _) = render(&mut s, th, 1.0, &Input::default(), &mut FocusState::default());
         preview::save(&format!("settings-conflict-{tname}.png"), &img);
         // The rewrite question.
@@ -346,6 +509,26 @@ fn preview_settings_pngs() {
         ));
         let (img, _) = render(&mut s, th, 1.0, &Input::default(), &mut FocusState::default());
         preview::save(&format!("settings-error-{tname}.png"), &img);
+        // config.toml does not parse, and the reset question.
+        let mut s = sample();
+        s.stale = true;
+        s.modal = Some(Modal::Broken("line 7: invalid integer for 'jpeg_quality': high".into()));
+        let (img, _) = render(&mut s, th, 1.0, &Input::default(), &mut FocusState::default());
+        preview::save(&format!("settings-invalid-{tname}.png"), &img);
+        s.modal = Some(Modal::Reset(String::new()));
+        let (img, _) = render(&mut s, th, 1.0, &Input::default(), &mut FocusState::default());
+        preview::save(&format!("settings-reset-{tname}.png"), &img);
+        // A hotkey the daemon could not register.
+        let mut s = sample();
+        s.notify("Couldn't register Ctrl+Alt+F9 — it's in use by another app; kept Shift+Win+X.".into());
+        let (img, _) = render(&mut s, th, 1.0, &Input::default(), &mut FocusState::default());
+        preview::save(&format!("settings-hotkey-failed-{tname}.png"), &img);
+        // A folder note (a drive that is not there).
+        let mut s = sample();
+        s.tab = 1;
+        s.folder_note = (s.form.folder.text.clone(), Some("Drive Q: is not on this computer.".into()));
+        let (img, _) = render(&mut s, th, 1.0, &Input::default(), &mut FocusState::default());
+        preview::save(&format!("settings-folder-note-{tname}.png"), &img);
     }
     // JPEG chosen (quality enabled), a hotkey warning, at 150 %.
     let mut s = sample();
@@ -357,6 +540,20 @@ fn preview_settings_pngs() {
     s.form.capture = Chord::parse("X");
     let (img, _) = render(&mut s, &DARK, 1.5, &Input::default(), &mut FocusState::default());
     preview::save("settings-general-warning-dark-150.png", &img);
+    let mut s = sample();
+    s.tab = 2;
+    s.form.keys.set(Action::Accept, vec![Chord::parse("Esc").unwrap()]);
+    s.table.selected = Some(17);
+    let mut focus = FocusState::default();
+    render(&mut s, &LIGHT, 1.5, &Input::default(), &mut focus);
+    focus.record("rebind");
+    let (img, _) = render(&mut s, &LIGHT, 1.5, &Input::default(), &mut focus);
+    preview::save("settings-conflict-rebind-light-150.png", &img);
+    let mut s = sample();
+    s.stale = true;
+    s.modal = Some(Modal::Broken("line 2: expected key = value".into()));
+    let (img, _) = render(&mut s, &DARK, 1.5, &Input::default(), &mut FocusState::default());
+    preview::save("settings-invalid-dark-150.png", &img);
 }
 
 fn click_at(x: f32, y: f32, k: f32) -> Input {
@@ -401,16 +598,18 @@ fn token_button_click_inserts() {
     s.form.filename.set("ab");
     s.form.filename.select(1..1);
     let mut focus = FocusState::default();
-    // Hour (00-23) is the 7th button of the first column (rows 22 + 3 px).
-    let gy = token_grid_y();
-    render(&mut s, &DARK, 1.0, &click_at(PAD + 40.0, gy + 25.0 * 6.0 + 11.0, 1.0), &mut focus);
+    // Hour (00-23) is the 2nd button of the second column.
+    let (gy, col_w) = token_grid_y();
+    let x = PAD + col_w + TOKEN_GAP + 40.0;
+    render(&mut s, &DARK, 1.0, &click_at(x, gy + TOKEN_H + TOKEN_GAP + TOKEN_H / 2.0, 1.0), &mut focus);
     assert_eq!(s.form.filename.text, "a%Hb");
     assert!(focus.is_focused("filename"));
 }
 
-/// The token grid's top (logical px), laid out as `saving` does it.
-fn token_grid_y() -> f32 {
-    let mut y = 0.0;
+/// The token grid's top and column width (logical px), laid out as
+/// `saving` does it.
+fn token_grid_y() -> (f32, f32) {
+    let (mut y, mut w) = (0.0, 0.0);
     preview::render(W, H, 1.0, &DARK, &Input::default(), &mut FocusState::default(), |ui| {
         let body = FRect { x: PAD, y: BODY_Y, w: W as f32 - 2.0 * PAD, h: 300.0 };
         ui.area(body, |ui| {
@@ -419,11 +618,11 @@ fn token_grid_y() -> f32 {
                 ui.row(|ui| ui.width(LABEL_W).label("x"));
             }
             ui.heading("File name");
-            ui.space(2.0);
             y = ui.cursor_y();
+            w = token_col_w(ui);
         });
     });
-    y
+    (y, w)
 }
 
 /// A click on a shortcut row starts recording its new keys; the next

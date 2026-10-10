@@ -10,13 +10,18 @@
 //! then (so a `skip_version` written meanwhile survives) and rewrites the
 //! whole `config.toml` ([`config::save_at`]). A file with comments or
 //! unknown keys would lose them: the first save asks first ([`REWRITE`]).
+//! A file that does not parse is never replaced by the defaults behind the
+//! user's back: the window shows the error ([`broken_text`]) and offers to
+//! open the file or, after a second question ([`RESET`]), to reset it
+//! (the old file is kept as `config.toml.bak`).
 //! After a save the daemon reloads the config (re-registers its hotkeys,
 //! applies `check_updates`); every later capture uses it.
 //!
 //! Drawn with the `ui` kit in a `wind::run_window` window on its own
 //! thread, one window at a time: another request brings it to the front.
-//! macOS opens windows only on the main thread, so there the config file
-//! opens in the default editor instead.
+//! A hotkey the daemon could not register after a save is reported in the
+//! open window ([`notify`]). macOS opens windows only on the main thread,
+//! so there the config file opens in the default editor instead.
 #![cfg_attr(target_os = "macos", allow(dead_code))]
 
 use crate::config::{self, Config};
@@ -29,7 +34,7 @@ use crate::theme::Theme;
 use crate::ui::layout::{GAP, H as ROW};
 use crate::ui::{Col, FocusState, Input, Row, TableState, TextState, Ui};
 use crate::wind::{self, Cursor, Driver, Ev, Hwnd, WindowSpec};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -69,12 +74,31 @@ pub const TOKENS: [(&str, &str); 15] = [
     ("Year (00-99)", "%y"),
     ("Year (2000)", "%Y"),
 ];
-/// Token buttons per column.
-const TOKEN_ROWS: usize = 8;
+/// Token buttons per column (3 columns of 5).
+const TOKEN_ROWS: usize = 5;
+/// Token button height and the gap between them (logical px).
+const TOKEN_H: f32 = 28.0;
+const TOKEN_GAP: f32 = 6.0;
 
 /// Asked once before the first save over a file rustshot would not write
 /// that way (comments, unknown keys).
 pub const REWRITE: &str = "Saving will rewrite config.toml and remove comments.";
+
+/// The question before "Reset to defaults…" replaces a broken file.
+pub const RESET: &str = "Replace config.toml with default settings? Your current values will be lost.";
+
+/// The error state's text for a `config.toml` that does not parse (`e`
+/// as [`config::read_at`] words it: "line 3: expected key = value").
+pub fn broken_text(e: &str) -> String {
+    format!("config.toml has an error ({e}). Fix it or reset it.")
+}
+
+/// Where "Reset to defaults…" keeps the old file: `config.toml.bak`.
+pub fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_else(|| "config.toml".into());
+    name.push(".bak");
+    path.with_file_name(name)
+}
 
 fn labels<const N: usize>(list: &[(&'static str, &'static str); N]) -> [&'static str; N] {
     list.map(|(l, _)| l)
@@ -167,7 +191,7 @@ impl Form {
         if self.quit != was.quit {
             c.quit_hotkey = chord_text(self.quit);
         }
-        if self.folder.text != was.folder.text {
+        if self.folder.text.trim() != was.folder.text.trim() {
             c.save_path = self.folder.text.trim().to_string();
         }
         if self.subfolder != was.subfolder {
@@ -261,11 +285,53 @@ impl Form {
         if self.capture.is_some() && self.capture == self.quit {
             Some("Capture and Quit use the same keys.")
         } else if bare(&self.capture) || bare(&self.quit) {
-            Some("A hotkey without Ctrl, Alt, Shift or Win takes that key from every app.")
+            Some(BARE_NOTE)
         } else {
             None
         }
     }
+
+    /// A word about the folder that does not stop the save: a relative
+    /// path, or a drive (root folder) this computer does not have.
+    pub fn folder_note(&self) -> Option<String> {
+        folder_note(self.folder.text.trim())
+    }
+}
+
+#[cfg(windows)]
+const BARE_NOTE: &str = "A hotkey without Ctrl, Alt, Shift or Win takes that key from every app.";
+#[cfg(target_os = "macos")]
+const BARE_NOTE: &str = "A hotkey without Ctrl, Alt, Shift or Cmd takes that key from every app.";
+#[cfg(not(any(windows, target_os = "macos")))]
+const BARE_NOTE: &str = "A hotkey without Ctrl, Alt, Shift or Super takes that key from every app.";
+
+/// See [`Form::folder_note`].
+fn folder_note(t: &str) -> Option<String> {
+    use std::path::Component;
+    if t.is_empty() {
+        return None;
+    }
+    let p = Path::new(t);
+    if !p.has_root() || p.is_relative() {
+        return Some("A relative folder is saved under the folder Rustshot was started in.".into());
+    }
+    // The drive (Windows) or the top-level folder (elsewhere: /media, /mnt).
+    let mut root = PathBuf::new();
+    for c in p.components() {
+        if let Component::Prefix(x) = c
+            && matches!(x.kind(), std::path::Prefix::UNC(..) | std::path::Prefix::VerbatimUNC(..))
+        {
+            return None; // a network share: not probed (it can take seconds)
+        }
+        root.push(c);
+        if cfg!(windows) && matches!(c, Component::RootDir) || matches!(c, Component::Normal(_)) {
+            break;
+        }
+    }
+    (!root.exists()).then(|| {
+        let name = root.display().to_string();
+        if cfg!(windows) { format!("Drive {} is not on this computer.", name.trim_end_matches('\\')) } else { format!("{name} does not exist.") }
+    })
 }
 
 /// The pattern field token buttons insert into.
@@ -280,8 +346,14 @@ pub enum Pattern {
 enum Modal {
     /// [`REWRITE`]; `close`: OK (not Apply) asked to save.
     Rewrite { close: bool },
-    /// A save failed.
+    /// A save failed, or a message for the user (a hotkey the daemon
+    /// could not register).
     Error(String),
+    /// `config.toml` does not parse (the error): Open config file, Reset
+    /// to defaults…, Close; nothing else until it is fixed.
+    Broken(String),
+    /// [`RESET`] over [`Modal::Broken`] (its error, to go back to).
+    Reset(String),
 }
 
 /// What the user did this frame.
@@ -299,6 +371,12 @@ pub enum Click {
     Restore,
     Clear,
     ResetAll,
+    /// The broken file's "Reset to defaults…".
+    ResetDefaults,
+    /// The reset question's Replace.
+    Replace,
+    /// The broken file's Close.
+    Close,
     /// Esc not taken by a control.
     Escape,
     /// Enter not taken by a control.
@@ -335,6 +413,15 @@ pub struct Settings {
     path: PathBuf,
     /// Show the renderer choice (Windows).
     renderer: bool,
+    /// The form was not made from the file (it did not parse at open):
+    /// rebuilt from it once it does.
+    stale: bool,
+    /// Messages waiting for the open question to close.
+    pending: Vec<String>,
+    /// The first conflicting shortcut row last revealed.
+    conflict_row: Option<usize>,
+    /// The folder text and its note (probing a drive every frame is slow).
+    folder_note: (String, Option<String>),
     set_autostart: fn(bool) -> Result<(), String>,
 }
 
@@ -351,8 +438,84 @@ impl Settings {
             pattern: Pattern::File,
             path,
             renderer: cfg!(windows),
+            stale: false,
+            pending: Vec::new(),
+            conflict_row: None,
+            folder_note: (String::new(), None),
             set_autostart: crate::autostart::set,
         }
+    }
+
+    /// The window for the config file at `path` as it is now. A file that
+    /// does not parse opens in the error state ([`Modal::Broken`]).
+    pub fn open(path: PathBuf, autostart: Option<bool>) -> Settings {
+        match config::read_at(&path) {
+            Ok(cfg) => Settings::new(cfg.unwrap_or_default(), autostart, path),
+            Err(e) => {
+                let mut s = Settings::new(Config::default(), autostart, path);
+                s.stale = true;
+                s.modal = Some(Modal::Broken(e));
+                s
+            }
+        }
+    }
+
+    /// Showing the broken-file error (or its reset question).
+    pub fn broken(&self) -> bool {
+        matches!(self.modal, Some(Modal::Broken(_) | Modal::Reset(_)))
+    }
+
+    /// While the broken-file error shows: read the file again; once it
+    /// parses the window works again (a form made before it broke is
+    /// kept, one that never saw it is rebuilt). Returns whether anything
+    /// changed.
+    pub fn recheck(&mut self) -> bool {
+        let Some(Modal::Broken(old)) = &self.modal else { return false };
+        match config::read_at(&self.path) {
+            Ok(cfg) => {
+                if self.stale {
+                    let cfg = cfg.unwrap_or_default();
+                    self.form = Form::new(&cfg, self.form.autostart);
+                    self.loaded = cfg;
+                    self.stale = false;
+                }
+                self.modal = None;
+                self.show_pending();
+                true
+            }
+            Err(e) if e != *old => {
+                self.modal = Some(Modal::Broken(e));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Show `msg` (e.g. a hotkey the daemon could not register) once no
+    /// other question is open.
+    pub fn notify(&mut self, msg: String) {
+        match &mut self.modal {
+            None => self.modal = Some(Modal::Error(msg)),
+            Some(Modal::Error(e)) => {
+                e.push('\n');
+                e.push_str(&msg);
+            }
+            Some(_) => self.pending.push(msg),
+        }
+    }
+
+    fn show_pending(&mut self) {
+        if self.modal.is_none() && !self.pending.is_empty() {
+            self.modal = Some(Modal::Error(std::mem::take(&mut self.pending).join("\n")));
+        }
+    }
+
+    /// The file on disk now, if it parses: `Ok(None)` when there is none.
+    /// When it does not, the window switches to the error state.
+    fn disk(&mut self) -> Result<Option<Config>, ()> {
+        config::read_at(&self.path).map_err(|e| {
+            self.modal = Some(Modal::Broken(e));
+        })
     }
 
     /// Something differs from what is saved.
@@ -368,11 +531,19 @@ impl Settings {
 
     pub fn on(&mut self, c: Click) -> Vec<Act> {
         let c = match (c, &self.modal) {
+            (Click::Escape, Some(Modal::Broken(_))) => Click::Close,
             (Click::Escape, Some(_)) => Click::Back,
             (Click::Escape, None) => Click::Cancel,
             (Click::Enter, Some(Modal::Rewrite { .. })) => Click::Save,
             (Click::Enter, Some(Modal::Error(_))) => Click::Back,
+            // Nothing happens to a broken file by a stray Enter.
+            (Click::Enter, Some(Modal::Broken(_) | Modal::Reset(_))) => return vec![],
             (Click::Enter, None) => Click::Ok,
+            // While the file is broken only its own buttons work.
+            (Click::OpenConfig | Click::ResetDefaults | Click::Close | Click::Cancel, Some(Modal::Broken(_))) => c,
+            (Click::Replace | Click::Back, Some(Modal::Reset(_))) => c,
+            (Click::Cancel, Some(Modal::Reset(_))) => Click::Close, // the window's close button
+            (_, Some(Modal::Broken(_) | Modal::Reset(_))) => return vec![],
             (c, _) => c,
         };
         match c {
@@ -388,9 +559,21 @@ impl Settings {
                 self.commit(close)
             }
             Click::Back => {
-                self.modal = None;
+                self.modal = match self.modal.take() {
+                    Some(Modal::Reset(e)) => Some(Modal::Broken(e)),
+                    _ => None,
+                };
+                self.show_pending();
                 vec![]
             }
+            Click::ResetDefaults => {
+                if let Some(Modal::Broken(e)) = &self.modal {
+                    self.modal = Some(Modal::Reset(e.clone()));
+                }
+                vec![]
+            }
+            Click::Replace => self.reset(),
+            Click::Close => vec![Act::Close],
             Click::Browse => vec![Act::Browse],
             Click::OpenConfig => vec![Act::OpenConfig],
             Click::Restore => {
@@ -410,6 +593,9 @@ impl Settings {
     }
 
     fn save(&mut self, close: bool) -> Vec<Act> {
+        if self.disk().is_err() {
+            return vec![]; // never merged onto the defaults
+        }
         if self.needs_confirm() {
             self.modal = Some(Modal::Rewrite { close });
             return vec![];
@@ -419,10 +605,9 @@ impl Settings {
 
     /// Write the changed values onto the file as it is now.
     fn commit(&mut self, close: bool) -> Vec<Act> {
-        let onto = std::fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|t| config::parse_config(&t).ok())
-            .unwrap_or_else(|| self.loaded.clone());
+        // The file as it is now (it may have changed, or broken, since).
+        let Ok(onto) = self.disk() else { return vec![] };
+        let onto = onto.unwrap_or_else(|| self.loaded.clone());
         let cfg = self.form.apply(&self.loaded, &onto);
         if let Err(e) = config::save_at(&self.path, &cfg) {
             self.modal = Some(Modal::Error(format!("Could not save {}: {e}", self.path.display())));
@@ -430,6 +615,8 @@ impl Settings {
         }
         self.confirmed = true; // the file is ours now
         self.loaded = cfg.clone();
+        // The form shows what was saved (merged with the file, trimmed).
+        self.form = Form::new(&cfg, self.form.autostart);
         let mut acts = vec![Act::Saved(Box::new(cfg))];
         if let (Some(on), true) = (self.form.autostart, self.form.autostart != self.autostart) {
             match (self.set_autostart)(on) {
@@ -445,14 +632,41 @@ impl Settings {
         }
         acts
     }
+
+    /// The reset question's Replace: keep the broken file as
+    /// `config.toml.bak`, then write the defaults.
+    fn reset(&mut self) -> Vec<Act> {
+        let Some(Modal::Reset(_)) = &self.modal else { return vec![] };
+        let bak = backup_path(&self.path);
+        if self.path.exists()
+            && let Err(e) = std::fs::copy(&self.path, &bak)
+        {
+            self.modal = Some(Modal::Error(format!("Could not back up config.toml to {}: {e}", bak.display())));
+            return vec![];
+        }
+        let cfg = Config::default();
+        if let Err(e) = config::save_at(&self.path, &cfg) {
+            self.modal = Some(Modal::Error(format!("Could not save {}: {e}", self.path.display())));
+            return vec![];
+        }
+        self.modal = None;
+        self.confirmed = true;
+        self.stale = false;
+        self.form = Form::new(&cfg, self.form.autostart);
+        self.loaded = cfg.clone();
+        self.show_pending();
+        vec![Act::Saved(Box::new(cfg))]
+    }
 }
 
 // --- Drawing ----------------------------------------------------------------
 
-/// A form row: label column, then the controls `f` draws.
+/// A form row: label column, then the controls `f` draws, which start at
+/// `LABEL_W + GAP` whatever the tab's row gap.
 fn field(ui: &mut Ui, label: &str, f: impl FnOnce(&mut Ui)) {
     ui.row(|ui| {
-        ui.width(LABEL_W).label(label);
+        let w = LABEL_W + GAP - ui.lay.gap;
+        ui.width(w).label(label);
         f(ui);
     });
 }
@@ -473,40 +687,43 @@ fn paint(ui: &mut Ui, s: &mut Settings) -> Option<Click> {
         })
     });
     let btn_y = b.h - PAD - ROW;
-    let body = FRect { x: PAD, y: BODY_Y, w: inner, h: btn_y - 16.0 - BODY_Y };
-    match s.tab {
-        0 => general(ui, s, body),
-        1 => saving(ui, s, body, &mut click),
-        _ => shortcuts(ui, s, body, &mut click),
-    }
+    // A form that never saw the file (it did not parse) is not shown.
+    if !s.stale {
+        let body = FRect { x: PAD, y: BODY_Y, w: inner, h: btn_y - 16.0 - BODY_Y };
+        match s.tab {
+            0 => general(ui, s, body),
+            1 => saving(ui, s, body, &mut click),
+            _ => shortcuts(ui, s, body, &mut click),
+        }
 
-    // Bottom bar: the config-file link (General), then OK / Cancel / Apply.
-    let bar = FRect { x: PAD, y: btn_y, w: inner, h: ROW };
-    if s.tab == 0 {
+        // Bottom bar: the config-file link (General), then OK / Cancel / Apply.
+        let bar = FRect { x: PAD, y: btn_y, w: inner, h: ROW };
+        if s.tab == 0 {
+            ui.area(bar, |ui| {
+                ui.row(|ui| {
+                    if ui.link("open_config", "Open config file") {
+                        click = Some(Click::OpenConfig);
+                    }
+                })
+            });
+        }
+        let btns = [("ok", "OK", Click::Ok), ("cancel", "Cancel", Click::Cancel), ("apply", "Apply", Click::Apply)];
+        let total: f32 = btns.iter().map(|b| ui.button_width(b.1)).sum::<f32>() + GAP * (btns.len() as f32 - 1.0);
+        let dirty = s.dirty();
         ui.area(bar, |ui| {
             ui.row(|ui| {
-                if ui.link("open_config", "Open config file") {
-                    click = Some(Click::OpenConfig);
+                ui.space(inner - total);
+                let on = ui.enabled;
+                for (id, label, c) in btns {
+                    ui.enabled = on && (c != Click::Apply || dirty);
+                    if ui.button(id, label, c == Click::Ok) {
+                        click = Some(c);
+                    }
                 }
+                ui.enabled = on;
             })
         });
     }
-    let btns = [("ok", "OK", Click::Ok), ("cancel", "Cancel", Click::Cancel), ("apply", "Apply", Click::Apply)];
-    let total: f32 = btns.iter().map(|b| ui.button_width(b.1)).sum::<f32>() + GAP * (btns.len() as f32 - 1.0);
-    let dirty = s.dirty();
-    ui.area(bar, |ui| {
-        ui.row(|ui| {
-            ui.space(inner - total);
-            let on = ui.enabled;
-            for (id, label, c) in btns {
-                ui.enabled = on && (c != Click::Apply || dirty);
-                if ui.button(id, label, c == Click::Ok) {
-                    click = Some(c);
-                }
-            }
-            ui.enabled = on;
-        })
-    });
 
     if let Some(m) = modal {
         ui.enabled = true;
@@ -517,26 +734,38 @@ fn paint(ui: &mut Ui, s: &mut Settings) -> Option<Click> {
     click
 }
 
-/// The rewrite question or a save error, centred over the dimmed form.
+/// The question, error or broken-file state, centred over the dimmed form.
 fn question(ui: &mut Ui, m: &Modal) -> Option<Click> {
     let b = ui.bounds();
-    let (icon, text, btns): (&str, String, &[(&str, &str, Click)]) = match m {
+    type Btns = &'static [(&'static str, &'static str, Click)];
+    let (icon, text, btns): (&str, String, Btns) = match m {
         Modal::Rewrite { .. } => {
             ("info", REWRITE.into(), &[("q_save", "Save", Click::Save), ("q_cancel", "Cancel", Click::Back)])
         }
         Modal::Error(e) => ("alert", e.clone(), &[("q_ok", "OK", Click::Back)]),
+        Modal::Broken(e) => (
+            "alert",
+            broken_text(e),
+            &[
+                ("q_open", "Open config file", Click::OpenConfig),
+                ("q_reset", "Reset to defaults…", Click::ResetDefaults),
+                ("q_close", "Close", Click::Close),
+            ],
+        ),
+        Modal::Reset(_) => ("alert", RESET.into(), &[("q_replace", "Replace", Click::Replace), ("q_cancel", "Cancel", Click::Back)]),
     };
-    let (cw, cp, icon_w) = (420.0f32, 24.0f32, 24.0 + 12.0);
+    let (cp, icon_w) = (24.0f32, 24.0 + 12.0);
+    let total: f32 = btns.iter().map(|b| ui.button_width(b.1)).sum::<f32>() + GAP * (btns.len() as f32 - 1.0);
+    let cw = (total + 2.0 * cp).max(420.0);
     let text_w = cw - 2.0 * cp - icon_w;
     let th = ui.paragraph_height(&text, text_w).clamp(24.0, 160.0);
     let ch = cp + th + 24.0 + ROW + cp;
     let card = FRect { x: ((b.w - cw) / 2.0).round(), y: ((b.h - ch) / 2.0).round(), w: cw, h: ch };
     ui.modal_card(card);
-    let col = if matches!(m, Modal::Error(_)) { ui.theme.error } else { ui.theme.accent_fg };
+    let col = if matches!(m, Modal::Rewrite { .. }) { ui.theme.accent_fg } else { ui.theme.error };
     ui.area(FRect { x: card.x + cp, y: card.y + cp, w: 24.0, h: 24.0 }, |ui| ui.icon(icon, 24.0, col));
     let tr = FRect { x: card.x + cp + icon_w, y: card.y + cp + if th <= 24.0 { 2.0 } else { 0.0 }, w: text_w, h: th };
     ui.area(tr, |ui| ui.height(th).paragraph(&text, false));
-    let total: f32 = btns.iter().map(|b| ui.button_width(b.1)).sum::<f32>() + GAP * (btns.len() as f32 - 1.0);
     let bar = FRect { x: card.x + cp, y: card.y1() - cp - ROW, w: cw - 2.0 * cp, h: ROW };
     let mut click = None;
     ui.area(bar, |ui| {
@@ -555,7 +784,11 @@ fn question(ui: &mut Ui, m: &Modal) -> Option<Click> {
 fn general(ui: &mut Ui, s: &mut Settings, body: FRect) {
     let show_renderer = s.renderer;
     let f = &mut s.form;
+    let note = f.hotkey_note();
     ui.area(body, |ui| {
+        // Spread out over the tab (less so when the hotkey note needs a row).
+        let roomy = note.is_none();
+        ui.lay.gap = if roomy { 12.0 } else { 8.0 };
         ui.heading("Appearance");
         field(ui, "Theme", |ui| {
             ui.dropdown("theme", &labels(&THEMES), &mut f.theme);
@@ -565,6 +798,9 @@ fn general(ui: &mut Ui, s: &mut Settings, body: FRect) {
                 ui.dropdown("renderer", &labels(&RENDERERS), &mut f.renderer);
                 ui.note(if f.renderer == 0 { "Uses the least memory" } else { "Composes every frame in memory" });
             });
+        }
+        if roomy {
+            ui.space(6.0);
         }
         ui.heading("Startup and updates");
         if let Some(on) = f.autostart.as_mut() {
@@ -576,6 +812,9 @@ fn general(ui: &mut Ui, s: &mut Settings, body: FRect) {
             ui.toggle("check_updates", &mut f.check_updates);
             ui.note("Once a day, from GitHub");
         });
+        if roomy {
+            ui.space(6.0);
+        }
         ui.heading("Global hotkeys");
         ui.allow_meta = true;
         field(ui, "Capture", |ui| {
@@ -584,7 +823,7 @@ fn general(ui: &mut Ui, s: &mut Settings, body: FRect) {
         field(ui, "Quit Rustshot", |ui| {
             ui.key_capture("quit_hotkey", &mut f.quit);
         });
-        if let Some(n) = f.hotkey_note() {
+        if let Some(n) = note {
             ui.row(|ui| {
                 ui.space(LABEL_W + GAP);
                 ui.error_note(n);
@@ -596,6 +835,10 @@ fn general(ui: &mut Ui, s: &mut Settings, body: FRect) {
 
 fn saving(ui: &mut Ui, s: &mut Settings, body: FRect, click: &mut Option<Click>) {
     let base = s.loaded.clone();
+    if s.folder_note.0 != s.form.folder.text {
+        s.folder_note = (s.form.folder.text.clone(), s.form.folder_note());
+    }
+    let folder_note = s.folder_note.1.clone();
     let f = &mut s.form;
     let mut target = s.pattern;
     let mut token = None;
@@ -603,11 +846,18 @@ fn saving(ui: &mut Ui, s: &mut Settings, body: FRect, click: &mut Option<Click>)
         ui.lay.gap = 6.0;
         field(ui, "Folder", |ui| {
             let bw = ui.button_width("Browse…");
-            ui.width(body.w - LABEL_W - bw - 2.0 * GAP).text_field("folder", &mut f.folder);
+            let fw = body.w - (LABEL_W + GAP) - bw - ui.lay.gap;
+            ui.width(fw).text_field("folder", &mut f.folder);
             if ui.button("browse", "Browse…", false) {
                 *click = Some(Click::Browse);
             }
         });
+        if let Some(n) = &folder_note {
+            ui.row(|ui| {
+                ui.space(LABEL_W + GAP);
+                ui.height(18.0).note(n);
+            });
+        }
         field(ui, "Daily subfolders", |ui| {
             ui.toggle("subfolder", &mut f.subfolder);
             ui.space(4.0);
@@ -630,17 +880,18 @@ fn saving(ui: &mut Ui, s: &mut Settings, body: FRect, click: &mut Option<Click>)
             ui.note("Ctrl+S always shows the Save As dialog");
         });
         ui.heading("File name");
-        ui.space(2.0);
         let gy = ui.cursor_y();
-        let (col_w, tb_h, tb_gap) = (150.0f32, 22.0f32, 3.0f32);
+        // Three balanced columns of compact buttons (top to bottom).
+        let col_w = token_col_w(ui);
         for (i, (label, _)) in TOKENS.iter().enumerate() {
             let (c, r) = ((i / TOKEN_ROWS) as f32, (i % TOKEN_ROWS) as f32);
-            let rect = FRect { x: body.x + c * (col_w + 6.0), y: gy + r * (tb_h + tb_gap), w: col_w, h: tb_h };
+            let rect = FRect { x: body.x + c * (col_w + TOKEN_GAP), y: gy + r * (TOKEN_H + TOKEN_GAP), w: col_w, h: TOKEN_H };
             if ui.place(rect).button(&format!("token{i}"), label, false) {
                 token = Some(i);
             }
         }
-        let rx = body.x + 2.0 * col_w + 6.0 + 20.0;
+        let cols = TOKENS.len().div_ceil(TOKEN_ROWS) as f32;
+        let rx = body.x + cols * col_w + (cols - 1.0) * TOKEN_GAP + 16.0;
         let right = FRect { x: rx, y: gy, w: body.x1() - rx, h: body.y1() - gy };
         ui.area(right, |ui| {
             ui.lay.gap = 6.0;
@@ -650,12 +901,12 @@ fn saving(ui: &mut Ui, s: &mut Settings, body: FRect, click: &mut Option<Click>)
             let w = ui.bounds().w;
             let lines = path_lines(ui, &path, w);
             ui.paragraph(&lines, true);
-            ui.space(4.0);
             ui.row(|ui| {
-                if ui.button("restore", "Restore", false) {
+                let bw = ((right.w - GAP) / 2.0).floor();
+                if ui.width(bw).button("restore", "Restore", false) {
                     *click = Some(Click::Restore);
                 }
-                if ui.button("clear", "Clear", false) {
+                if ui.width(bw).button("clear", "Clear", false) {
                     *click = Some(Click::Clear);
                 }
             });
@@ -674,6 +925,11 @@ fn saving(ui: &mut Ui, s: &mut Settings, body: FRect, click: &mut Option<Click>)
         ui.focus.focus(if target == Pattern::Sub { "subfolder_pattern" } else { "filename" });
     }
     s.pattern = target;
+}
+
+/// Width of a token button column: the widest label plus a little room.
+fn token_col_w(ui: &Ui) -> f32 {
+    TOKENS.iter().map(|(l, _)| ui.text_width(l)).fold(0.0, f32::max).ceil() + 16.0
 }
 
 /// `path` broken into lines of at most `w` (logical px) after its
@@ -699,6 +955,14 @@ fn shortcuts(ui: &mut Ui, s: &mut Settings, body: FRect, click: &mut Option<Clic
     let cols = [Col { title: "Description", frac: 0.62 }, Col { title: "Key", frac: 0.38 }];
     let note_h = if note.is_some() { 20.0 + GAP } else { 0.0 };
     let table_h = body.h - ROW - GAP - note_h;
+    // A new conflict: scroll its first row into view.
+    let first_bad = rows.iter().position(|r| r.2);
+    if first_bad != s.conflict_row {
+        if let Some(i) = first_bad {
+            s.table.reveal(i, table_h);
+        }
+        s.conflict_row = first_bad;
+    }
     let mut record = false;
     ui.area(body, |ui| {
         ui.height(table_h).table("shortcuts", &cols, &trows, &mut s.table);
@@ -709,7 +973,7 @@ fn shortcuts(ui: &mut Ui, s: &mut Settings, body: FRect, click: &mut Option<Clic
         ui.row(|ui| match s.table.selected {
             Some(i) => {
                 let a = Action::ALL[i];
-                ui.width(180.0).label(&format!("{}:", a.label()));
+                ui.width(LABEL_W + GAP - ui.lay.gap).label(a.label());
                 let mut c = s.form.keys.chords(a).first().copied();
                 if ui.key_capture("rebind", &mut c) {
                     s.form.keys.set(a, c.into_iter().collect());
@@ -732,8 +996,16 @@ fn shortcuts(ui: &mut Ui, s: &mut Settings, body: FRect, click: &mut Option<Clic
 
 // --- Window -----------------------------------------------------------------
 
-/// The open window's inbox (a request raises it), if any.
-static OPEN: Mutex<Option<Sender<()>>> = Mutex::new(None);
+/// What the open window is told from other threads.
+enum Msg {
+    /// Come to the front (another request to open it).
+    Raise,
+    /// Show this to the user ([`notify`]).
+    Note(String),
+}
+
+/// The open window's inbox, if any.
+static OPEN: Mutex<Option<Sender<Msg>>> = Mutex::new(None);
 /// The daemon's event sender: told to reload after a save.
 static DAEMON: Mutex<Option<Sender<HotEvent>>> = Mutex::new(None);
 
@@ -746,10 +1018,16 @@ pub fn set_daemon(tx: Sender<HotEvent>) {
     *lock(&DAEMON) = Some(tx);
 }
 
+/// Show `text` in the open Settings window (over the form, with OK);
+/// false when no window is open (the caller tells the user some other way).
+pub fn notify(text: &str) -> bool {
+    lock(&OPEN).as_ref().is_some_and(|tx| tx.send(Msg::Note(text.to_string())).is_ok())
+}
+
 /// Open the window on its own thread, or bring the open one to the front.
 pub fn show() {
     #[cfg(target_os = "macos")]
-    crate::actions::open_config();
+    std::thread::spawn(crate::actions::open_config); // never block the caller
     #[cfg(not(target_os = "macos"))]
     if let Some(rx) = claim() {
         std::thread::spawn(move || run(rx));
@@ -769,10 +1047,10 @@ pub fn run_here() {
 
 /// Take the single-window slot; `None` (and the open window raised) when
 /// a window is already open.
-fn claim() -> Option<Receiver<()>> {
+fn claim() -> Option<Receiver<Msg>> {
     let mut open = lock(&OPEN);
     if let Some(tx) = open.as_ref()
-        && tx.send(()).is_ok()
+        && tx.send(Msg::Raise).is_ok()
     {
         return None;
     }
@@ -781,19 +1059,30 @@ fn claim() -> Option<Receiver<()>> {
     Some(rx)
 }
 
-fn run(rx: Receiver<()>) {
-    let cfg = config::load();
-    let th = crate::theme::resolve(&cfg);
+fn run(rx: Receiver<Msg>) {
     let autostart = crate::update::managed_install().is_none().then(crate::autostart::is_enabled);
-    let mut w = Window::new(Settings::new(cfg, autostart, config::config_path()), th, rx);
+    let s = Settings::open(config::config_path(), autostart);
+    let th = crate::theme::resolve(&s.loaded);
+    let mut w = Window::new(s, th, rx);
     let spec = WindowSpec { title: "Rustshot Settings".into(), w: W, h: H, resizable: false, min: (W, H) };
     if let Err(e) = wind::run_window(spec, &mut w) {
         eprintln!("rustshot: settings window: {e:#}");
     }
     let mut open = lock(&OPEN);
-    let late = w.rx.try_iter().count() > 0;
+    let mut late = false;
+    let mut notes = Vec::new();
+    for m in w.rx.try_iter() {
+        match m {
+            Msg::Raise => late = true,
+            Msg::Note(t) => notes.push(t),
+        }
+    }
     *open = None;
     drop(open);
+    // Told while closing (OK saves, then closes): the tray says it instead.
+    for t in notes {
+        crate::tray::notify(&t);
+    }
     if late {
         show(); // a request raced the close
     }
@@ -809,8 +1098,10 @@ struct Window {
     focus: FocusState,
     canvas: PixBuf,
     out: PixBuf,
-    /// Requests to come to the front.
-    rx: Receiver<()>,
+    /// Requests to come to the front, and messages.
+    rx: Receiver<Msg>,
+    /// When the broken file was last read again.
+    rechecked: std::time::Instant,
     /// The folder picker's answer (it runs on its own thread).
     picked: (Sender<Option<PathBuf>>, Receiver<Option<PathBuf>>),
     picking: bool,
@@ -818,7 +1109,7 @@ struct Window {
 }
 
 impl Window {
-    fn new(s: Settings, th: Theme, rx: Receiver<()>) -> Window {
+    fn new(s: Settings, th: Theme, rx: Receiver<Msg>) -> Window {
         Window {
             hwnd: Hwnd::default(),
             s,
@@ -828,6 +1119,7 @@ impl Window {
             canvas: PixBuf::default(),
             out: PixBuf::default(),
             rx,
+            rechecked: std::time::Instant::now(),
             picked: std::sync::mpsc::channel(),
             picking: false,
             closing: false,
@@ -952,9 +1244,27 @@ impl Driver for Window {
             }
             Ev::Timer => {
                 let mut changed = false;
-                if self.rx.try_iter().count() > 0 {
+                let mut raise = false;
+                while let Ok(m) = self.rx.try_recv() {
+                    match m {
+                        Msg::Raise => raise = true,
+                        Msg::Note(t) => {
+                            self.s.notify(t);
+                            changed = true;
+                        }
+                    }
+                }
+                if raise {
                     #[cfg(windows)]
                     wind::raise(self.hwnd);
+                }
+                // The broken file fixed in an editor: the window works again.
+                if self.s.broken() && self.rechecked.elapsed() >= std::time::Duration::from_millis(500) {
+                    self.rechecked = std::time::Instant::now();
+                    if self.s.recheck() {
+                        self.th = crate::theme::resolve(&self.s.loaded);
+                        changed = true;
+                    }
                 }
                 while let Ok(p) = self.picked.1.try_recv() {
                     self.picking = false;
