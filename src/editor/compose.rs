@@ -303,12 +303,25 @@ pub(super) fn backdrop_rect(
     order: Order,
 ) {
     let stride = r.w() as usize;
+    for (q, src) in backdrop_runs(sel, size, alpha, r) {
+        let off = ((q.y0 - r.y0) as usize * stride + (q.x0 - r.x0) as usize) * 4;
+        bd.fill(q, src, &mut out[off..], stride, order);
+    }
+}
+
+/// Rect `r` split into disjoint runs that each show one [`Source`]: bands
+/// of rows crossed by the same dim spans, cut where the dim depth changes.
+/// A handful of runs per rect (the GDI overlay blits each one).
+pub(super) fn backdrop_runs(sel: Option<FRect>, size: (u32, u32), alpha: u8, r: PxRect) -> Vec<(PxRect, Source)> {
+    if r.is_empty() {
+        return Vec::new();
+    }
     let spans = if alpha == 0 { Vec::new() } else { dim_spans(sel, size) };
     let spans: Vec<PxRect> = spans.into_iter().filter(|s| s.intersects(&r)).collect();
     if spans.is_empty() {
-        bd.fill(r, Source::Plain, out, stride, order);
-        return;
+        return vec![(r, Source::Plain)];
     }
+    let mut runs = Vec::new();
     let mut ys = vec![r.y0, r.y1];
     for s in &spans {
         ys.extend([s.y0, s.y1].into_iter().filter(|&y| y > r.y0 && y < r.y1));
@@ -332,13 +345,42 @@ pub(super) fn backdrop_rect(
                 } else {
                     Source::Dimmed { alpha, times: depth as u8 }
                 };
-                let off = ((ya - r.y0) as usize * stride + (x - r.x0) as usize) * 4;
-                bd.fill(PxRect::new(x, ya, ex, yb), src, &mut out[off..], stride, order);
+                runs.push((PxRect::new(x, ya, ex, yb), src));
                 x = ex;
             }
             depth += de;
         }
     }
+    runs
+}
+
+/// Coalesce rects: two merge when their bounding box is no larger than
+/// the two areas summed (so merging never paints more). Order-insensitive
+/// enough for invalidation; the result covers every input rect.
+pub fn merge_rects(mut v: Vec<PxRect>) -> Vec<PxRect> {
+    v.retain(|r| !r.is_empty());
+    let area = |r: &PxRect| r.w() as i64 * r.h() as i64;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut i = 0;
+        while i < v.len() {
+            let mut j = i + 1;
+            while j < v.len() {
+                let (a, b) = (v[i], v[j]);
+                let u = PxRect::new(a.x0.min(b.x0), a.y0.min(b.y0), a.x1.max(b.x1), a.y1.max(b.y1));
+                if b.contains(&a) || a.contains(&b) || area(&u) <= area(&a) + area(&b) {
+                    v[i] = u;
+                    v.swap_remove(j);
+                    changed = true;
+                } else {
+                    j += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+    v
 }
 
 fn px_bounds(r: FRect) -> PxRect {

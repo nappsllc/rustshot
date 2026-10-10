@@ -96,48 +96,62 @@ fn union_rect(mons: &[MonInfo]) -> (i32, i32, u32, u32) {
     (min_x, min_y, (max_x - min_x) as u32, (max_y - min_y) as u32)
 }
 
-/// Capture a single monitor.
-pub fn grab_monitor(index: usize) -> Result<Shot> {
-    let mons = monitors()?;
+/// Geometry of a single monitor's shot (no pixels yet).
+fn monitor_geom(mons: &[MonInfo], index: usize) -> Result<Shot> {
     let m = mons
         .get(index)
         .ok_or_else(|| anyhow!("monitor index {index} out of range"))?;
-    let image = gdi_capture(m.x, m.y, m.w, m.h)?;
     Ok(Shot {
         origin: (m.x, m.y),
         size: (m.w, m.h),
         scale: m.scale,
-        image,
+        image: PixBuf::default(),
         monitors: vec![(0, 0, m.w, m.h)],
     })
 }
 
-/// Capture the whole virtual desktop (all monitors composited).
-/// Only valid when all monitors share one scale factor (caller checks).
-pub fn grab_span(mons: &[MonInfo]) -> Result<Shot> {
+/// Geometry of the whole virtual desktop's shot (no pixels yet).
+fn span_geom(mons: &[MonInfo]) -> Shot {
     let (ox, oy, w, h) = union_rect(mons);
     let scale =
         uniform_scale(mons).unwrap_or_else(|| mons.first().map(|m| m.scale).unwrap_or(1.0));
-    let image = gdi_capture(ox, oy, w, h)?;
-    Ok(Shot {
+    Shot {
         origin: (ox, oy),
         size: (w, h),
         scale,
-        image,
+        image: PixBuf::default(),
         monitors: monitors_in_shot(mons, (ox, oy), (w, h)),
-    })
+    }
 }
 
-/// Decide what the interactive editor should capture:
-/// a specific monitor, the monitor under the cursor, or the full span.
-pub fn grab_edit(screen: Option<u32>, active_monitor_only: bool) -> Result<Shot> {
+/// Fill a geometry-only shot with the screen pixels.
+fn grab_into(mut shot: Shot) -> Result<Shot> {
+    shot.image = gdi_capture(shot.origin.0, shot.origin.1, shot.size.0, shot.size.1)?;
+    Ok(shot)
+}
+
+/// Capture a single monitor.
+pub fn grab_monitor(index: usize) -> Result<Shot> {
+    grab_into(monitor_geom(&monitors()?, index)?)
+}
+
+/// What the interactive editor should capture: a specific monitor, the
+/// monitor under the cursor, or the full span (only when all monitors
+/// share one scale factor). Geometry only: `image` stays empty, so a
+/// backend can capture the pixels itself (the Windows GDI overlay).
+pub fn plan_edit(screen: Option<u32>, active_monitor_only: bool) -> Result<Shot> {
     let mons = monitors()?;
     let span_ok = uniform_scale(&mons).is_some() && !active_monitor_only;
     match screen {
-        Some(n) => grab_monitor(n as usize),
-        None if span_ok => grab_span(&mons),
-        None => grab_monitor(monitor_at_cursor(&mons)),
+        Some(n) => monitor_geom(&mons, n as usize),
+        None if span_ok => Ok(span_geom(&mons)),
+        None => monitor_geom(&mons, monitor_at_cursor(&mons)),
     }
+}
+
+/// `plan_edit` plus the pixels.
+pub fn grab_edit(screen: Option<u32>, active_monitor_only: bool) -> Result<Shot> {
+    grab_into(plan_edit(screen, active_monitor_only)?)
 }
 
 /// Global rect (virtual-screen physical) of a monitor or `all`.

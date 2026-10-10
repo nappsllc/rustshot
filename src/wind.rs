@@ -93,6 +93,19 @@ pub trait Driver {
     /// present each returned frame at most once (every paint path calls
     /// `frame()` first), so its contents after presenting are dead.
     fn frame(&mut self) -> Option<&mut PixBuf>;
+    /// What to repaint for the current state, asked wherever a repaint is
+    /// requested: rects `[x0, y0, x1, y1]` (client coordinates, end
+    /// exclusive; empty = nothing changed), or `None` for the whole window
+    /// (the software renderer).
+    fn damage(&mut self) -> Option<Vec<[i32; 4]>> {
+        None
+    }
+    /// Windows GDI renderer: paint `rects` of the window into `hdc`
+    /// directly. `false` = not handled (present `frame()` instead).
+    #[cfg(windows)]
+    fn paint(&mut self, _hdc: windows::Win32::Graphics::Gdi::HDC, _rects: &[[i32; 4]]) -> bool {
+        false
+    }
     /// Cursor for WM_SETCURSOR.
     fn cursor(&self) -> Cursor;
     /// Window is being destroyed (loop ends after this).
@@ -130,6 +143,21 @@ mod imp;
 mod imp;
 
 pub use imp::*;
+
+/// Request a repaint of whatever `drv` reports as damaged.
+pub fn request(hwnd: Hwnd, drv: &mut dyn Driver) {
+    match drv.damage() {
+        None => invalidate(hwnd),
+        #[cfg(windows)]
+        Some(rects) => imp::invalidate_rects(hwnd, &rects),
+        #[cfg(not(windows))]
+        Some(rects) => {
+            if !rects.is_empty() {
+                invalidate(hwnd)
+            }
+        }
+    }
+}
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

@@ -135,6 +135,7 @@ quit_hotkey = "Ctrl+Alt+Shift+Q"
 copy_url_after_upload = true
 capture_active_monitor = false    # true = only the monitor under the cursor
 check_updates = true              # daemon checks GitHub once a day
+renderer = "gdi"                  # Windows overlay: "gdi" (low memory) or "software"; ignored elsewhere
 upload_client_id = "313baf0c7b4d3ff"
 ```
 

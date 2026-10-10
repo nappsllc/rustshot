@@ -4,10 +4,11 @@
 use super::*;
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, EndPaint,
-    InvalidateRect, PAINTSTRUCT, ScreenToClient, SRCCOPY, StretchDIBits,
+    BeginPaint, CreateRectRgn, DeleteObject, EndPaint, GetRegionData, GetUpdateRgn,
+    InvalidateRect, ScreenToClient, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS, PAINTSTRUCT, RGNDATA, RGNDATAHEADER, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
@@ -67,6 +68,49 @@ pub fn invalidate(hwnd: HWND) {
     }
 }
 
+/// Invalidate rects `[x0, y0, x1, y1]` of the client area (no erase).
+pub fn invalidate_rects(hwnd: HWND, rects: &[[i32; 4]]) {
+    for r in rects {
+        let rc = RECT { left: r[0], top: r[1], right: r[2], bottom: r[3] };
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), Some(&rc), false);
+        }
+    }
+}
+
+/// The update region as rects (before `BeginPaint` validates it); its
+/// bounding box when it has many pieces.
+unsafe fn update_rects(hwnd: HWND) -> Vec<[i32; 4]> {
+    unsafe {
+        let rgn = CreateRectRgn(0, 0, 0, 0);
+        let mut out = Vec::new();
+        // 0 = ERROR, 1 = NULLREGION: nothing to read.
+        if GetUpdateRgn(hwnd, rgn, false).0 > 1 {
+            let n = GetRegionData(rgn, 0, None);
+            if n as usize >= std::mem::size_of::<RGNDATAHEADER>() {
+                // u64 storage keeps the RECTs after the header aligned.
+                let mut buf = vec![0u64; (n as usize).div_ceil(8)];
+                let data = buf.as_mut_ptr() as *mut RGNDATA;
+                if GetRegionData(rgn, n, Some(data)) != 0 {
+                    let hdr = &(*data).rdh;
+                    let rects = std::slice::from_raw_parts(
+                        (*data).Buffer.as_ptr() as *const RECT,
+                        hdr.nCount as usize,
+                    );
+                    if rects.len() > 32 {
+                        let b = hdr.rcBound;
+                        out.push([b.left, b.top, b.right, b.bottom]);
+                    } else {
+                        out.extend(rects.iter().map(|r| [r.left, r.top, r.right, r.bottom]));
+                    }
+                }
+            }
+        }
+        let _ = DeleteObject(rgn.into());
+        out
+    }
+}
+
 /// Re-arm the window timer (same id replaces the old interval).
 pub fn retime(hwnd: HWND, ms: u64) {
     if hwnd.is_invalid() {
@@ -110,7 +154,7 @@ unsafe extern "system" fn wndproc(
                     x: x_of(lp),
                     y: y_of(lp),
                 });
-                invalidate(hwnd);
+                request(hwnd, drv);
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
@@ -119,7 +163,7 @@ unsafe extern "system" fn wndproc(
                     x: x_of(lp),
                     y: y_of(lp),
                 });
-                invalidate(hwnd);
+                request(hwnd, drv);
                 LRESULT(0)
             }
             WM_MOUSEWHEEL => {
@@ -134,7 +178,7 @@ unsafe extern "system" fn wndproc(
                     x: pt.x,
                     y: pt.y,
                 });
-                invalidate(hwnd);
+                request(hwnd, drv);
                 LRESULT(0)
             }
             WM_KEYDOWN | WM_KEYUP => {
@@ -145,25 +189,30 @@ unsafe extern "system" fn wndproc(
                     repeat,
                     mods: Mods::current(),
                 });
-                invalidate(hwnd);
+                request(hwnd, drv);
                 LRESULT(0)
             }
             WM_CHAR => {
                 drv.on_event(Ev::Char(wp.0 as u16));
-                invalidate(hwnd);
+                request(hwnd, drv);
                 LRESULT(0)
             }
             WM_TIMER => {
                 // Idle ticks (nothing animating) cost no frame.
                 if drv.on_event(Ev::Timer) {
-                    invalidate(hwnd);
+                    request(hwnd, drv);
                 }
                 LRESULT(0)
             }
             WM_PAINT => {
+                let rects = update_rects(hwnd);
                 let mut ps: PAINTSTRUCT = std::mem::zeroed();
                 let hdc = BeginPaint(hwnd, &mut ps);
-                if let Some(fb) = drv.frame() {
+                let rc = ps.rcPaint;
+                let rects = if rects.is_empty() { vec![[rc.left, rc.top, rc.right, rc.bottom]] } else { rects };
+                if !drv.paint(hdc, &rects)
+                    && let Some(fb) = drv.frame()
+                {
                     present(hdc, fb);
                 }
                 let _ = EndPaint(hwnd, &ps);

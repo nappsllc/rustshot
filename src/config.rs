@@ -36,6 +36,10 @@ pub struct Config {
     pub capture_active_monitor: bool,
     /// Let the daemon check GitHub for a newer release once a day.
     pub check_updates: bool,
+    /// Overlay renderer on Windows: "gdi" (screenshot kept in GDI bitmaps,
+    /// only changed rects repainted; the default) or "software" (whole
+    /// frame composed in memory). Linux/macOS always use software.
+    pub renderer: String,
 }
 
 impl Default for Config {
@@ -65,7 +69,17 @@ impl Default for Config {
             copy_url_after_upload: true,
             capture_active_monitor: false,
             check_updates: true,
+            renderer: "gdi".into(),
         }
+    }
+}
+
+impl Config {
+    /// Whether captures use the GDI overlay renderer: Windows only, and
+    /// any value but "software" (unknown values fall back to gdi).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn use_gdi(&self) -> bool {
+        cfg!(windows) && !self.renderer.trim().eq_ignore_ascii_case("software")
     }
 }
 
@@ -200,6 +214,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
             "check_updates" => {
                 cfg.check_updates = as_bool(val).map_err(|e| bad("boolean", &e))?
             }
+            "renderer" => cfg.renderer = as_string(val).map_err(|e| bad("string", &e))?,
             _ => {} // unknown keys are ignored, as with serde's default
         }
     }
@@ -230,7 +245,8 @@ pub fn to_toml(c: &Config) -> String {
          upload_client_id = {}\n\
          copy_url_after_upload = {}\n\
          capture_active_monitor = {}\n\
-         check_updates = {}\n",
+         check_updates = {}\n\
+         renderer = {}\n",
         q(&c.save_path),
         q(&c.filename_pattern),
         q(&c.ui_color),
@@ -249,6 +265,7 @@ pub fn to_toml(c: &Config) -> String {
         c.copy_url_after_upload,
         c.capture_active_monitor,
         c.check_updates,
+        q(&c.renderer),
     )
 }
 
@@ -412,6 +429,13 @@ mod tests {
         assert!(back.check_updates);
         let off = to_toml(&Config { check_updates: false, ..Config::default() });
         assert!(!parse_config(&off).unwrap().check_updates);
+        assert_eq!(back.renderer, "gdi");
+        let sw = to_toml(&Config { renderer: "software".into(), ..Config::default() });
+        assert_eq!(parse_config(&sw).unwrap().renderer, "software");
+        assert!(!parse_config(&sw).unwrap().use_gdi());
+        assert_eq!(back.use_gdi(), cfg!(windows));
+        let odd = Config { renderer: "vulkan".into(), ..Config::default() };
+        assert_eq!(odd.use_gdi(), cfg!(windows), "unknown values fall back to gdi");
     }
 
     #[test]

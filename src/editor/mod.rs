@@ -22,6 +22,13 @@ use std::time::{Duration, Instant};
 mod toolbar;
 mod chrome;
 mod compose;
+#[cfg(windows)]
+mod gdi;
+/// Linux/macOS: no GDI backend (`Edit::gdi` is always `None`).
+#[cfg(not(windows))]
+mod gdi {
+    pub struct GdiScreen;
+}
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -280,10 +287,11 @@ impl App {
                     if edit.notice.as_ref().is_some_and(|t| t.expired(Instant::now())) {
                         edit.notice = None;
                     }
-                    if had && edit.notice.is_none() {
-                        wind::invalidate(self.hwnd);
-                    }
+                    let cleared = had && edit.notice.is_none();
                     self.st = State::Edit(Box::new(edit));
+                    if cleared {
+                        self.repaint();
+                    }
                     break;
                 }
             }
@@ -336,7 +344,8 @@ impl App {
         let tasks = std::mem::take(&mut pending.tasks);
         let accept_on_select = pending.accept_on_select;
 
-        let shot = match capture::grab_edit(screen, cfg.capture_active_monitor) {
+        let th = theme::resolve(&cfg);
+        let (shot, gdi) = match grab(&cfg, &th, screen) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("error: capture failed: {e:#}");
@@ -363,7 +372,6 @@ impl App {
         let base = std::mem::take(&mut shot.image);
         let sel = initial_sel.filter(|r| !r.is_trivial());
         let accept_now = accept_on_select && sel.is_some();
-        let th = theme::resolve(&cfg);
         let mut edit = Edit {
             mo: Motion::new(Instant::now()),
             shot,
@@ -371,6 +379,8 @@ impl App {
             composed: None,
             frame: PixBuf::default(),
             scene: None,
+            painted: None,
+            gdi,
             caret_drawn: None,
             toast_drawn: None,
             area_drawn: None,
@@ -459,7 +469,9 @@ impl App {
             w: edit.shot.size.0 as f32,
             h: edit.shot.size.1 as f32,
         });
-        let img = crop_to_image(edit.composed(), sel);
+        #[cfg(windows)]
+        crate::memlog("overlay");
+        let img = edit.export(sel);
         let g = (
             (sel.x.round() as i32) + edit.shot.origin.0,
             (sel.y.round() as i32) + edit.shot.origin.1,
@@ -953,6 +965,15 @@ impl App {
     }
 }
 
+impl App {
+    /// Ask for a repaint of what changed (GDI: the dirty rects; software:
+    /// the whole window).
+    fn repaint(&mut self) {
+        let h = self.hwnd;
+        wind::request(h, self);
+    }
+}
+
 impl Driver for App {
     fn on_create(&mut self, hwnd: Hwnd) {
         self.hwnd = hwnd;
@@ -967,7 +988,7 @@ impl Driver for App {
                     matches!(&self.st, State::Edit(e) if !matches!(e.interact, Interact::None));
                 if dragging {
                     self.pointer_move(x, y);
-                    wind::invalidate(self.hwnd);
+                    self.repaint();
                 } else if let State::Edit(e) = &mut self.st {
                     let p = Pt::new(x as f32, y as f32);
                     // Chrome follows the monitor under the pointer when
@@ -975,7 +996,7 @@ impl Driver for App {
                     let area_moved =
                         e.area_drawn.is_some_and(|a| a != pick_area(&e.shot.monitors, e.sel, p));
                     if e.track_hover(p) || area_moved {
-                        wind::invalidate(self.hwnd);
+                        self.repaint();
                     }
                 }
             }
@@ -1008,6 +1029,9 @@ impl Driver for App {
     fn frame(&mut self) -> Option<&mut PixBuf> {
         let State::Edit(edit) = &mut self.st else { return None };
         let edit: &mut Edit = edit;
+        if edit.gdi.is_some() {
+            return None; // painted by `paint`
+        }
         let now = Instant::now();
         edit.prepare(self.notice.as_ref(), self.mouse, now);
         // Borrowed out of `edit` while composing, put back below;
@@ -1022,6 +1046,42 @@ impl Driver for App {
         wind::set_fast_timer(self.hwnd, animating(edit, self.notice.as_ref(), now));
         edit.frame = img;
         Some(&mut edit.frame)
+    }
+
+    fn damage(&mut self) -> Option<Vec<[i32; 4]>> {
+        let State::Edit(edit) = &mut self.st else { return None };
+        let edit: &mut Edit = edit;
+        edit.gdi.as_ref()?;
+        let now = Instant::now();
+        edit.prepare(self.notice.as_ref(), self.mouse, now);
+        wind::set_fast_timer(self.hwnd, animating(edit, self.notice.as_ref(), now));
+        let rects = compose::merge_rects(edit.dirty_rects(edit.painted.as_ref()));
+        // The target state: every pixel that differs from it is invalid now.
+        edit.painted = edit.scene.clone();
+        if rects.len() > MAX_DAMAGE_RECTS {
+            return None;
+        }
+        Some(rects.into_iter().map(|r| [r.x0, r.y0, r.x1, r.y1]).collect())
+    }
+
+    #[cfg(windows)]
+    fn paint(&mut self, hdc: windows::Win32::Graphics::Gdi::HDC, rects: &[[i32; 4]]) -> bool {
+        let State::Edit(edit) = &mut self.st else { return false };
+        let edit: &mut Edit = edit;
+        if edit.gdi.is_none() {
+            return false;
+        }
+        if edit.scene.is_none() {
+            // A system paint before any damage (first show).
+            let now = Instant::now();
+            edit.prepare(self.notice.as_ref(), self.mouse, now);
+            wind::set_fast_timer(self.hwnd, animating(edit, self.notice.as_ref(), now));
+            edit.painted = edit.scene.clone();
+        }
+        let rects: Vec<compose::PxRect> =
+            rects.iter().map(|r| compose::PxRect::new(r[0], r[1], r[2], r[3])).collect();
+        edit.paint_gdi(hdc, &rects);
+        true
     }
 
     fn cursor(&self) -> Cursor {
@@ -1051,6 +1111,21 @@ impl Driver for App {
 // ---------------------------------------------------------------------------
 // The editor
 // ---------------------------------------------------------------------------
+
+/// Capture for the editor with the renderer from `cfg` (resolved once per
+/// capture): Windows `gdi` keeps the pixels in GDI bitmaps and leaves
+/// `shot.image` empty; `software` (and Linux/macOS) reads them into memory.
+fn grab(cfg: &Config, th: &Theme, screen: Option<u32>) -> anyhow::Result<(Shot, Option<gdi::GdiScreen>)> {
+    #[cfg(windows)]
+    if cfg.use_gdi() {
+        let shot = capture::plan_edit(screen, cfg.capture_active_monitor)?;
+        let dim = th.dim.with_alpha(th.dim_alpha(cfg.contrast_opacity));
+        let scr = gdi::GdiScreen::capture(shot.origin, shot.size, dim)?;
+        return Ok((shot, Some(scr)));
+    }
+    let _ = th;
+    Ok((capture::grab_edit(screen, cfg.capture_active_monitor)?, None))
+}
 
 /// Plain-letter tool shortcuts (Flameshot-style).
 fn tool_for_key(vk: u32) -> Option<Tool> {
@@ -1165,6 +1240,12 @@ struct Edit {
     frame: PixBuf,
     /// The last prepared frame state (`prepare`), drawn by `compose_rect`.
     scene: Option<compose::Scene>,
+    /// GDI renderer: the scene the window shows once the pending
+    /// invalidations are painted (what `dirty_rects` diffs against).
+    painted: Option<compose::Scene>,
+    /// GDI renderer (Windows, `renderer = "gdi"`): the capture as GDI
+    /// bitmaps; `base` then stays empty and `composed` unused.
+    gdi: Option<gdi::GdiScreen>,
     /// Caret blink phase in the last frame (None: no text draft).
     caret_drawn: Option<bool>,
     /// `at` of the toast drawn in the last frame (None: no toast).
@@ -1203,16 +1284,34 @@ struct Edit {
     hot_handle: Option<usize>,
 }
 
+/// More merged dirty rects than this invalidate the whole window.
+const MAX_DAMAGE_RECTS: usize = 16;
+
 const HANDLE_HIT: f32 = 10.0; // handle hit radius, logical px (20 px target)
 const CLICK_PX: f32 = 2.5; // movement below this counts as a click
 
 impl Edit {
+    /// The selection crop (`sel` in image coords) to export, objects
+    /// baked in.
+    fn export(&self, sel: FRect) -> PixBuf {
+        #[cfg(windows)]
+        if self.gdi.is_some() {
+            return self.export_gdi(sel);
+        }
+        crop_to_image(self.composed(), sel)
+    }
+
     /// The capture with committed objects baked in.
     fn composed(&self) -> &PixBuf {
         self.composed.as_ref().unwrap_or(&self.base)
     }
 
     fn rebuild(&mut self) {
+        if self.gdi.is_some() {
+            // Objects are rendered from the bitmaps where they are needed.
+            self.dirty = false;
+            return;
+        }
         if self.objects.is_empty() {
             // Nothing to bake (e.g. undid the last object): drop the copy.
             self.composed = None;
@@ -1781,6 +1880,8 @@ mod tests {
             base,
             frame: PixBuf::default(),
             scene: None,
+            painted: None,
+            gdi: None,
             caret_drawn: None,
             toast_drawn: None,
             area_drawn: None,
@@ -2660,4 +2761,8 @@ mod tests {
         #[cfg(not(windows))]
         let _ = fb;
     }
+
+    #[cfg(windows)]
+    #[path = "../gdi_tests.rs"]
+    mod gdi_path;
 }

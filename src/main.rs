@@ -420,6 +420,53 @@ fn main() {
     }
 }
 
+/// End the process; first, with `RUSTSHOT_MEMLOG=<path>` set (Windows),
+/// append this process' private and peak commit to that file (one line:
+/// `pid=.. phase=exit private=.. peak_private=..`, bytes) for memory
+/// measurements. The editor also logs `phase=overlay` just before the
+/// export crop.
+fn exit(code: i32) -> ! {
+    #[cfg(windows)]
+    memlog("exit");
+    std::process::exit(code)
+}
+
+/// One `RUSTSHOT_MEMLOG` line tagged `phase` (see [`exit`]).
+#[cfg(windows)]
+pub fn memlog(phase: &str) {
+    use windows::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    let Some(path) = std::env::var_os("RUSTSHOT_MEMLOG").filter(|p| !p.is_empty()) else { return };
+    let mut c = PROCESS_MEMORY_COUNTERS_EX {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut c as *mut PROCESS_MEMORY_COUNTERS_EX as *mut PROCESS_MEMORY_COUNTERS,
+            c.cb,
+        )
+    };
+    if ok.is_err() {
+        return;
+    }
+    let line = format!(
+        "pid={} phase={phase} private={} peak_private={} peak_working_set={}
+",
+        std::process::id(),
+        c.PrivateUsage,
+        c.PeakPagefileUsage,
+        c.PeakWorkingSetSize
+    );
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 fn run() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let cmd = match parse_from(&argv) {
@@ -431,7 +478,7 @@ fn run() -> Result<()> {
         Err(e) => {
             eprintln!("error: {e}");
             eprintln!("\nUsage: rustshot [COMMAND] --help");
-            std::process::exit(2);
+            exit(2);
         }
     };
     capture::enable_dpi_awareness();
@@ -467,7 +514,7 @@ fn run() -> Result<()> {
                 }
                 Err(e) => {
                     eprintln!("error: update check failed: {e}");
-                    std::process::exit(1);
+                    exit(1);
                 }
             }
         }
@@ -475,7 +522,7 @@ fn run() -> Result<()> {
             // `_solo` keeps a Solo daemon's lock file locked until the process ends.
             let mut _solo = None;
             let guard = match instance::acquire_or_signal() {
-                instance::Instance::Signalled => std::process::exit(0),
+                instance::Instance::Signalled => exit(0),
                 instance::Instance::Primary(g) => Some(g),
                 instance::Instance::Solo(keep) => {
                     _solo = Some(keep);
@@ -490,7 +537,7 @@ fn run() -> Result<()> {
                 && export::wait_upload(rx, cfg.copy_url_after_upload).is_none() {
                     code = 1;
                 }
-            std::process::exit(code);
+            exit(code);
         }
         Cmd::Gui(args) => {
             let cfg = config::load();
@@ -503,14 +550,14 @@ fn run() -> Result<()> {
             if args.noedit {
                 let shot = capture::grab_edit(None, cfg.capture_active_monitor)
                     .map_err(|e| anyhow!("{e:#}"))?;
-                std::process::exit(run_direct(&cfg, &args, shot, region));
+                exit(run_direct(&cfg, &args, shot, region));
             }
             let mut pending = Pending::editor();
             pending.tasks = tasks;
             pending.region = region;
             pending.filename = args.filename.clone();
             let code = editor_main(cfg, RunKind::OneShot, pending);
-            std::process::exit(code);
+            exit(code);
         }
         Cmd::Full(args) => {
             let cfg = config::load();
@@ -525,11 +572,11 @@ fn run() -> Result<()> {
                 pending.region = region;
                 pending.filename = args.filename.clone();
                 let code = editor_main(cfg, RunKind::OneShot, pending);
-                std::process::exit(code);
+                exit(code);
             }
             let shot = capture::grab_edit(None, cfg.capture_active_monitor)
                 .map_err(|e| anyhow!("{e:#}"))?;
-            std::process::exit(run_direct(&cfg, &args, shot, region));
+            exit(run_direct(&cfg, &args, shot, region));
         }
         Cmd::Screen { number, args } => {
             let cfg = config::load();
@@ -540,11 +587,11 @@ fn run() -> Result<()> {
                 pending.tasks = tasks_from(&args);
                 pending.filename = args.filename.clone();
                 let code = editor_main(cfg, RunKind::OneShot, pending);
-                std::process::exit(code);
+                exit(code);
             }
             let shot =
                 capture::grab_monitor(number as usize).map_err(|e| anyhow!("{e:#}"))?;
-            std::process::exit(run_direct(&cfg, &args, shot, None));
+            exit(run_direct(&cfg, &args, shot, None));
         }
     }
 }
