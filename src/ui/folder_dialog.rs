@@ -1,7 +1,10 @@
 //! Native "choose a folder" dialog for the Saving tab's Browse… button.
-//! Blocking; None when cancelled or unavailable. Windows: IFileOpenDialog
-//! with FOS_PICKFOLDERS (COM, apartment-threaded on the calling thread).
-//! Linux: zenity, then kdialog. macOS: NSOpenPanel (directories only).
+//! Blocking: the call returns only when the dialog closes, so callers
+//! either run it off the UI thread or accept that their window does not
+//! repaint meanwhile. None when cancelled or unavailable.
+//! Windows: IFileOpenDialog with FOS_PICKFOLDERS (COM, apartment-threaded
+//! on the calling thread). Linux: zenity, then kdialog. macOS: NSOpenPanel
+//! (directories only).
 
 use std::path::{Path, PathBuf};
 
@@ -72,19 +75,36 @@ pub fn pick_folder(owner: Option<crate::wind::Hwnd>, initial: &Path) -> Option<P
 }
 
 /// Ask for a folder, starting in `initial`: zenity (GTK) first, then
-/// kdialog (KDE); a missing binary falls through to the next.
+/// kdialog (KDE); a missing binary falls through to the next. With an
+/// `owner` (an X11 window id) the dialog is attached to it as a transient.
+/// Blocks until the dialog closes (see the module docs).
 #[cfg(target_os = "linux")]
-pub fn pick_folder(_owner: Option<crate::wind::Hwnd>, initial: &Path) -> Option<PathBuf> {
+pub fn pick_folder(owner: Option<crate::wind::Hwnd>, initial: &Path) -> Option<PathBuf> {
     use std::process::Command;
-    // zenity treats a trailing slash as "start inside this folder".
-    let start = format!("{}/", initial.display());
-    let zenity =
-        Command::new("zenity").args(["--file-selection", "--directory"]).arg(format!("--filename={start}")).output();
-    if let Ok(out) = zenity {
+    let mut zenity = Command::new("zenity");
+    zenity.args(["--file-selection", "--directory"]).arg(zenity_filename(initial));
+    if let Some(w) = owner {
+        zenity.arg(format!("--attach={}", w.0));
+    }
+    if let Ok(out) = zenity.output() {
         return finish(out);
     }
-    let kdialog = Command::new("kdialog").arg("--getexistingdirectory").arg(initial).output();
-    kdialog.ok().and_then(finish)
+    let mut kdialog = Command::new("kdialog");
+    if let Some(w) = owner {
+        kdialog.arg("--attach").arg(w.0.to_string());
+    }
+    kdialog.arg("--getexistingdirectory").arg(initial);
+    kdialog.output().ok().and_then(finish)
+}
+
+/// `--filename=<initial>/` built from the raw path bytes (non-UTF-8 safe);
+/// zenity treats the trailing slash as "start inside this folder".
+#[cfg(any(target_os = "linux", test))]
+fn zenity_filename(initial: &Path) -> std::ffi::OsString {
+    let mut a = std::ffi::OsString::from("--filename=");
+    a.push(initial.as_os_str());
+    a.push("/");
+    a
 }
 
 #[cfg(target_os = "linux")]
@@ -157,6 +177,21 @@ mod tests {
         assert!(opts.contains(FOS_PICKFOLDERS));
         let dir = unsafe { dlg.GetFolder() }.expect("initial folder set");
         drop(dir);
+    }
+
+    #[test]
+    fn zenity_filename_keeps_the_path() {
+        let p = std::path::Path::new("dir with space");
+        assert_eq!(super::zenity_filename(p), std::ffi::OsString::from("--filename=dir with space/"));
+    }
+
+    /// A non-UTF-8 folder name passes through to zenity unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn zenity_filename_is_not_lossy() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let p = std::path::Path::new(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+        assert_eq!(super::zenity_filename(p).into_vec(), b"--filename=caf\xe9/".to_vec());
     }
 
     #[test]

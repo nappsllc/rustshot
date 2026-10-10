@@ -102,6 +102,10 @@ impl TextState {
     pub fn key(&mut self, vk: u32, m: Mods, clip: &mut dyn Clipboard) -> (bool, bool) {
         let sel = !self.selection().is_empty();
         let c = self.caret;
+        // Ctrl+Alt is AltGr on Windows layouts: it types characters (Polish
+        // AltGr+A = ą), so it must never act as a Ctrl shortcut.
+        let ctrl = m.ctrl && !m.alt;
+        let shift_only = m.shift && !m.ctrl && !m.alt;
         match vk {
             key::LEFT if sel && !m.shift => {
                 let s = self.selection().start;
@@ -111,14 +115,16 @@ impl TextState {
                 let e = self.selection().end;
                 self.move_to(e, false)
             }
-            key::LEFT => self.move_to(if m.ctrl { self.word_prev(c) } else { self.prev(c) }, m.shift),
-            key::RIGHT => self.move_to(if m.ctrl { self.word_next(c) } else { self.next(c) }, m.shift),
+            key::LEFT => self.move_to(if ctrl { self.word_prev(c) } else { self.prev(c) }, m.shift),
+            key::RIGHT => self.move_to(if ctrl { self.word_next(c) } else { self.next(c) }, m.shift),
             key::HOME | key::UP => self.move_to(0, m.shift),
             key::END | key::DOWN => self.move_to(self.text.len(), m.shift),
+            key::DELETE if shift_only && sel => return (self.cut(clip), true), // Shift+Del
+            key::INSERT if shift_only => return (self.paste(clip, sel), true),  // Shift+Insert
             key::BACK | key::DELETE => {
                 if !sel {
                     let back = vk == key::BACK;
-                    let to = match (back, m.ctrl) {
+                    let to = match (back, ctrl) {
                         (true, true) => self.word_prev(c),
                         (true, false) => self.prev(c),
                         (false, true) => self.word_next(c),
@@ -132,33 +138,37 @@ impl TextState {
                 self.insert("");
                 return (true, true);
             }
-            0x41 if m.ctrl => self.select_all(),             // A
-            0x43 | key::INSERT if m.ctrl => copy(self, clip), // C, Ctrl+Insert
-            0x58 if m.ctrl => {
-                // X
-                if !sel {
-                    return (false, true);
-                }
-                copy(self, clip);
-                self.insert("");
-                return (true, true);
-            }
-            0x56 if m.ctrl => {
-                // V
-                let Some(t) = clip.get() else { return (false, true) };
-                // Single line: line breaks become spaces, other controls go.
-                let t: String = t
-                    .trim_end_matches(['\r', '\n'])
-                    .chars()
-                    .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
-                    .filter(|c| !c.is_control())
-                    .collect();
-                self.insert(&t);
-                return (!t.is_empty() || sel, true);
-            }
+            0x41 if ctrl => self.select_all(),                     // A
+            0x43 | key::INSERT if ctrl => copy(self, clip),         // C, Ctrl+Insert
+            0x58 if ctrl => return (self.cut(clip), true),          // X
+            0x56 if ctrl => return (self.paste(clip, sel), true),   // V
             _ => return (false, false),
         }
         (false, true)
+    }
+
+    /// Copy the selection and delete it; whether the text changed.
+    fn cut(&mut self, clip: &mut dyn Clipboard) -> bool {
+        if self.selection().is_empty() {
+            return false;
+        }
+        copy(self, clip);
+        self.insert("");
+        true
+    }
+
+    /// Replace the selection with the clipboard text; whether the text changed.
+    fn paste(&mut self, clip: &mut dyn Clipboard, sel: bool) -> bool {
+        let Some(t) = clip.get() else { return false };
+        // Single line: line breaks become spaces, other controls go.
+        let t: String = t
+            .trim_end_matches(['\r', '\n'])
+            .chars()
+            .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+            .filter(|c| !c.is_control())
+            .collect();
+        self.insert(&t);
+        !t.is_empty() || sel
     }
 }
 
@@ -211,7 +221,7 @@ impl Ui<'_> {
         if self.focus.focused == Some(id) && self.enabled {
             let input = self.input;
             for (i, ev) in input.keys.iter().enumerate() {
-                if self.used & super::bit(i) != 0 {
+                if self.is_used(i) {
                     continue;
                 }
                 match *ev {
@@ -223,7 +233,7 @@ impl Ui<'_> {
                         let (ch, used) = st.key(vk, mods, &mut *self.clip);
                         changed |= ch;
                         if used {
-                            self.used |= super::bit(i);
+                            self.consume(i);
                         }
                     }
                 }
@@ -249,22 +259,33 @@ impl Ui<'_> {
         let (sel, caret, scroll) = (st.selection(), st.caret, st.scroll);
         let text = st.text.as_str();
         let k = self.k;
+        // Dark mode needs a denser tint than accent_ring to read as selected.
+        let sel_bg = if th.dark { th.accent.fade(0.45) } else { th.accent_ring };
         super::clipped(&mut self.fb, inner, |fb| {
             let ox = inner.x - scroll;
             let cy = inner.y + inner.h / 2.0;
             let lh = (16.0 * k).round();
+            let lw = k.round().max(1.0);
+            let cx = (ox + text_width(font, px, &text[..caret])).round().min(inner.x1() - lw);
             if focused && !sel.is_empty() {
-                let x0 = ox + text_width(font, px, &text[..sel.start]);
-                let x1 = ox + text_width(font, px, &text[..sel.end]);
+                let mut x0 = (ox + text_width(font, px, &text[..sel.start])).round();
+                let mut x1 = (ox + text_width(font, px, &text[..sel.end])).round();
+                // Keep a 1 px gap between the caret and the selection.
+                if caret == sel.end {
+                    x1 = x1.min(cx - lw);
+                } else {
+                    x0 = x0.max(cx + 2.0 * lw);
+                }
                 let y = (cy - lh / 2.0).round();
-                fb.fill_rect(x0.round() as i32, y as i32, (x1 - x0).round() as i32, lh as i32, th.accent_ring);
+                if x1 > x0 {
+                    fb.fill_rect(x0 as i32, y as i32, (x1 - x0) as i32, lh as i32, sel_bg);
+                }
             }
             let ty = cy - crate::uifb::text_height(font, px) / 2.0;
             fb.draw_text(font, px, text, ox, ty, th.text.fade(fade));
             if focused {
-                let x = (ox + text_width(font, px, &text[..caret])).round().min(inner.x1() - k.round().max(1.0));
                 let y = (cy - lh / 2.0).round();
-                fb.fill_rect(x as i32, y as i32, k.round().max(1.0) as i32, lh as i32, th.text);
+                fb.fill_rect(cx as i32, y as i32, lw as i32, lh as i32, th.text);
             }
         });
         changed

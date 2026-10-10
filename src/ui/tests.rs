@@ -17,6 +17,8 @@ fn r(x: f32, y: f32, w: f32, h: f32) -> FRect {
 const NONE: Mods = Mods { ctrl: false, shift: false, alt: false };
 const CTRL: Mods = Mods { ctrl: true, shift: false, alt: false };
 const SHIFT: Mods = Mods { ctrl: false, shift: true, alt: false };
+/// AltGr arrives as Ctrl+Alt on Windows.
+const ALTGR: Mods = Mods { ctrl: true, shift: false, alt: true };
 
 /// A window's worth of control state, driven one frame at a time.
 struct Harness {
@@ -24,17 +26,25 @@ struct Harness {
     focus: FocusState,
     clip: FakeClip,
     img: PixBuf,
+    /// DPI scale (physical px per logical px).
+    k: f32,
 }
 
 impl Harness {
     fn new() -> Harness {
-        Harness { input: Input::default(), focus: FocusState::default(), clip: FakeClip::default(), img: PixBuf::new(W, HH) }
+        Harness::scaled(1.0)
+    }
+
+    fn scaled(k: f32) -> Harness {
+        let (w, h) = ((W as f32 * k).round() as u32, (HH as f32 * k).round() as u32);
+        Harness { input: Input::default(), focus: FocusState::default(), clip: FakeClip::default(), img: PixBuf::new(w, h), k }
     }
 
     fn frame<R>(&mut self, f: impl FnOnce(&mut Ui) -> R) -> (R, Out) {
-        let fb = Fb::new(self.img.as_raw_mut(), W as usize);
+        let stride = self.img.width() as usize;
+        let fb = Fb::new(self.img.as_raw_mut(), stride);
         let area = r(0.0, 0.0, W as f32, HH as f32);
-        let mut ui = Ui::new(fb, &DARK, &self.input, &mut self.focus, &mut self.clip, 1.0, area);
+        let mut ui = Ui::new(fb, &DARK, &self.input, &mut self.focus, &mut self.clip, self.k, area);
         let v = f(&mut ui);
         let out = ui.finish();
         self.input.end_frame();
@@ -220,6 +230,43 @@ fn text_field_clipboard() {
 }
 
 #[test]
+fn text_field_altgr_is_not_a_ctrl_shortcut() {
+    let mut h = Harness::new();
+    let mut st = TextState::new("kot");
+    h.focus.focus("f");
+    field(&mut h, &mut st);
+    // Polish AltGr+A: Key{A, Ctrl+Alt} then the typed character.
+    h.key(0x41, ALTGR).typed("ą");
+    assert!(field(&mut h, &mut st));
+    assert_eq!((st.text.as_str(), st.selected()), ("kotą", ""), "no select-all, no replace");
+    st.select(0..3);
+    h.clip.0 = Some("clip".into());
+    h.key(0x58, ALTGR).key(0x56, ALTGR).key(0x43, ALTGR); // AltGr+X/V/C
+    assert!(!field(&mut h, &mut st));
+    assert_eq!((st.text.as_str(), st.selected(), h.clip.0.as_deref()), ("kotą", "kot", Some("clip")));
+    h.key(key::END, NONE).key(key::BACK, ALTGR);
+    field(&mut h, &mut st);
+    assert_eq!(st.text, "kot", "AltGr+Backspace deletes one char, not a word");
+}
+
+#[test]
+fn text_field_shift_insert_and_shift_delete() {
+    let mut h = Harness::new();
+    let mut st = TextState::new("one two");
+    h.focus.focus("f");
+    field(&mut h, &mut st);
+    h.key(key::LEFT, Mods { ctrl: true, shift: true, alt: false }).key(key::DELETE, SHIFT); // cut "two"
+    assert!(field(&mut h, &mut st));
+    assert_eq!((st.text.as_str(), h.clip.0.as_deref()), ("one ", Some("two")));
+    h.key(key::HOME, NONE).key(key::INSERT, SHIFT); // paste at the start
+    assert!(field(&mut h, &mut st));
+    assert_eq!(st.text, "twoone ");
+    h.key(key::DELETE, SHIFT); // nothing selected: plain Delete
+    field(&mut h, &mut st);
+    assert_eq!(st.text, "twone ");
+}
+
+#[test]
 fn text_field_click_places_caret_and_drag_selects() {
     let mut h = Harness::new();
     let mut st = TextState::new("abcdefghij");
@@ -282,6 +329,39 @@ fn tab_order_follows_draw_order_and_wraps() {
     // The focused control disappears: focus is dropped.
     h.frame(|ui| ui.button("a", "A", false));
     assert!(!h.focus.is_focused("c"));
+}
+
+#[test]
+fn consumed_keys_tracked_past_64_events() {
+    let mut h = Harness::new();
+    h.frame(one_button);
+    h.focus.focus("ok");
+    for _ in 0..70 {
+        h.key(0x10, SHIFT); // Shift presses: nobody uses them
+    }
+    h.key(key::RETURN, NONE);
+    let (clicked, out) = h.frame(one_button);
+    assert!(clicked && !out.enter, "Enter at index 70 is consumed by the button");
+    // A text field with 100 typed chars then Esc: all typed, Esc reported.
+    let mut st = TextState::new("");
+    h.focus.focus("f");
+    field(&mut h, &mut st);
+    h.typed(&"x".repeat(100)).key(key::BACK, NONE).key(key::ESCAPE, NONE);
+    let (_, out) = h.frame(|ui| ui.place(r(20.0, 20.0, 300.0, 32.0)).text_field("f", &mut st));
+    assert_eq!(st.text.len(), 99);
+    assert!(out.escape);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "share the id")]
+fn duplicate_ids_are_caught() {
+    let mut h = Harness::new();
+    h.frame(|ui| {
+        ui.button("dup", "A", false);
+        ui.enabled = false;
+        ui.button("dup", "B", false);
+    });
 }
 
 #[test]
@@ -350,6 +430,38 @@ fn dropdown_keyboard() {
     assert!(!out.escape, "Esc closing the list is not the dialog's Esc");
     h.key(key::ESCAPE, NONE);
     assert!(dd(&mut h, &mut sel).1.escape);
+}
+
+#[test]
+fn dropdown_highlight_follows_only_a_moving_pointer() {
+    let mut h = Harness::new();
+    let mut sel = 0;
+    h.click(60, 36); // opens; the pointer then rests over the first item
+    dd(&mut h, &mut sel);
+    h.ev(Ev::Move { x: 60, y: 56 + 4 + 14 });
+    dd(&mut h, &mut sel);
+    h.key(key::DOWN, NONE);
+    dd(&mut h, &mut sel);
+    h.key(key::DOWN, NONE);
+    dd(&mut h, &mut sel);
+    h.key(key::RETURN, NONE);
+    let (changed, _) = dd(&mut h, &mut sel);
+    assert!(changed && sel == 2, "keyboard highlight kept under a still pointer: {sel}");
+}
+
+#[test]
+fn dropdown_with_no_items_closes() {
+    let mut h = Harness::new();
+    let mut sel = 0;
+    h.click(60, 36);
+    dd(&mut h, &mut sel);
+    assert!(h.focus.busy());
+    h.ev(Ev::Move { x: 60, y: 70 }).key(key::DOWN, NONE).key(key::END, NONE);
+    let (changed, _) = h.frame(|ui| ui.place(r(20.0, 20.0, 160.0, 32.0)).dropdown("fmt", &[], &mut sel));
+    assert!(!changed && !h.focus.busy() && sel == 0);
+    h.click(60, 36).key(key::RETURN, NONE);
+    h.frame(|ui| ui.place(r(20.0, 20.0, 160.0, 32.0)).dropdown("fmt", &[], &mut sel));
+    assert!(!h.focus.busy(), "an empty dropdown does not open");
 }
 
 #[test]
@@ -426,6 +538,67 @@ fn table_keyboard_moves_and_scrolls_into_view() {
     assert_eq!((st.selected, st.scroll), (Some(0), 0.0));
     h.key(key::UP, NONE);
     assert!(!tbl(&mut h, &mut st, &names), "stays at the top");
+}
+
+#[test]
+fn table_max_scroll_shows_the_last_row_at_fractional_scale() {
+    let mut h = Harness::scaled(1.1);
+    let mut st = TableState::default();
+    let names = rows();
+    tbl(&mut h, &mut st, &names);
+    h.ev(Ev::Wheel { delta: -120 * 100, x: 100, y: 100 });
+    tbl(&mut h, &mut st, &names);
+    let (body, _) = st.body.unwrap();
+    let last = st.row_rect(29).expect("last row visible");
+    assert!((last.y1() - body.y1()).abs() < 0.01, "last row bottom {} vs body bottom {}", last.y1(), body.y1());
+    // End scrolls to the same place.
+    h.focus.focus("tbl");
+    st.scroll = 0.0;
+    h.key(key::END, NONE);
+    tbl(&mut h, &mut st, &names);
+    assert!((st.row_rect(29).unwrap().y1() - body.y1()).abs() < 0.01);
+}
+
+#[test]
+fn table_wheel_and_click_in_one_frame_hit_the_shown_row() {
+    let mut h = Harness::new();
+    let mut st = TableState { scroll: (30.0 - 8.0) * 28.0, ..Default::default() };
+    let names = rows();
+    tbl(&mut h, &mut st, &names);
+    // Scrolling further down is clamped before the click is hit-tested.
+    h.ev(Ev::Wheel { delta: -120, x: 100, y: 100 }).click(100, 20 + 28 + 10);
+    tbl(&mut h, &mut st, &names);
+    assert_eq!(st.selected, Some(22), "first visible row at max scroll");
+}
+
+/// Mouse interaction at 150 %: list item, table row and caret positions
+/// all scale with `k`.
+#[test]
+fn interaction_at_150_percent() {
+    let mut h = Harness::scaled(1.5);
+    let mut sel = 0;
+    // Dropdown box (20,20,160,32) → physical (30,30,240,48); the list
+    // starts 6 px below with 6 px padding; items 42 px.
+    dd(&mut h, &mut sel);
+    h.click(90, 50);
+    dd(&mut h, &mut sel);
+    assert!(h.focus.busy());
+    h.click(90, 78 + 6 + 6 + 42 + 21);
+    assert!(dd(&mut h, &mut sel).0 && sel == 1);
+    // Table at (30,30); header and rows 42 px.
+    let mut st = TableState::default();
+    let names = rows();
+    tbl(&mut h, &mut st, &names);
+    h.click(150, 30 + 42 + 42 + 21);
+    tbl(&mut h, &mut st, &names);
+    assert_eq!(st.selected, Some(1));
+    // Text field at x 30 with 15 px padding.
+    let mut ts = TextState::new("abcdefghij");
+    field(&mut h, &mut ts);
+    let x = 45.0 + crate::uifb::text_width(&crate::fonts::UI, 13.0 * 1.5, "abc");
+    h.click(x.round() as i32, 50);
+    field(&mut h, &mut ts);
+    assert_eq!(ts.caret(), 3);
 }
 
 // ---- slider / tabs ----
@@ -717,6 +890,35 @@ fn preview_gallery_pngs() {
         shot(&format!("ui-states-{name}.png"), th, 1.0, states);
     }
     shot("ui-gallery-dark-150.png", &DARK, 1.5, gallery_state(1.5));
+}
+
+#[cfg(windows)]
+fn shell(script: &str) -> std::process::Command {
+    let mut c = std::process::Command::new("cmd");
+    c.args(["/C", script]);
+    c
+}
+
+#[cfg(not(windows))]
+fn shell(script: &str) -> std::process::Command {
+    let mut c = std::process::Command::new("sh");
+    c.args(["-c", script]);
+    c
+}
+
+#[test]
+fn output_within_returns_stdout_or_gives_up() {
+    use std::time::{Duration, Instant};
+    let out = output_within(shell("echo hi"), Duration::from_secs(5)).expect("echo");
+    assert_eq!(String::from_utf8_lossy(&out).trim(), "hi");
+    assert!(output_within(shell("exit 3"), Duration::from_secs(5)).is_none(), "failure status");
+    #[cfg(windows)]
+    let slow = shell("ping -n 6 127.0.0.1 >NUL");
+    #[cfg(not(windows))]
+    let slow = shell("sleep 5");
+    let t = Instant::now();
+    assert!(output_within(slow, Duration::from_millis(300)).is_none());
+    assert!(t.elapsed() < Duration::from_secs(3), "killed at the deadline: {:?}", t.elapsed());
 }
 
 #[test]

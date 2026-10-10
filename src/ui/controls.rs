@@ -71,9 +71,12 @@ fn fade(ui: &Ui) -> f32 {
 pub(super) fn field_frame(ui: &mut Ui, r: FRect, focused: bool, hovered: bool) {
     let th = ui.theme;
     let k = fade(ui);
-    let bg = if hovered && !focused { th.bg_pressed } else { th.bg_hover };
-    fill(ui, r, RADIUS, bg.fade(k));
-    if focused {
+    // Recessed field fill (unlike the raised bg_hover of secondary buttons);
+    // hover only strengthens the border.
+    fill(ui, r, RADIUS, th.field_bg.fade(k));
+    if hovered && !focused && ui.enabled {
+        ring(ui, r, RADIUS, th.text_muted.fade(0.45));
+    } else if focused {
         ring(ui, r, RADIUS, th.accent.fade(k));
         let o = grow(r, ui.px(1.0));
         let lw = ui.px(2.0).round();
@@ -143,8 +146,11 @@ impl Ui<'_> {
         self.text_line(s, 12.0, true);
     }
 
-    /// Section heading.
+    /// Section heading; below other controls it gets extra space above.
     pub fn heading(&mut self, s: &str) {
+        if !self.lay.in_row() && self.cursor_y() > self.bounds().y + 0.5 {
+            self.space(8.0);
+        }
         self.text_line(s, 15.0, false);
     }
 
@@ -253,8 +259,11 @@ impl Ui<'_> {
         };
         let lr = FRect { x: r.x, y: ly.round(), w: r.w, h: lh };
         let item_at = |p: crate::objects::Pt| {
-            (contains(lr, p) && p.y >= lr.y + pad).then(|| (((p.y - lr.y - pad) / ih) as usize).min(n - 1))
+            (n > 0 && contains(lr, p) && p.y >= lr.y + pad).then(|| (((p.y - lr.y - pad) / ih) as usize).min(n - 1))
         };
+        if n == 0 && self.focus.open.is_some_and(|o| o.0 == id) {
+            self.focus.open = None; // nothing to choose from
+        }
 
         if self.pressed_in(r) && n > 0 {
             // A press on the box toggles (Ui::new already closed it on a press outside the list).
@@ -265,8 +274,10 @@ impl Ui<'_> {
         if let Some((oid, hover, _)) = self.focus.open
             && oid == id
         {
-            let mut hover = hover;
-            if let Some(i) = item_at(self.input.mouse) {
+            let mut hover = hover.min(n - 1);
+            if self.input.moved
+                && let Some(i) = item_at(self.input.mouse)
+            {
                 hover = i;
             }
             let mut close = false;
@@ -484,11 +495,16 @@ impl Ui<'_> {
         let body = FRect { x: r.x, y: r.y + rh, w: r.w, h: r.h - rh };
         let n = rows.len();
         let page = ((body.h / rh).floor() as usize).max(1);
-        let max_scroll = (n as f32 * ITEM_H - body.h / self.k).max(0.0);
+        // `scroll` counts ITEM_H per row; rows are drawn `rh` physical px
+        // tall, so the viewport spans body.h / rh rows.
+        let to_scroll = ITEM_H / rh;
+        let max_scroll = ((n as f32 * rh - body.h) * to_scroll).max(0.0);
 
         if self.hovered(r) && self.input.wheel != 0 {
             st.scroll -= self.input.wheel as f32 / 120.0 * 3.0 * ITEM_H;
         }
+        // Clamp before hit-testing so a click lands on the row it shows.
+        st.scroll = st.scroll.clamp(0.0, max_scroll);
         if let Some(p) = self.input.pressed
             && self.pressed_in(r)
         {
@@ -524,7 +540,7 @@ impl Ui<'_> {
         if moved && let Some(s) = st.selected {
             // Scroll the selection into view.
             let (top, bot) = (s as f32 * ITEM_H, (s + 1) as f32 * ITEM_H);
-            let vh = body.h / self.k;
+            let vh = body.h * to_scroll;
             if top < st.scroll {
                 st.scroll = top;
             } else if bot > st.scroll + vh {
@@ -558,10 +574,12 @@ impl Ui<'_> {
         let px = self.px(text_size());
         let first = (scroll / rh) as usize;
         let ui_k = self.k;
+        // Highlights stop short of the scroll thumb (4 px + 3 px margin).
+        let right = if max_scroll > 0.0 { 4.0 + 4.0 + 3.0 } else { 4.0 };
         super::clipped(&mut self.fb, body, |fb| {
             for (i, row) in rows.iter().enumerate().skip(first).take(page + 2) {
                 let y = body.y + i as f32 * rh - scroll;
-                let rr = FRect { x: body.x + ui_k * 4.0, y: y + ui_k, w: body.w - ui_k * 8.0, h: rh - 2.0 * ui_k };
+                let rr = FRect { x: body.x + ui_k * 4.0, y: y + ui_k, w: body.w - ui_k * (4.0 + right), h: rh - 2.0 * ui_k };
                 if sel == Some(i) {
                     chrome::fill(fb, chrome::round(rr), ui_k * 6.0, th.accent_bg.fade(k));
                 } else if hover_row == Some(i) {
@@ -692,7 +710,10 @@ fn mix(a: C4, b: C4, t: f32) -> C4 {
 /// surface with the selected item checked and the highlighted one tinted.
 pub(super) fn draw_popup(ui: &mut Ui, items: &[String], r: FRect, sel: usize, hover: usize) {
     let cu = ui.chrome();
-    chrome::surface(&mut ui.fb, &cu, r, 10.0, &ALL_LAYERS, 1.0);
+    // The full stack reads as a grey halo on the light surface: only the
+    // contact and near layers there.
+    let layers: &[usize] = if ui.theme.dark { &ALL_LAYERS } else { &[0, 1] };
+    chrome::surface(&mut ui.fb, &cu, r, 10.0, layers, 1.0);
     let th = ui.theme;
     let ih = ui.px(ITEM_H).round();
     let pad = ui.px(4.0).round();

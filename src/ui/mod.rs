@@ -58,6 +58,9 @@ pub struct Input {
     pub keys: Vec<KeyIn>,
     /// Modifiers as of the latest key event (Shift+click extends a selection).
     pub mods: Mods,
+    /// The pointer position changed this frame (hover follows the mouse
+    /// only then, so a keyboard-moved highlight is not snapped back).
+    pub moved: bool,
     /// High surrogate waiting for its low half.
     hi: Option<u16>,
 }
@@ -72,6 +75,7 @@ impl Default for Input {
             wheel: 0,
             keys: Vec::new(),
             mods: Mods::default(),
+            moved: false,
             hi: None,
         }
     }
@@ -81,19 +85,19 @@ impl Input {
     /// Fold one window event in; returns whether it is UI input.
     pub fn feed(&mut self, ev: &Ev) -> bool {
         match *ev {
-            Ev::Move { x, y } => self.mouse = Pt::new(x as f32, y as f32),
+            Ev::Move { x, y } => self.point(x, y),
             Ev::Down { x, y } => {
-                self.mouse = Pt::new(x as f32, y as f32);
+                self.point(x, y);
                 self.pressed = Some(self.mouse);
                 self.held = true;
             }
             Ev::Up { x, y } => {
-                self.mouse = Pt::new(x as f32, y as f32);
+                self.point(x, y);
                 self.released = Some(self.mouse);
                 self.held = false;
             }
             Ev::Wheel { delta, x, y } => {
-                self.mouse = Pt::new(x as f32, y as f32);
+                self.point(x, y);
                 self.wheel += delta;
             }
             Ev::Key { vk, up, mods, .. } => {
@@ -112,6 +116,12 @@ impl Input {
             _ => return false,
         }
         true
+    }
+
+    fn point(&mut self, x: i32, y: i32) {
+        let p = Pt::new(x as f32, y as f32);
+        self.moved |= p != self.mouse;
+        self.mouse = p;
     }
 
     fn char_unit(&mut self, u: u16) {
@@ -136,6 +146,7 @@ impl Input {
         self.pressed = None;
         self.released = None;
         self.wheel = 0;
+        self.moved = false;
         self.keys.clear();
     }
 }
@@ -247,13 +258,51 @@ fn linux_clipboard_text() -> Option<String> {
         if bin == "wl-paste" && std::env::var_os("WAYLAND_DISPLAY").is_none() {
             continue;
         }
-        if let Ok(out) = std::process::Command::new(bin).args(args).output()
-            && out.status.success()
-        {
-            return String::from_utf8(out.stdout).ok();
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(args);
+        // A hung selection owner must not freeze the UI thread for long.
+        if let Some(out) = output_within(cmd, std::time::Duration::from_secs(1)) {
+            return String::from_utf8(out).ok();
         }
     }
     None
+}
+
+/// Run `cmd` (stdin closed, stderr dropped) and return its stdout when it
+/// exits successfully within `limit`; otherwise kill it and return None.
+#[cfg(any(target_os = "linux", test))]
+fn output_within(mut cmd: std::process::Command, limit: std::time::Duration) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::Instant;
+    let start = Instant::now();
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut pipe = child.stdout.take()?;
+    // Read on a helper thread so a full pipe cannot stall the deadline.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let kill = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let Ok(buf) = rx.recv_timeout(limit) else {
+        kill(&mut child);
+        return None;
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success().then_some(buf),
+            Ok(None) if start.elapsed() < limit => std::thread::sleep(std::time::Duration::from_millis(5)),
+            _ => {
+                kill(&mut child);
+                return None;
+            }
+        }
+    }
 }
 
 /// What the frame left for the caller.
@@ -287,8 +336,10 @@ pub struct Ui<'a> {
     /// Controls drawn while false are dimmed, inert and skipped by Tab.
     pub enabled: bool,
     pub(crate) lay: Layout,
-    /// Bit i: `input.keys[i]` was consumed.
-    used: u64,
+    /// `used[i]`: `input.keys[i]` was consumed.
+    used: Vec<bool>,
+    /// Ids registered this frame, disabled ones included (duplicate check).
+    seen: std::collections::HashSet<u64>,
     popup: Option<Popup>,
     /// The open list's rect at frame start: presses and hover there belong
     /// to its dropdown even after it closes mid-frame.
@@ -319,7 +370,8 @@ impl<'a> Ui<'a> {
             clip,
             enabled: true,
             lay: Layout::new(area),
-            used: 0,
+            used: vec![false; input.keys.len()],
+            seen: Default::default(),
             popup: None,
             block: None,
             closed: None,
@@ -331,7 +383,7 @@ impl<'a> Ui<'a> {
                 && !mods.ctrl
                 && !mods.alt
             {
-                ui.used |= bit(i);
+                ui.used[i] = true;
                 let prev = std::mem::take(&mut ui.focus.prev);
                 if prev.is_empty() {
                     ui.focus.pending_tab = Some(mods.shift);
@@ -375,7 +427,7 @@ impl<'a> Ui<'a> {
         }
         let mut out = Out { redraw: self.redraw, ..Out::default() };
         for i in 0..self.input.keys.len() {
-            if self.used & bit(i) == 0
+            if !self.used[i]
                 && let KeyIn::Key { vk, .. } = self.input.keys[i]
             {
                 out.escape |= vk == key::ESCAPE;
@@ -397,6 +449,8 @@ impl<'a> Ui<'a> {
 
     /// Register `id` as focusable (in draw order); returns whether it has focus.
     fn focusable(&mut self, id: u64) -> bool {
+        let fresh = self.seen.insert(id);
+        debug_assert!(fresh, "two controls share the id {id:#x} this frame");
         if self.enabled {
             self.focus.order.push(id);
         }
@@ -422,14 +476,18 @@ impl<'a> Ui<'a> {
     fn keys(&self) -> Vec<(usize, u32, Mods)> {
         (self.input.keys.iter().enumerate())
             .filter_map(|(i, e)| match *e {
-                KeyIn::Key { vk, mods } if self.used & bit(i) == 0 => Some((i, vk, mods)),
+                KeyIn::Key { vk, mods } if !self.used[i] => Some((i, vk, mods)),
                 _ => None,
             })
             .collect()
     }
 
     fn consume(&mut self, i: usize) {
-        self.used |= bit(i);
+        self.used[i] = true;
+    }
+
+    fn is_used(&self, i: usize) -> bool {
+        self.used[i]
     }
 
     /// Consume and report a press of `vk` (no Ctrl/Alt) while `id` is focused.
@@ -446,10 +504,6 @@ impl<'a> Ui<'a> {
         }
         hit
     }
-}
-
-fn bit(i: usize) -> u64 {
-    if i < 64 { 1 << i } else { 0 }
 }
 
 pub fn contains(r: FRect, p: Pt) -> bool {
