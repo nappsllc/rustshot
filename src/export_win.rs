@@ -448,7 +448,8 @@ fn write_body(
     use std::io::Write;
     let total = content_length(resp);
     let wr = |e: std::io::Error| format!("write {}: {e}", dest.display());
-    let mut file = std::fs::File::create(dest).map_err(wr)?;
+    let mut file =
+        std::fs::OpenOptions::new().write(true).create_new(true).open(dest).map_err(wr)?;
     let mut buf = vec![0u8; 64 * 1024];
     let mut got = 0u64;
     if !progress(0, total) {

@@ -33,7 +33,10 @@ fn run_curl(
     dest: &Path,
     progress: &dyn Fn(u64, Option<u64>) -> bool,
 ) -> Result<(), String> {
+    // A stale file must not be reused (curl would truncate it in place).
+    let _ = std::fs::remove_file(dest);
     let mut child = Command::new("curl")
+        .arg("-q") // first argument: ignore ~/.curlrc
         .args(["-fsSL", "--proto", "=https", "--proto-redir", "=https", "--max-redirs", "5"])
         .args(["--connect-timeout", "15", "-w", "%{url_effective}", "-o"])
         .arg(dest)
@@ -48,7 +51,11 @@ fn run_curl(
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {}
-            Err(e) => return Err(format!("curl: {e}")),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("curl: {e}"));
+            }
         }
         if !progress(size(), None) {
             let _ = child.kill();

@@ -47,11 +47,13 @@ fn is_safe_release_url(u: &str) -> bool {
     u.starts_with(RELEASES_PREFIX) && is_clean_url(u)
 }
 
-/// A release asset URL of this repo (no traversal, no backslashes).
+/// A release asset URL of this repo (exact lowercase prefix; no traversal,
+/// backslashes or percent-escapes after the prefix).
 pub fn is_safe_download_url(u: &str) -> bool {
     u.starts_with(DOWNLOAD_PREFIX)
         && is_clean_url(u)
         && !u.contains('\\')
+        && !u[DOWNLOAD_PREFIX.len()..].contains(['%', '@'])
         && !u[DOWNLOAD_PREFIX.len()..].split(['/', '?', '#']).any(|seg| seg == ".." || seg == ".")
 }
 
@@ -551,9 +553,18 @@ pub fn pick_asset<'a>(kind: &InstallKind, rel: &'a Release) -> Option<&'a Asset>
 // --- Integrity --------------------------------------------------------------
 
 /// Parse `sha256sum` output: `<hex>  <name>` or `<hex> *<name>` per line.
-/// Malformed lines are skipped; the first entry for a name wins.
+/// Malformed lines are skipped. A name listed twice with different digests is
+/// poisoned: it is absent from the result, so a lookup finds nothing. Identical
+/// duplicates are fine.
+#[cfg(test)] // production code uses parse_sums_checked
 pub fn parse_sums(text: &str) -> HashMap<String, [u8; 32]> {
-    let mut out = HashMap::new();
+    parse_sums_checked(text).0
+}
+
+/// Like `parse_sums`, also returning the names that conflict.
+fn parse_sums_checked(text: &str) -> (HashMap<String, [u8; 32]>, Vec<String>) {
+    let mut out: HashMap<String, [u8; 32]> = HashMap::new();
+    let mut poisoned: Vec<String> = Vec::new();
     for line in text.lines() {
         let Some((hex, rest)) = line.trim().split_once(' ') else { continue };
         let Some(digest) = crate::sha256::parse_hex(hex) else { continue };
@@ -561,17 +572,30 @@ pub fn parse_sums(text: &str) -> HashMap<String, [u8; 32]> {
         let name = name.strip_prefix('*').unwrap_or(name);
         let name = name.strip_prefix("./").unwrap_or(name);
         if !name.is_empty() {
-            out.entry(name.to_string()).or_insert(digest);
+            match out.get(name) {
+                Some(d) if *d != digest => poisoned.push(name.to_string()),
+                Some(_) => {}
+                None => {
+                    out.insert(name.to_string(), digest);
+                }
+            }
         }
     }
-    out
+    for n in &poisoned {
+        out.remove(n);
+    }
+    (out, poisoned)
 }
 
 /// Largest `SHA256SUMS` we accept (a few hundred bytes in practice).
 const SUMS_MAX: u64 = 64 * 1024;
 
 /// Download `SHA256SUMS` and `asset` into `dir`, and verify the asset's
-/// SHA-256. Returns the asset's path. Refuses a release without
+/// SHA-256. Returns the asset's path and the expected digest (so the
+/// installer can `verify_file` again right before executing). `dir` must be
+/// user-private: stale files of either name are deleted first and the new ones
+/// are created exclusively, but a shared dir would still let another user
+/// swap the file after verification. Refuses a release without
 /// `SHA256SUMS` or without an entry for the asset; on any failure, mismatch
 /// or cancel (`progress` returning false; error `CANCELLED`) the downloaded
 /// files are deleted. `progress(got, total)` falls back to the asset's
@@ -582,8 +606,10 @@ pub fn fetch_verified(
     asset: &Asset,
     dir: &Path,
     progress: &dyn Fn(u64, Option<u64>) -> bool,
-) -> Result<PathBuf, String> {
-    if !is_safe_asset_name(&asset.name) || asset.name == SUMS_NAME || !is_safe_download_url(&asset.url)
+) -> Result<(PathBuf, [u8; 32]), String> {
+    if !is_safe_asset_name(&asset.name)
+        || asset.name.eq_ignore_ascii_case(SUMS_NAME)
+        || !is_safe_download_url(&asset.url)
     {
         return Err("refusing an unexpected release asset".into());
     }
@@ -596,14 +622,31 @@ pub fn fetch_verified(
     let sums_path = dir.join(SUMS_NAME);
     let dest = dir.join(&asset.name);
     let total = Some(asset.size).filter(|&s| s > 0);
-    let result = (|| -> Result<(), String> {
-        crate::export::download_to(&sums_asset.url, &sums_path, &|_, _| progress(0, total))?;
+    let _ = std::fs::remove_file(&sums_path);
+    let _ = std::fs::remove_file(&dest);
+    let result = (|| -> Result<[u8; 32], String> {
+        // Abort the SHA256SUMS download once it passes the cap.
+        let too_big = std::cell::Cell::new(false);
+        let r = crate::export::download_to(&sums_asset.url, &sums_path, &|got, _| {
+            if got > SUMS_MAX {
+                too_big.set(true);
+                return false;
+            }
+            progress(0, total)
+        });
+        if too_big.get() {
+            return Err("SHA256SUMS is unexpectedly large".into());
+        }
+        r?;
         let len = std::fs::metadata(&sums_path).map_err(|e| e.to_string())?.len();
         if len > SUMS_MAX {
             return Err("SHA256SUMS is unexpectedly large".into());
         }
         let text = std::fs::read(&sums_path).map_err(|e| e.to_string())?;
-        let sums = parse_sums(&String::from_utf8_lossy(&text));
+        let (sums, poisoned) = parse_sums_checked(&String::from_utf8_lossy(&text));
+        if poisoned.contains(&asset.name) {
+            return Err(format!("SHA256SUMS lists {} twice", asset.name));
+        }
         let want = *sums
             .get(&asset.name)
             .ok_or_else(|| format!("{} is not listed in SHA256SUMS; refusing to install", asset.name))?;
@@ -612,15 +655,27 @@ pub fn fetch_verified(
         if got != want {
             return Err(format!("{} failed its SHA-256 check; refusing to install", asset.name));
         }
-        Ok(())
+        Ok(want)
     })();
     let _ = std::fs::remove_file(&sums_path);
     match result {
-        Ok(()) => Ok(dest),
+        Ok(want) => Ok((dest, want)),
         Err(e) => {
             let _ = std::fs::remove_file(&dest);
             Err(e)
         }
+    }
+}
+
+/// Re-hash `path` and compare with `expected` (the installer calls this right
+/// before executing the download).
+#[allow(dead_code)] // used by the installer (later task)
+pub fn verify_file(path: &Path, expected: [u8; 32]) -> Result<(), String> {
+    let got = crate::sha256::file_digest(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if got == expected {
+        Ok(())
+    } else {
+        Err("the downloaded file does not match its SHA-256; refusing to run it".into())
     }
 }
 
@@ -994,6 +1049,14 @@ mod tests {
             "https://github.com/nappsllc/rustshot/releases/download/v1/x\\y",
             "https://github.com/nappsllc/rustshot/releases/download/v1/x y",
             "https://github.com.evil.example/nappsllc/rustshot/releases/download/v1/x",
+            "https://github.com/nappsllc/rustshot/releases/download/%2e%2e/%2e%2e/other/x",
+            "https://github.com/nappsllc/rustshot/releases/download/v1%2Fx",
+            "https://github.com/nappsllc/rustshot/releases/download/v1/x%5cy",
+            "HTTPS://GITHUB.COM/nappsllc/rustshot/releases/download/v1/x",
+            "https://GITHUB.COM/nappsllc/rustshot/releases/download/v1/x",
+            "https://user@github.com/nappsllc/rustshot/releases/download/v1/x",
+            "https://github.com@evil.example/nappsllc/rustshot/releases/download/v1/x",
+            "https://github.com/nappsllc/rustshot/releases/download/v1/x@evil.example",
         ] {
             assert!(!is_safe_download_url(bad), "accepted {bad}");
         }
@@ -1179,10 +1242,33 @@ mod tests {
              garbage line\n{a}  ./SHA256SUMS\n\n{e}  rustshot-0.1.2-setup.exe\nnothex  x\n"
         );
         let m = parse_sums(&text);
-        assert_eq!(m.len(), 3);
-        assert_eq!(m["rustshot-0.1.2-setup.exe"], crate::sha256::digest(b"abc"));
+        // setup.exe is listed twice with different digests: poisoned, absent.
+        assert_eq!(m.len(), 2);
+        assert!(!m.contains_key("rustshot-0.1.2-setup.exe"));
         assert_eq!(m["rustshot-0.1.2-x86_64.AppImage"], crate::sha256::digest(b""));
         assert!(m.contains_key("SHA256SUMS"));
+    }
+
+    #[test]
+    fn sums_duplicates() {
+        let a = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let e = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        // Conflicting digests poison the name; identical ones are fine.
+        let m = parse_sums(&format!("{a}  x.exe\n{e}  x.exe\n{a}  y.exe\n{a}  y.exe\n"));
+        assert!(!m.contains_key("x.exe"));
+        assert_eq!(m["y.exe"], crate::sha256::digest(b"abc"));
+        let (_, poisoned) = parse_sums_checked(&format!("{a}  x.exe\n{e}  x.exe\n"));
+        assert_eq!(poisoned, ["x.exe"]);
+    }
+
+    #[test]
+    fn verify_file_checks_digest() {
+        let p = std::env::temp_dir().join(format!("rustshot-test-vf-{}", std::process::id()));
+        std::fs::write(&p, b"abc").unwrap();
+        assert!(verify_file(&p, crate::sha256::digest(b"abc")).is_ok());
+        assert!(verify_file(&p, crate::sha256::digest(b"abd")).is_err());
+        let _ = std::fs::remove_file(&p);
+        assert!(verify_file(&p, [0; 32]).is_err());
     }
 
     #[test]
@@ -1194,6 +1280,10 @@ mod tests {
         let mut bad = rel.assets[0].clone();
         bad.url = "https://evil.example/x".into();
         assert!(fetch_verified(&rel, &bad, &dir, &|_, _| true).is_err());
+        // An asset named like the checksum file (any case) is refused up front.
+        let rel2 = rel_with(&["sha256sums", "SHA256SUMS"]);
+        let err = fetch_verified(&rel2, &rel2.assets[0], &dir, &|_, _| true).unwrap_err();
+        assert!(err.contains("unexpected release asset"), "{err}");
         let _ = std::fs::remove_dir(&dir);
     }
 
