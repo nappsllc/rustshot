@@ -2,7 +2,7 @@
 //! ab_glyph text rendering. Draw into an unpremultiplied RGBA buffer via [`Fb`].
 
 use crate::objects::{FRect, Pt};
-use crate::raster::{Blend, Surf};
+use crate::raster::{Blend, Order, Surf};
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -42,65 +42,103 @@ fn div255(x: u32) -> u32 {
     (x + 1 + (x >> 8)) >> 8
 }
 
-/// Borrowed drawing surface over an RGBA8 buffer.
+/// Borrowed drawing surface over a 4-byte-per-pixel buffer. The buffer
+/// covers image coordinates `ox..ox + stride` x `oy..oy + height`; every
+/// draw call takes image coordinates and clips to that window.
 pub struct Fb<'a> {
     pub d: &'a mut [u8],
     pub stride: usize,
+    pub ox: i32,
+    pub oy: i32,
+    pub order: Order,
 }
 
 impl<'a> Fb<'a> {
+    /// A whole-image RGBA surface (origin 0,0).
     pub fn new(d: &'a mut [u8], stride: usize) -> Self {
-        Fb { d, stride }
+        Self::with_origin(d, stride, 0, 0, Order::Rgba)
     }
 
+    /// A surface whose top-left pixel is image pixel (`ox`, `oy`).
+    pub fn with_origin(d: &'a mut [u8], stride: usize, ox: i32, oy: i32, order: Order) -> Self {
+        Fb {
+            d,
+            stride,
+            ox,
+            oy,
+            order,
+        }
+    }
+
+    /// Buffer height in pixels.
     pub fn height(&self) -> i32 {
         self.d.len() as i32 / 4 / self.stride as i32
+    }
+
+    /// The window in image coordinates: (x0, y0, x1, y1), end-exclusive.
+    fn bounds(&self) -> (i32, i32, i32, i32) {
+        (
+            self.ox,
+            self.oy,
+            self.ox + self.stride as i32,
+            self.oy + self.height(),
+        )
     }
 
     /// The same pixels as an AA raster surface (strokes, polygons).
     pub fn surf(&mut self) -> Surf<'_> {
         let h = self.height().max(0) as u32;
-        Surf::new(&mut *self.d, self.stride as u32, h)
+        Surf::with_origin(
+            &mut *self.d,
+            self.stride as u32,
+            h,
+            self.ox,
+            self.oy,
+            self.order,
+        )
     }
 
-    /// Blend `c` over the pixel at (x, y).
-    pub fn blend_px(&mut self, x: usize, y: usize, c: C4) {
-        let i = (y * self.stride + x) * 4;
-        if i + 3 >= self.d.len() {
+    /// Blend `c` over the pixel at image coordinates (x, y); outside the
+    /// window is a no-op.
+    pub fn blend_px(&mut self, x: i32, y: i32, c: C4) {
+        let (x, y) = (x - self.ox, y - self.oy);
+        if x < 0 || y < 0 || x >= self.stride as i32 {
             return;
         }
+        let i = (y as usize * self.stride + x as usize) * 4;
+        let Some(px) = self.d.get_mut(i..i + 4) else {
+            return;
+        };
+        let bgra = self.order == Order::Bgra;
         let a = c.a as u32;
         if a == 255 {
-            self.d[i] = c.r;
-            self.d[i + 1] = c.g;
-            self.d[i + 2] = c.b;
-            self.d[i + 3] = 255;
+            px.copy_from_slice(&if bgra { [c.b, c.g, c.r, 255] } else { [c.r, c.g, c.b, 255] });
             return;
         }
         if a == 0 {
             return;
         }
+        if bgra {
+            px.swap(0, 2); // blend in RGBA, swap back
+        }
         let ia = 255 - a;
-        let (d0, d1, d2, d3) = (
-            self.d[i] as u32,
-            self.d[i + 1] as u32,
-            self.d[i + 2] as u32,
-            self.d[i + 3] as u32,
-        );
-        self.d[i] = div255(c.r as u32 * a + d0 * ia) as u8;
-        self.d[i + 1] = div255(c.g as u32 * a + d1 * ia) as u8;
-        self.d[i + 2] = div255(c.b as u32 * a + d2 * ia) as u8;
-        self.d[i + 3] = (a + div255(d3 * ia)).min(255) as u8;
+        px[0] = div255(c.r as u32 * a + px[0] as u32 * ia) as u8;
+        px[1] = div255(c.g as u32 * a + px[1] as u32 * ia) as u8;
+        px[2] = div255(c.b as u32 * a + px[2] as u32 * ia) as u8;
+        px[3] = (a + div255(px[3] as u32 * ia)).min(255) as u8;
+        if bgra {
+            px.swap(0, 2);
+        }
     }
 
     pub fn fill_rect(&mut self, x0: i32, y0: i32, w: i32, h: i32, c: C4) {
         if w <= 0 || h <= 0 {
             return;
         }
-        let fh = self.height();
-        for y in y0.max(0)..(y0 + h).min(fh) {
-            for x in x0.max(0)..(x0 + w).min(self.stride as i32) {
-                self.blend_px(x as usize, y as usize, c);
+        let (bx0, by0, bx1, by1) = self.bounds();
+        for y in y0.max(by0)..(y0 + h).min(by1) {
+            for x in x0.max(bx0)..(x0 + w).min(bx1) {
+                self.blend_px(x, y, c);
             }
         }
     }
@@ -112,11 +150,11 @@ impl<'a> Fb<'a> {
         }
         let (x1, y1) = (x0 + w, y0 + h);
         let half = thickness / 2.0;
-        let fh = self.height();
-        let ys = (y0 - half - 1.0).floor().max(0.0) as i32;
-        let ye = ((y1 + half + 1.0).ceil() as i32).min(fh);
-        let xs = (x0 - half - 1.0).floor().max(0.0) as i32;
-        let xe = ((x1 + half + 1.0).ceil() as i32).min(self.stride as i32);
+        let (bx0, by0, bx1, by1) = self.bounds();
+        let ys = ((y0 - half - 1.0).floor() as i32).max(by0);
+        let ye = ((y1 + half + 1.0).ceil() as i32).min(by1);
+        let xs = ((x0 - half - 1.0).floor() as i32).max(bx0);
+        let xe = ((x1 + half + 1.0).ceil() as i32).min(bx1);
         // Coverage is zero farther than `half + 1` from the outline, so only
         // the four border strips are visited, never the hollow interior:
         // rows near the top/bottom edge span the full width; other rows
@@ -143,7 +181,7 @@ impl<'a> Fb<'a> {
                 if cov > 0.0 {
                     let mut col = c;
                     col.a = ((c.a as f32 * cov) as u32).min(255) as u8;
-                    self.blend_px(x as usize, y as usize, col);
+                    self.blend_px(x, y, col);
                 }
             }
         }
@@ -155,9 +193,9 @@ impl<'a> Fb<'a> {
             return;
         }
         let r = r.min(w as f32 / 2.0).min(h as f32 / 2.0);
-        let fh = self.height();
-        for y in y0.max(0)..(y0 + h).min(fh) {
-            for x in x0.max(0)..(x0 + w).min(self.stride as i32) {
+        let (bx0, by0, bx1, by1) = self.bounds();
+        for y in y0.max(by0)..(y0 + h).min(by1) {
+            for x in x0.max(bx0)..(x0 + w).min(bx1) {
                 let mut a = c.a;
                 if r > 0.0 {
                     let cx = x as f32 + 0.5;
@@ -181,7 +219,7 @@ impl<'a> Fb<'a> {
                 }
                 let mut col = c;
                 col.a = a;
-                self.blend_px(x as usize, y as usize, col);
+                self.blend_px(x, y, col);
             }
         }
     }
@@ -199,8 +237,7 @@ impl<'a> Fb<'a> {
         let f = font.as_scaled(PxScale { x: px, y: px });
         let baseline = y + f.ascent();
         let mut pen = x;
-        let fh = self.height();
-        let stride = self.stride;
+        let (bx0, by0, bx1, by1) = self.bounds();
         for ch in s.chars() {
             let glyph = ab_glyph::Glyph {
                 id: font.glyph_id(ch),
@@ -215,12 +252,12 @@ impl<'a> Fb<'a> {
                     }
                     let sx = bounds.min.x as i32 + gx as i32;
                     let sy = bounds.min.y as i32 + gy as i32;
-                    if sx < 0 || sy < 0 || sx >= stride as i32 || sy >= fh {
+                    if sx < bx0 || sy < by0 || sx >= bx1 || sy >= by1 {
                         return;
                     }
                     let mut col = c;
                     col.a = ((c.a as f32 * cov) as u32).min(255) as u8;
-                    self.blend_px(sx as usize, sy as usize, col);
+                    self.blend_px(sx, sy, col);
                 });
             }
             pen += f.h_advance(font.glyph_id(ch));
@@ -230,17 +267,17 @@ impl<'a> Fb<'a> {
 
     /// Anti-aliased filled circle.
     pub fn fill_circle(&mut self, cx: f32, cy: f32, r: f32, c: C4) {
-        let fh = self.height();
-        let x0 = (cx - r - 1.0).floor().max(0.0) as i32;
-        let x1 = ((cx + r + 1.0).ceil() as i32).min(self.stride as i32);
-        let y0 = (cy - r - 1.0).floor().max(0.0) as i32;
-        let y1 = ((cy + r + 1.0).ceil() as i32).min(fh);
+        let (bx0, by0, bx1, by1) = self.bounds();
+        let x0 = ((cx - r - 1.0).floor() as i32).max(bx0);
+        let x1 = ((cx + r + 1.0).ceil() as i32).min(bx1);
+        let y0 = ((cy - r - 1.0).floor() as i32).max(by0);
+        let y1 = ((cy + r + 1.0).ceil() as i32).min(by1);
         for y in y0..y1 {
             for x in x0..x1 {
                 let d = (x as f32 + 0.5 - cx).hypot(y as f32 + 0.5 - cy);
                 let cov = (r + 0.5 - d).clamp(0.0, 1.0);
                 if cov > 0.0 {
-                    self.blend_px(x as usize, y as usize, c.fade(cov));
+                    self.blend_px(x, y, c.fade(cov));
                 }
             }
         }
@@ -322,7 +359,7 @@ pub fn text_height(font: &FontArc, px: f32) -> f32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A real font for glyph metrics (system font, else embedded Inter).
@@ -435,7 +472,7 @@ mod tests {
                     let cov = (half + 0.5 - sdf.abs()).clamp(0.0, 1.0);
                     if cov > 0.0 {
                         let c = C4::new(200, 100, 50, ((180.0 * cov) as u32).min(255) as u8);
-                        Fb::new(&mut b, w).blend_px(x, y, c);
+                        Fb::new(&mut b, w).blend_px(x as i32, y as i32, c);
                     }
                 }
             }
@@ -502,5 +539,127 @@ mod tests {
         let r = FRect { x: 1.5, y: 1.5, w: 397.0, h: 297.0 };
         Fb::new(&mut d, 400).stroke_dashed_rect(r, 3.3, 0.7, 1.0, C4::rgb(255, 255, 255));
         assert!(d.as_chunks::<4>().0.iter().any(|p| p[0] > 200));
+    }
+
+    /// Offset BGRA sub-buffer drawing equals full RGBA drawing, cropped and
+    /// channel-swapped (byte-exact). Shared with the object tests.
+    pub(crate) mod equiv {
+        use crate::raster::{Order, Surf};
+        use crate::uifb::Fb;
+
+        pub const W: usize = 100;
+        pub const H: usize = 80;
+        /// Sub-buffer window (x, y, w, h) inside the image.
+        pub const CROP: (usize, usize, usize, usize) = (30, 20, 40, 30);
+
+        pub fn background() -> Vec<u8> {
+            let mut d = vec![0u8; W * H * 4];
+            for (i, p) in d.chunks_exact_mut(4).enumerate() {
+                let (x, y) = (i % W, i / W);
+                p[0] = (x * 7 + y * 3) as u8;
+                p[1] = (x * 2 + y * 11 + 40) as u8;
+                p[2] = ((x ^ y) * 5) as u8;
+                p[3] = 255;
+            }
+            d
+        }
+
+        /// Swapped crop of `full` (BGRA, CROP-sized).
+        pub fn crop_bgra(full: &[u8]) -> Vec<u8> {
+            let (cx, cy, cw, ch) = CROP;
+            let mut out = Vec::with_capacity(cw * ch * 4);
+            for y in cy..cy + ch {
+                for x in cx..cx + cw {
+                    let i = (y * W + x) * 4;
+                    out.extend_from_slice(&[full[i + 2], full[i + 1], full[i], full[i + 3]]);
+                }
+            }
+            out
+        }
+
+        /// Run `draw` on a full RGBA surface and on an offset BGRA window
+        /// over the same background; the results must agree byte for byte.
+        pub fn check(name: &str, draw: impl Fn(&mut Surf)) {
+            let mut full = background();
+            draw(&mut Surf::new(&mut full, W as u32, H as u32));
+            let mut sub = crop_bgra(&background());
+            let (cx, cy, cw, ch) = CROP;
+            draw(&mut Surf::with_origin(
+                &mut sub,
+                cw as u32,
+                ch as u32,
+                cx as i32,
+                cy as i32,
+                Order::Bgra,
+            ));
+            assert!(sub == crop_bgra(&full), "{name}: surf mismatch");
+        }
+
+        /// Same for the integer-blend `Fb` paths.
+        pub fn check_fb(name: &str, draw: impl Fn(&mut Fb)) {
+            let mut full = background();
+            draw(&mut Fb::new(&mut full, W));
+            let mut sub = crop_bgra(&background());
+            let (cx, cy, cw, _) = CROP;
+            draw(&mut Fb::with_origin(
+                &mut sub,
+                cw,
+                cx as i32,
+                cy as i32,
+                Order::Bgra,
+            ));
+            assert!(sub == crop_bgra(&full), "{name}: fb mismatch");
+            // The drawing must also have changed something inside the window.
+            assert!(sub != crop_bgra(&background()) || name.contains("outside"), "{name}: no-op");
+        }
+    }
+
+    #[test]
+    fn offset_bgra_fb_matches_full_rgba() {
+        use equiv::check_fb;
+        let c = C4::new(220, 40, 90, 200);
+        let solid = C4::rgb(10, 250, 120);
+        check_fb("fill_rect straddling", |f| f.fill_rect(20, 10, 30, 20, c));
+        check_fb("fill_rect solid", |f| f.fill_rect(55, 35, 30, 30, solid));
+        check_fb("fill_rect all edges", |f| f.fill_rect(10, 5, 80, 60, c));
+        check_fb("stroke_rect", |f| f.stroke_rect(25.5, 15.25, 30.0, 25.0, 3.0, c));
+        check_fb("stroke_rect big outside", |f| f.stroke_rect(10.0, 5.0, 80.0, 60.0, 2.0, c));
+        check_fb("fill_rounded", |f| f.fill_rounded(22, 12, 30, 20, 6.0, c));
+        check_fb("fill_rounded solid", |f| f.fill_rounded(50, 30, 40, 30, 8.0, solid));
+        check_fb("fill_circle", |f| f.fill_circle(34.0, 24.0, 9.5, c));
+        check_fb("stroke_circle", |f| f.stroke_circle(68.0, 48.0, 11.0, 2.5, c));
+        check_fb("stroke_rounded", |f| {
+            f.stroke_rounded(FRect { x: 40.0, y: 15.0, w: 50.0, h: 30.0 }, 7.0, 2.0, c)
+        });
+        check_fb("stroke_dashed_rect", |f| {
+            f.stroke_dashed_rect(FRect { x: 38.5, y: 15.5, w: 55.0, h: 28.0 }, 5.0, 3.0, 1.5, c)
+        });
+        // Entirely outside the window: still identical (and untouched).
+        check_fb("outside", |f| f.fill_rect(0, 0, 10, 10, c));
+        if let Some(font) = font() {
+            check_fb("text", |f| {
+                f.draw_text(&font, 14.0, "Hello wy", 24.0, 12.0, c);
+            });
+        }
+    }
+
+    #[test]
+    fn offset_bgra_surf_primitives_match_full_rgba() {
+        use crate::raster::{Blend, Surf};
+        use equiv::check;
+        let c = C4::new(30, 200, 240, 190);
+        let pts = [Pt::new(15.0, 60.0), Pt::new(45.0, 18.0), Pt::new(85.0, 50.0)];
+        for (blend, name) in [(Blend::Normal, "normal"), (Blend::Multiply, "multiply")] {
+            check(&format!("polyline {name}"), |s: &mut Surf| {
+                s.stroke_polyline(&pts, 6.0, c, blend)
+            });
+            check(&format!("ellipse {name}"), |s: &mut Surf| {
+                s.stroke_ellipse(FRect { x: 20.0, y: 10.0, w: 60.0, h: 40.0 }, 3.0, c, blend)
+            });
+            check(&format!("round_rect {name}"), |s: &mut Surf| {
+                s.stroke_round_rect(FRect { x: 22.0, y: 12.0, w: 70.0, h: 50.0 }, 6.0, 3.0, c, blend)
+            });
+            check(&format!("convex {name}"), |s: &mut Surf| s.fill_convex(&pts, c, blend));
+        }
     }
 }

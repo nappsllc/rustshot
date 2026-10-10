@@ -18,37 +18,80 @@ pub enum Blend {
     Multiply,
 }
 
-/// A mutable draw target: raw RGBA bytes plus its dimensions.
+/// Byte order of a 4-byte pixel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Order {
+    #[default]
+    Rgba,
+    /// Windows DIB sections (the GDI overlay); built by the overlay path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Bgra,
+}
+
+impl Order {
+    /// Byte index of the r, g, b channels within a pixel.
+    #[inline(always)]
+    pub fn rgb_idx(self) -> [usize; 3] {
+        match self {
+            Order::Rgba => [0, 1, 2],
+            Order::Bgra => [2, 1, 0],
+        }
+    }
+}
+
+/// A mutable draw target: raw pixel bytes plus its dimensions. The buffer
+/// covers image coordinates `ox..ox + w` x `oy..oy + h`; every draw call
+/// takes image coordinates and clips to that window.
 pub struct Surf<'a> {
     pub data: &'a mut [u8],
     w: u32,
     h: u32,
+    ox: i32,
+    oy: i32,
+    order: Order,
 }
 
 impl<'a> Surf<'a> {
     pub fn new(data: &'a mut [u8], w: u32, h: u32) -> Self {
-        Surf { data, w, h }
+        Self::with_origin(data, w, h, 0, 0, Order::Rgba)
+    }
+
+    /// A surface whose top-left pixel is image pixel (`ox`, `oy`).
+    pub fn with_origin(
+        data: &'a mut [u8],
+        w: u32,
+        h: u32,
+        ox: i32,
+        oy: i32,
+        order: Order,
+    ) -> Self {
+        Surf {
+            data,
+            w,
+            h,
+            ox,
+            oy,
+            order,
+        }
     }
 
     pub fn from_buf(buf: &'a mut PixBuf) -> Self {
         let (w, h) = (buf.width(), buf.height());
-        Surf {
-            data: buf.as_raw_mut(),
-            w,
-            h,
-        }
+        Surf::new(buf.as_raw_mut(), w, h)
+    }
+
+    /// The window in image coordinates: (x0, y0, x1, y1), end-exclusive.
+    pub fn bounds(&self) -> (i32, i32, i32, i32) {
+        (self.ox, self.oy, self.ox + self.w as i32, self.oy + self.h as i32)
     }
 
     pub fn width(&self) -> u32 {
         self.w
     }
 
-    pub fn height(&self) -> u32 {
-        self.h
-    }
-
     /// Blend one pixel: straight-alpha source over an opaque destination.
     pub fn blend_px(&mut self, x: i32, y: i32, c: C4, cov: f32, blend: Blend) {
+        let (x, y) = (x - self.ox, y - self.oy);
         if x < 0 || y < 0 || x >= self.w as i32 || y >= self.h as i32 {
             return;
         }
@@ -62,7 +105,8 @@ impl<'a> Surf<'a> {
         }
         let inv = 1.0 - a;
         let src = [c.r, c.g, c.b];
-        for (i, sv) in src.iter().enumerate() {
+        let ch = self.order.rgb_idx();
+        for (sv, &i) in src.iter().zip(&ch) {
             let dv = self.data[idx + i] as f32;
             let sv = *sv as f32;
             let v = match blend {
@@ -91,14 +135,13 @@ impl<'a> Surf<'a> {
             maxx = maxx.max(p.x);
             maxy = maxy.max(p.y);
         }
-        let (w, h) = (self.w, self.h);
+        let bounds = self.bounds();
         let (x0, y0, x1, y1) = clamp_bbox(
             (minx - margin).floor() as i32,
             (miny - margin).floor() as i32,
             (maxx + margin).ceil() as i32,
             (maxy + margin).ceil() as i32,
-            w,
-            h,
+            bounds,
         );
         if x1 <= x0 || y1 <= y0 {
             return;
@@ -120,8 +163,7 @@ impl<'a> Surf<'a> {
                 (a.y.min(b.y) - margin).floor() as i32,
                 (a.x.max(b.x) + margin).ceil() as i32,
                 (a.y.max(b.y) + margin).ceil() as i32,
-                w,
-                h,
+                bounds,
             );
             for y in ly0.max(y0)..ly1.min(y1) {
                 for x in lx0.max(x0)..lx1.min(x1) {
@@ -154,14 +196,13 @@ impl<'a> Surf<'a> {
         let cx = r.x + r.w / 2.0;
         let cy = r.y + r.h / 2.0;
         let band = width.max(0.5) / 2.0 + 0.5;
-        let (w, h) = (self.w, self.h);
+        let bounds = self.bounds();
         let (x0, y0, x1, y1) = clamp_bbox(
             (cx - rx - band).floor() as i32,
             (cy - ry - band).floor() as i32,
             (cx + rx + band).ceil() as i32,
             (cy + ry + band).ceil() as i32,
-            w,
-            h,
+            bounds,
         );
         for y in y0..y1 {
             for x in x0..x1 {
@@ -197,14 +238,13 @@ impl<'a> Surf<'a> {
         let cy = r.y + r.h / 2.0;
         let hx = (r.w / 2.0 - rad).max(0.0);
         let hy = (r.h / 2.0 - rad).max(0.0);
-        let (w, h) = (self.w, self.h);
+        let bounds = self.bounds();
         let (x0, y0, x1, y1) = clamp_bbox(
             (r.x - band).floor() as i32,
             (r.y - band).floor() as i32,
             (r.x1() + band).ceil() as i32,
             (r.y1() + band).ceil() as i32,
-            w,
-            h,
+            bounds,
         );
         // Interior pixels well inside the outline (q < lim on both axes:
         // d <= -band - 0.5, zero coverage) are skipped, so a large shape
@@ -260,14 +300,13 @@ impl<'a> Surf<'a> {
             maxx = maxx.max(p.x);
             maxy = maxy.max(p.y);
         }
-        let (w, h) = (self.w, self.h);
+        let bounds = self.bounds();
         let (x0, y0, x1, y1) = clamp_bbox(
             minx.floor() as i32,
             miny.floor() as i32,
             maxx.ceil() as i32,
             maxy.ceil() as i32,
-            w,
-            h,
+            bounds,
         );
         for y in y0..y1 {
             for x in x0..x1 {
@@ -307,9 +346,15 @@ fn dist_seg(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     (dx * dx + dy * dy).sqrt()
 }
 
-/// Intersect an integer range with the buffer bounds.
-fn clamp_bbox(x0: i32, y0: i32, x1: i32, y1: i32, w: u32, h: u32) -> (i32, i32, i32, i32) {
-    (x0.max(0), y0.max(0), x1.min(w as i32), y1.min(h as i32))
+/// Intersect an integer range with the surface window (image coordinates).
+fn clamp_bbox(
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    b: (i32, i32, i32, i32),
+) -> (i32, i32, i32, i32) {
+    (x0.max(b.0), y0.max(b.1), x1.min(b.2), y1.min(b.3))
 }
 
 #[cfg(test)]

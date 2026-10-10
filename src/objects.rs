@@ -129,7 +129,7 @@ fn draw_text(
     top: Pt,
     color: C4,
 ) {
-    let (w, h) = (sf.width(), sf.height());
+    let (bx0, by0, bx1, by1) = sf.bounds();
     let scale = PxScale::from(size);
     let sfont = font.as_scaled(scale);
     let ascent = sfont.ascent();
@@ -147,7 +147,7 @@ fn draw_text(
                 og.draw(|gx, gy, cov| {
                     let px = bounds.min.x.floor() as i32 + gx as i32;
                     let py = bounds.min.y.floor() as i32 + gy as i32;
-                    if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
+                    if px >= bx0 && py >= by0 && px < bx1 && py < by1 {
                         sf.blend_px(px, py, color, cov, Blend::Normal);
                     }
                 });
@@ -158,30 +158,44 @@ fn draw_text(
     }
 }
 
+/// Mosaic `r`. The cell grid is anchored at the rect's corner in image
+/// coordinates; cells are clipped to the surface window (exact when the
+/// window contains the rect).
 fn pixelate(sf: &mut Surf, r: FRect, cell: f32) {
-    let (pw, ph) = (sf.width() as i32, sf.height() as i32);
+    let (bx0, by0, bx1, by1) = sf.bounds();
+    let pw = sf.width() as i32;
     let x0 = r.x.max(0.0).floor() as i32;
     let y0 = r.y.max(0.0).floor() as i32;
-    let x1 = r.x1().min(pw as f32).ceil() as i32;
-    let y1 = r.y1().min(ph as f32).ceil() as i32;
-    if x1 <= x0 || y1 <= y0 {
+    let x1 = (r.x1().min(bx1 as f32).ceil() as i32).min(bx1);
+    let y1 = (r.y1().min(by1 as f32).ceil() as i32).min(by1);
+    if x1 <= x0.max(bx0) || y1 <= y0.max(by0) {
         return;
     }
-    let c = cell.max(2.0).round();
-    let step = (c / 4.0).max(1.0) as i32;
+    let c = cell.max(2.0).round() as i32;
+    let step = (c / 4).max(1);
+    let idx = |x: i32, y: i32| (((y - by0) * pw + (x - bx0)) as usize) * 4;
+    // First sample at or after `lo` on the grid `start + k * step`.
+    let align = |start: i32, lo: i32| {
+        if start >= lo {
+            start
+        } else {
+            start + (lo - start + step - 1) / step * step
+        }
+    };
     let Surf { data, .. } = sf;
-    let mut cy = y0;
+    // Skip whole cells left of / above the window.
+    let mut cy = y0 + ((by0 - y0).max(0) / c) * c;
     while cy < y1 {
-        let mut cx = x0;
+        let mut cx = x0 + ((bx0 - x0).max(0) / c) * c;
         while cx < x1 {
-            let ex = (cx + c as i32).min(x1);
-            let ey = (cy + c as i32).min(y1);
+            let ex = (cx + c).min(x1);
+            let ey = (cy + c).min(y1);
             let (mut sr, mut sg, mut sb, mut sa, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
-            let mut sy = cy;
+            let mut sy = align(cy, by0);
             while sy < ey {
-                let mut sx = cx;
+                let mut sx = align(cx, bx0);
                 while sx < ex {
-                    let i = ((sy * pw + sx) as usize) * 4;
+                    let i = idx(sx, sy);
                     sr += data[i] as u32;
                     sg += data[i + 1] as u32;
                     sb += data[i + 2] as u32;
@@ -195,35 +209,32 @@ fn pixelate(sf: &mut Surf, r: FRect, cell: f32) {
                 n = 1;
             }
             let (ar, ag, ab, aa) = (sr / n, sg / n, sb / n, sa / n);
-            let mut sy = cy;
-            while sy < ey {
-                let mut sx = cx;
-                while sx < ex {
-                    let i = ((sy * pw + sx) as usize) * 4;
+            for sy in cy.max(by0)..ey {
+                for sx in cx.max(bx0)..ex {
+                    let i = idx(sx, sy);
                     data[i] = ar as u8;
                     data[i + 1] = ag as u8;
                     data[i + 2] = ab as u8;
                     data[i + 3] = aa as u8;
-                    sx += 1;
                 }
-                sy += 1;
             }
-            cx += c as i32;
+            cx += c;
         }
-        cy += c as i32;
+        cy += c;
     }
 }
 
 fn invert(sf: &mut Surf, r: FRect) {
-    let (pw, ph) = (sf.width() as i32, sf.height() as i32);
-    let x0 = r.x.max(0.0).floor() as i32;
-    let y0 = r.y.max(0.0).floor() as i32;
-    let x1 = r.x1().min(pw as f32).ceil() as i32;
-    let y1 = r.y1().min(ph as f32).ceil() as i32;
+    let (bx0, by0, bx1, by1) = sf.bounds();
+    let pw = sf.width() as i32;
+    let x0 = (r.x.max(0.0).floor() as i32).max(bx0);
+    let y0 = (r.y.max(0.0).floor() as i32).max(by0);
+    let x1 = (r.x1().min(bx1 as f32).ceil() as i32).min(bx1);
+    let y1 = (r.y1().min(by1 as f32).ceil() as i32).min(by1);
     let Surf { data, .. } = sf;
-    for y in y0.max(0)..y1.min(ph) {
-        for x in x0.max(0)..x1.min(pw) {
-            let i = ((y * pw + x) as usize) * 4;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = (((y - by0) * pw + (x - bx0)) as usize) * 4;
             data[i] = 255 - data[i];
             data[i + 1] = 255 - data[i + 1];
             data[i + 2] = 255 - data[i + 2];
@@ -234,7 +245,14 @@ fn invert(sf: &mut Surf, r: FRect) {
 impl Obj {
     /// Bake this object into the image.
     pub fn render(&self, buf: &mut PixBuf, font: Option<&FontArc>) {
-        let mut sf = Surf::from_buf(buf);
+        self.render_into(&mut Surf::from_buf(buf), font);
+    }
+
+    /// Bake this object into any surface (offset window, either channel
+    /// order). Pixelate/invert read the surface's own pixels, so the caller
+    /// pre-fills it with the background; pixelate is exact when the surface
+    /// window contains the whole rect.
+    pub fn render_into(&self, sf: &mut Surf, font: Option<&FontArc>) {
         match self {
             Obj::Line { a, b, color, width } => {
                 sf.stroke_polyline(&[*a, *b], *width, *color, Blend::Normal);
@@ -269,11 +287,11 @@ impl Obj {
                 size,
             } => {
                 if let Some(font) = font {
-                    draw_text(&mut sf, font, *size, text, *pos, *color);
+                    draw_text(sf, font, *size, text, *pos, *color);
                 }
             }
-            Obj::Pixelate { r, cell } => pixelate(&mut sf, *r, *cell),
-            Obj::Invert { r } => invert(&mut sf, *r),
+            Obj::Pixelate { r, cell } => pixelate(sf, *r, *cell),
+            Obj::Invert { r } => invert(sf, *r),
         }
     }
 }
@@ -350,5 +368,56 @@ mod tests {
             size: 8.0,
         }
         .render(&mut img, None);
+    }
+
+    #[test]
+    fn every_object_matches_full_rgba_in_offset_bgra() {
+        use crate::uifb::tests::equiv::check;
+        let c = C4::new(250, 60, 20, 210);
+        let (a, b) = (Pt::new(18.0, 62.0), Pt::new(82.0, 22.0));
+        let rect = FRect { x: 24.0, y: 14.0, w: 56.0, h: 40.0 };
+        let objs = vec![
+            Obj::Line { a, b, color: c, width: 4.0 },
+            Obj::Arrow { a, b, color: c, width: 5.0 },
+            Obj::Arrow { a, b: Pt::new(18.5, 62.5), color: c, width: 5.0 },
+            Obj::Rect { r: rect, color: c, width: 3.0 },
+            Obj::Ellipse { r: rect, color: c, width: 3.0 },
+            Obj::Path {
+                pts: vec![a, Pt::new(40.0, 20.0), Pt::new(60.0, 60.0), b],
+                color: c,
+                width: 3.0,
+            },
+            Obj::Marker { a, b, color: C4::new(255, 230, 0, 160), width: 14.0 },
+            Obj::Invert { r: rect },
+            Obj::Pixelate { r: FRect { x: 33.0, y: 23.0, w: 30.0, h: 22.0 }, cell: 6.0 },
+            Obj::Pixelate { r: FRect { x: 31.0, y: 21.0, w: 38.0, h: 28.0 }, cell: 8.0 },
+        ];
+        for (n, o) in objs.iter().enumerate() {
+            check(&format!("obj {n}"), |s| o.render_into(s, None));
+        }
+        if let Some(font) = crate::fonts::load_system_font() {
+            let t = Obj::Text {
+                pos: Pt::new(22.0, 16.0),
+                text: "Hello
+World wy".into(),
+                color: c,
+                size: 16.0,
+            };
+            check("text", |s| t.render_into(s, Some(&font)));
+        }
+    }
+
+    #[test]
+    fn render_wrapper_matches_render_into() {
+        let mut a = PixBuf::new(30, 30);
+        let mut b = PixBuf::new(30, 30);
+        let o = Obj::Ellipse {
+            r: FRect { x: 3.0, y: 4.0, w: 20.0, h: 18.0 },
+            color: C4::rgb(1, 2, 3),
+            width: 2.0,
+        };
+        o.render(&mut a, None);
+        o.render_into(&mut Surf::from_buf(&mut b), None);
+        assert_eq!(a.as_raw(), b.as_raw());
     }
 }
