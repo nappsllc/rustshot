@@ -2,10 +2,16 @@ use crate::config::Config;
 use crate::wind::key;
 use std::sync::mpsc::{self, Receiver, Sender};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum HotEvent {
     Capture,
     Quit,
+    /// An update is about to install: reply on the sender as soon as no
+    /// capture, editor or upload is running, and start no new capture from
+    /// now on (until `RestartAborted` or the exit).
+    RestartWhenIdle(Sender<()>),
+    /// The install after `RestartWhenIdle` failed: captures work again.
+    RestartAborted,
     /// An installed update is starting: quit once no capture is open.
     Restart,
 }
@@ -35,12 +41,9 @@ impl Hotkeys {
         self.tx.clone()
     }
 
+    /// The next queued event, if any.
     pub fn poll(&self) -> Option<HotEvent> {
-        let mut out = None;
-        while let Ok(ev) = self.rx.try_recv() {
-            out = Some(ev);
-        }
-        out
+        self.rx.try_recv().ok()
     }
 }
 

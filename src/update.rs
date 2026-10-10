@@ -435,7 +435,8 @@ pub fn notes_lines(body: &str, max_lines: usize) -> Vec<(String, bool)> {
         out.pop();
     }
     out.truncate(max_lines);
-    while out.last().is_some_and(|l| l.0.is_empty()) {
+    // Never end on a blank or on a heading whose section was cut off.
+    while out.last().is_some_and(|l| l.0.is_empty() || l.1) {
         out.pop();
     }
     out
@@ -1210,7 +1211,12 @@ mod tests {
              code line\n\
              Full Changelog: https://github.com/nappsllc/rustshot/compare/v0.1.1...v0.1.2"
         );
-        assert_eq!(notes_excerpt(body, 2), "What's Changed\nFeatures");
+        // Never ends on a heading whose section was cut off.
+        assert_eq!(notes_excerpt(body, 2), "");
+        assert_eq!(
+            notes_excerpt(body, 3),
+            "What's Changed\nFeatures\n- Save to dated folders by @a in https://github.com/nappsllc/rustshot/pull/7"
+        );
         // A cut right after a blank line does not leave it trailing.
         assert_eq!(notes_excerpt("a\n\nb", 2), "a");
         assert_eq!(notes_excerpt("", 12), "");
@@ -1232,6 +1238,26 @@ mod tests {
                 l("#nohash", false),
             ]
         );
+    }
+
+    #[test]
+    fn notes_lines_never_end_on_a_heading() {
+        let l = |s: &str, h: bool| (s.to_string(), h);
+        // Cut right after the second heading: it goes, with the blank above.
+        let body = "## A
+- one
+
+## B
+- two
+";
+        assert_eq!(notes_lines(body, 4), vec![l("A", true), l("- one", false)]);
+        assert_eq!(notes_lines(body, 5), vec![l("A", true), l("- one", false), l("", false), l("B", true), l("- two", false)]);
+        // A body that ends on a heading, and one that is only a heading.
+        assert_eq!(notes_lines("- one
+## Later
+", 12), vec![l("- one", false)]);
+        assert!(notes_lines("## Only
+", 12).is_empty());
     }
 
     fn rel_with(names: &[&str]) -> Release {

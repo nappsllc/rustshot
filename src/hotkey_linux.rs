@@ -190,7 +190,7 @@ pub fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEv
                     if !held.insert(keycode) {
                         continue; // repeat while held
                     }
-                    if tx.send(specs[*idx].2).is_err() {
+                    if tx.send(specs[*idx].2.clone()).is_err() {
                         break; // receiver dropped
                     }
                 }

@@ -164,7 +164,8 @@ pub fn run(
         crate::tray::spawn(h.sender());
     }
     if let Some(h) = &hot {
-        // An installed update stops the daemon through the Quit hotkey path.
+        // The update worker asks us to go idle (`RestartWhenIdle`), then to
+        // quit once the new version starts (`Restart`).
         crate::update_ui::set_quit_sender(h.sender());
     }
     let updates = match kind {
@@ -184,6 +185,8 @@ pub fn run(
         updates,
         update_pending: None,
         restart_pending: false,
+        updating: false,
+        idle_reply: None,
         font,
         ui_font,
         notice: None,
@@ -234,6 +237,10 @@ struct App {
     /// An installed update asked us to quit (`HotEvent::Restart`); done
     /// once no capture is open.
     restart_pending: bool,
+    /// An update is installing (`HotEvent::RestartWhenIdle`): no new capture.
+    updating: bool,
+    /// Told (once) as soon as we are idle; the worker installs only then.
+    idle_reply: Option<std::sync::mpsc::Sender<()>>,
     font: Option<AnnotFont>,
     ui_font: Option<&'static UiFont>,
     notice: Option<Toast>,
@@ -255,18 +262,10 @@ impl App {
 
     /// Run hotkey/upload polling and advance the state machine until stable.
     fn pump(&mut self) {
-        let ev = self.hot.as_ref().and_then(|h| h.poll());
-        match ev {
-            Some(HotEvent::Quit) => {
-                self.request_exit(0);
+        while let Some(ev) = self.hot.as_ref().and_then(|h| h.poll()) {
+            if !self.on_hot(ev) {
                 return;
             }
-            Some(HotEvent::Restart) => self.restart_pending = true,
-            // No new capture once the update restarts us.
-            Some(HotEvent::Capture) if matches!(self.st, State::Hidden) && !self.restart_pending => {
-                self.pending = Some(Pending::editor());
-            }
-            _ => {}
         }
         self.poll_upload();
         if let Some(rx) = &self.updates {
@@ -316,6 +315,8 @@ impl App {
                 }
             }
         }
+        // An update waits for us to go idle before it installs.
+        self.idle_gate();
         // An update is restarting us: quit as soon as no capture is open
         // (never under the user's open capture or export).
         if self.restart_due() {
@@ -323,10 +324,56 @@ impl App {
         }
     }
 
-    /// A pending restart may happen now: no capture is open or about to
-    /// open. Clears the request when it says yes.
+    /// Handle one daemon event; false once we are quitting.
+    fn on_hot(&mut self, ev: HotEvent) -> bool {
+        match ev {
+            HotEvent::Quit => {
+                self.request_exit(0);
+                return false;
+            }
+            HotEvent::Restart => self.restart_pending = true,
+            HotEvent::RestartWhenIdle(reply) => {
+                self.updating = true;
+                self.idle_reply = Some(reply);
+            }
+            HotEvent::RestartAborted => {
+                self.updating = false;
+                self.idle_reply = None;
+            }
+            // No new capture while an update installs or restarts us.
+            HotEvent::Capture if self.updating || self.restart_pending => {
+                eprintln!("rustshot: an update is installing; capture ignored");
+            }
+            HotEvent::Capture if matches!(self.st, State::Hidden) => self.pending = Some(Pending::editor()),
+            HotEvent::Capture => {}
+        }
+        true
+    }
+
+    /// No capture, editor or export is open or about to open, and no
+    /// upload is in flight.
+    fn idle(&self) -> bool {
+        matches!(self.st, State::Hidden)
+            && self.pending.is_none()
+            && self.upload_slot.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+    }
+
+    /// Answer a waiting update worker once we are idle. Captures stay
+    /// refused afterwards; if the worker is gone it will not install, so
+    /// they are allowed again.
+    fn idle_gate(&mut self) {
+        if self.idle_reply.is_some() && self.idle() {
+            let reply = self.idle_reply.take().expect("checked");
+            if reply.send(()).is_err() {
+                self.updating = false;
+            }
+        }
+    }
+
+    /// A pending restart may happen now: we are idle. Clears the request
+    /// when it says yes.
     fn restart_due(&mut self) -> bool {
-        let due = self.restart_pending && matches!(self.st, State::Hidden) && self.pending.is_none();
+        let due = self.restart_pending && self.idle();
         if due {
             self.restart_pending = false;
         }
@@ -1939,6 +1986,75 @@ mod tests {
         assert!(!app.restart_pending && !app.restart_due(), "once");
     }
 
+    /// An upload still in flight keeps the daemon from being idle.
+    fn upload_in_flight(app: &App) -> std::sync::mpsc::Sender<Result<String, String>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        *app.upload_slot.lock().unwrap() = Some(rx);
+        tx
+    }
+
+    /// The update worker installs only once no capture, editor or upload
+    /// runs; from its request on no new capture starts.
+    #[test]
+    fn idle_gate_waits_for_capture_and_upload() {
+        let mut app = preview_app(theme::DARK, None); // a capture is open
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(app.on_hot(HotEvent::RestartWhenIdle(tx)));
+        app.idle_gate();
+        assert!(rx.try_recv().is_err(), "capture open: no reply");
+        app.st = State::Hidden;
+        let up = upload_in_flight(&app);
+        app.idle_gate();
+        assert!(rx.try_recv().is_err(), "upload in flight: no reply");
+        up.send(Err("offline".into())).unwrap();
+        app.poll_upload();
+        app.idle_gate();
+        assert_eq!(rx.try_recv(), Ok(()), "idle: reply");
+        app.idle_gate();
+        assert!(rx.try_recv().is_err(), "reply once");
+        // From now on until the exit a capture is refused.
+        assert!(app.on_hot(HotEvent::Capture));
+        assert!(app.pending.is_none(), "capture refused after the gate");
+        // The install failed: captures work again.
+        assert!(app.on_hot(HotEvent::RestartAborted));
+        assert!(app.on_hot(HotEvent::Capture));
+        assert!(app.pending.is_some());
+    }
+
+    /// A capture asked while the worker waits is refused too (it would
+    /// keep the daemon busy); a reply nobody reads lifts the gate.
+    #[test]
+    fn idle_gate_refuses_captures_while_waiting() {
+        let mut app = preview_app(theme::DARK, None);
+        app.st = State::Hidden;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.pending = Some(Pending::editor()); // a capture about to open
+        app.on_hot(HotEvent::RestartWhenIdle(tx));
+        app.idle_gate();
+        assert!(rx.try_recv().is_err(), "capture about to open: no reply");
+        app.pending = None;
+        app.on_hot(HotEvent::Capture);
+        assert!(app.pending.is_none(), "refused while waiting");
+        drop(rx); // the worker gave up
+        app.idle_gate();
+        assert!(app.idle_reply.is_none() && !app.updating);
+        app.on_hot(HotEvent::Capture);
+        assert!(app.pending.is_some());
+    }
+
+    /// `Restart` sets the flag; a capture is ignored while it is pending.
+    #[test]
+    fn restart_event_sets_the_flag_and_refuses_captures() {
+        let mut app = preview_app(theme::DARK, None);
+        app.st = State::Hidden;
+        assert!(app.on_hot(HotEvent::Restart));
+        assert!(app.restart_pending);
+        assert!(app.on_hot(HotEvent::Capture));
+        assert!(app.pending.is_none());
+        let _up = upload_in_flight(&app);
+        assert!(!app.restart_due(), "upload in flight");
+    }
+
     fn preview_app_with(th: Theme, sel: Option<FRect>, shot: Shot) -> App {
         let theme_name = if th == theme::DARK { "dark" } else { "light" };
         let cfg = Config { theme: theme_name.into(), ..Config::default() };
@@ -2000,6 +2116,8 @@ mod tests {
             updates: None,
             update_pending: None,
             restart_pending: false,
+            updating: false,
+            idle_reply: None,
             font,
             ui_font,
             notice: None,

@@ -136,8 +136,10 @@ enum Screen {
     /// Cancel pressed; the download stops and cleans up (Close hides the
     /// window meanwhile).
     Cancelling(Release),
-    /// The installer / swap runs; nothing can be cancelled any more.
-    Installing(Release),
+    /// Committed to installing; nothing can be cancelled any more.
+    /// `waiting`: the daemon finishes the user's open capture (or upload)
+    /// first; then the installer / swap runs.
+    Installing { rel: Release, waiting: bool },
     /// Download, verification or install failed; Retry downloads again.
     InstallFailed { rel: Release, msg: String },
     /// Writing `skip_version` failed.
@@ -168,6 +170,8 @@ pub enum In {
     /// The download finished, passed its SHA-256 check and the install
     /// starts (Err: it failed or was cancelled; the files are gone either way).
     Fetched(Result<(), String>),
+    /// The install waits for the daemon to go idle (true), or runs (false).
+    Waiting(bool),
     Installed(Result<Applied, String>),
     Skipped(Result<(), String>),
     /// A request while the dialog is open.
@@ -181,8 +185,8 @@ pub enum Act {
     /// Run `update::check_now` on a worker (→ `In::Checked`).
     Check,
     /// Download, verify and install on a worker (→ `Progress`, `Fetched`,
-    /// `Installed`; the worker ends the daemon itself when the new version
-    /// is starting).
+    /// `Waiting`, `Installed`; the worker has the daemon go idle before it
+    /// installs, and ends it when the new version is starting).
     Download(Release),
     /// Abort the running download.
     Cancel,
@@ -217,7 +221,7 @@ impl Machine {
     fn busy(&self) -> bool {
         matches!(
             self.screen,
-            Screen::Downloading { .. } | Screen::Verifying(_) | Screen::Cancelling(_) | Screen::Installing(_)
+            Screen::Downloading { .. } | Screen::Verifying(_) | Screen::Cancelling(_) | Screen::Installing { .. }
         )
     }
 
@@ -231,13 +235,13 @@ impl Machine {
             Screen::SaveFailed(_) => (&[Close], Some(Close)),
             Screen::Checking | Screen::Downloading { .. } | Screen::Verifying(_) => (&[Cancel], None),
             Screen::Cancelling(_) => (&[Close], None),
-            Screen::Installing(_) => (&[Cancel], None),
+            Screen::Installing { .. } => (&[Cancel], None),
         }
     }
 
     /// The buttons that react (the others are drawn disabled).
     fn enabled(&self) -> bool {
-        !matches!(self.screen, Screen::Installing(_))
+        !matches!(self.screen, Screen::Installing { .. })
     }
 
     /// The button Enter presses: none in an unsolicited dialog.
@@ -260,6 +264,11 @@ impl Machine {
                     acts
                 }
             };
+        }
+        // The user clicked (or activated a button from the keyboard): the
+        // dialog is theirs now, Enter works again.
+        if matches!(ev, In::Click(_)) {
+            self.unsolicited = false;
         }
         // The button the event stands for.
         let btn = match &ev {
@@ -288,7 +297,7 @@ impl Machine {
                 }
             }
             (S::Downloading { rel, .. } | S::Verifying(rel), In::Fetched(r), _) => match r {
-                Ok(()) => (S::Installing(rel), vec![]),
+                Ok(()) => (S::Installing { rel, waiting: false }, vec![]),
                 Err(msg) => (S::InstallFailed { rel, msg }, vec![]),
             },
             (S::Downloading { rel, .. } | S::Verifying(rel), In::Dismiss, _)
@@ -296,14 +305,15 @@ impl Machine {
                 (S::Cancelling(rel), vec![Act::Cancel])
             }
             // Committed to installing before the cancel reached the worker.
-            (S::Cancelling(rel), In::Fetched(Ok(())), _) => (S::Installing(rel), vec![]),
+            (S::Cancelling(rel), In::Fetched(Ok(())), _) => (S::Installing { rel, waiting: false }, vec![]),
             (s @ S::Cancelling(_), In::Fetched(Err(_)), _) => (s, vec![Act::Close]),
             // Don't wait for a stalled download: the worker cleans up alone.
             (s @ S::Cancelling(_), In::Dismiss, _) | (s @ S::Cancelling(_), _, Some(Btn::Close)) => {
                 (s, vec![Act::Close])
             }
-            (s @ S::Installing(_), In::Installed(Ok(_)), _) => (s, vec![Act::Close]),
-            (S::Installing(rel), In::Installed(Err(msg)), _) => (S::InstallFailed { rel, msg }, vec![]),
+            (S::Installing { rel, .. }, In::Waiting(waiting), _) => (S::Installing { rel, waiting }, vec![]),
+            (s @ S::Installing { .. }, In::Installed(Ok(_)), _) => (s, vec![Act::Close]),
+            (S::Installing { rel, .. }, In::Installed(Err(msg)), _) => (S::InstallFailed { rel, msg }, vec![]),
             (S::InstallFailed { rel, .. }, _, Some(Btn::Retry)) => {
                 (S::Downloading { rel: rel.clone(), got: 0, total: None }, vec![Act::Download(rel)])
             }
@@ -394,7 +404,8 @@ fn content<'a>(m: &'a Machine, th: &Theme) -> Content<'a> {
         }
         Screen::Verifying(rel) => busy(rel, "Verifying the download…".into(), 1.0),
         Screen::Cancelling(rel) => busy(rel, "Cancelling…".into(), 0.0),
-        Screen::Installing(rel) => busy(rel, "Installing… Rustshot will restart.".into(), 1.0),
+        Screen::Installing { rel, waiting: true } => busy(rel, "Waiting for the capture to close…".into(), 1.0),
+        Screen::Installing { rel, waiting: false } => busy(rel, "Installing… Rustshot will restart.".into(), 1.0),
         Screen::UpToDate => msg(
             Mark::Icon("okc", th.success),
             "Rustshot is up to date".into(),
@@ -451,7 +462,9 @@ fn layout(ui: &Ui, c: &Content) -> Lay {
             top = r.y1() + 12.0;
             lay.text = Some(r);
         }
-        lay.notes = Some(FRect { x: PAD, y: top, w: inner, h: (body_bottom - top).max(40.0) });
+        // Whole lines only: no sliver of a cut-off last row.
+        let h = crate::ui::controls::text_view_fit(body_bottom - top, 2);
+        lay.notes = Some(FRect { x: PAD, y: top, w: inner, h });
     } else {
         let room = body_bottom - PAD;
         let th = c.text.as_ref().map_or(0.0, |t| text_h(t, room - TITLE_H - 2.0));
@@ -531,7 +544,9 @@ fn paint(ui: &mut Ui, m: &Machine, v: &mut View) -> Option<Btn> {
 
 /// The open dialog's inbox, if any.
 static OPEN: Mutex<Option<Sender<In>>> = Mutex::new(None);
-/// The daemon's event sender: `Quit` after an update restarts us.
+/// The daemon's event sender: the download worker asks it to go idle
+/// (`RestartWhenIdle`) before installing, then sends `Restart` (the new
+/// version is starting) or `RestartAborted` (the install failed).
 static QUIT: Mutex<Option<Sender<HotEvent>>> = Mutex::new(None);
 /// Held by the download worker for its whole run: a new download waits
 /// until a cancelled one has cleaned up its files.
@@ -541,21 +556,37 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Register the daemon's event sender (an installed update quits through it).
+/// Register the daemon's event sender (an update installs and restarts
+/// through it).
 pub fn set_quit_sender(tx: Sender<HotEvent>) {
     *lock(&QUIT) = Some(tx);
 }
 
-/// End the daemon cleanly (tray icon removed, instance released; a capture
-/// in progress is finished first); the relaunched version waits for this
-/// process to exit.
-fn quit_daemon() {
-    if let Some(tx) = lock(&QUIT).as_ref()
-        && tx.send(HotEvent::Restart).is_ok()
-    {
-        return;
+/// How long the worker waits for the daemon's idle reply before the dialog
+/// says it is waiting for the capture.
+const IDLE_QUICK: Duration = Duration::from_millis(250);
+
+/// Ask the daemon to finish what the user has open (capture, editor,
+/// export, upload) and start nothing new, and wait until it has. The
+/// dialog shows the wait when it is not immediate. False: the daemon is
+/// gone (or quit meanwhile), so nothing may be installed.
+fn wait_idle(daemon: Option<&Sender<HotEvent>>, tx: &Sender<In>) -> bool {
+    let Some(d) = daemon else { return false };
+    let (reply, idle) = std::sync::mpsc::channel();
+    if d.send(HotEvent::RestartWhenIdle(reply)).is_err() {
+        return false;
     }
-    std::process::exit(0);
+    match idle.recv_timeout(IDLE_QUICK) {
+        Ok(()) => return true,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return false,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+    }
+    let _ = tx.send(In::Waiting(true));
+    let ok = idle.recv().is_ok();
+    if ok {
+        let _ = tx.send(In::Waiting(false));
+    }
+    ok
 }
 
 /// Open the dialog with `state` (the user asked), or hand it to the open one.
@@ -775,6 +806,16 @@ impl Dialog {
     }
 }
 
+/// `update_install::apply` for this install (verified file, its SHA-256).
+type ApplyFn = Box<dyn Fn(&std::path::Path, [u8; 32]) -> Result<Applied, String> + Send>;
+
+/// The daemon and the installer, as the worker sees them (stubbed in tests).
+struct Installer {
+    /// The daemon's event sender (`None`: no daemon, nothing installs).
+    daemon: Option<Sender<HotEvent>>,
+    apply: ApplyFn,
+}
+
 /// Worker: pick the asset for this install, download and verify it, then
 /// install. No asset for this kind of install: open the release page. The
 /// dialog may close meanwhile (a cancel it no longer waits for): then
@@ -809,7 +850,20 @@ fn download(rel: Release, tx: Sender<In>, phase: Arc<AtomicU8>) {
         }
         phase.load(Ordering::SeqCst) != CANCELLED
     };
-    match update::fetch_verified(&rel, &asset, &dir, &progress) {
+    let fetched = update::fetch_verified(&rel, &asset, &dir, &progress);
+    let inst = Installer {
+        daemon: lock(&QUIT).clone(),
+        apply: Box::new(move |file, sha| update_install::apply(&kind, file, sha)),
+    };
+    install(fetched, &phase, &tx, &inst);
+}
+
+/// After the download: commit (unless cancelled), have the daemon go idle,
+/// then install and let the daemon quit for the new version. Every way
+/// out that does not install deletes the file.
+fn install(fetched: Result<(PathBuf, [u8; 32]), String>, phase: &AtomicU8, tx: &Sender<In>, inst: &Installer) {
+    let commit = || phase.compare_exchange(RUNNING, COMMITTED, Ordering::SeqCst, Ordering::SeqCst).is_ok();
+    match fetched {
         Err(e) if e == update::CANCELLED => {
             let _ = tx.send(In::Fetched(Err(e)));
         }
@@ -822,13 +876,25 @@ fn download(rel: Release, tx: Sender<In>, phase: Arc<AtomicU8>) {
         }
         Ok((file, sha)) => {
             let _ = tx.send(In::Fetched(Ok(())));
-            let r = update_install::apply(&kind, &file, sha);
+            // The installer starts the new version, which gives up if we
+            // have not exited within ~30 s: so no capture may be open from
+            // here on, or the user could end up with no Rustshot running.
+            let daemon = inst.daemon.as_ref();
+            if !wait_idle(daemon, tx) {
+                let _ = std::fs::remove_file(&file);
+                let msg = "Install failed: Rustshot is not running in the background any more";
+                let _ = tx.send(In::Installed(Err(msg.into())));
+                return;
+            }
+            let r = (inst.apply)(&file, sha);
             if r.is_err() {
                 let _ = std::fs::remove_file(&file);
             }
-            if r == Ok(Applied::RestartingNow) {
+            if let Some(d) = daemon {
                 // Even when the dialog is gone: the new version waits for us.
-                quit_daemon();
+                // Nothing to do if the daemon is already gone.
+                let ev = if r == Ok(Applied::RestartingNow) { HotEvent::Restart } else { HotEvent::RestartAborted };
+                let _ = d.send(ev);
             }
             let _ = tx.send(In::Installed(r.map_err(|e| format!("Install failed: {e}"))));
         }
@@ -869,6 +935,10 @@ impl Driver for Dialog {
                 }
             }
             _ => {
+                if matches!(ev, Ev::Down { .. }) {
+                    // A click into the window: the user is using it.
+                    self.m.unsolicited = false;
+                }
                 self.input.feed(&ev);
                 self.render();
             }
@@ -927,12 +997,19 @@ mod tests {
         assert!(matches!(m.screen, Screen::Verifying(_)));
         // Busy: neither a new state nor Esc/close interrupts the install.
         assert_eq!(m.on(In::Fetched(Ok(()))), vec![]);
-        assert!(matches!(m.screen, Screen::Installing(_)));
+        assert!(matches!(m.screen, Screen::Installing { waiting: false, .. }));
         assert_eq!(m.on(In::Dismiss), vec![]);
         assert_eq!(m.on(In::Click(Btn::Cancel)), vec![]);
         m.on(In::Open(Request::Show(DialogState::UpToDate)));
         m.on(In::Open(Request::Check));
-        assert!(matches!(m.screen, Screen::Installing(_)));
+        assert!(matches!(m.screen, Screen::Installing { .. }));
+        // The daemon finishes the user's capture first; still not cancellable.
+        m.on(In::Waiting(true));
+        assert!(matches!(m.screen, Screen::Installing { waiting: true, .. }));
+        assert_eq!(m.on(In::Dismiss), vec![]);
+        assert!(!m.enabled());
+        m.on(In::Waiting(false));
+        assert!(matches!(m.screen, Screen::Installing { waiting: false, .. }));
         // The worker has already asked the daemon to quit; the dialog closes.
         assert_eq!(m.on(In::Installed(Ok(Applied::RestartingNow))), vec![Act::Close]);
     }
@@ -965,6 +1042,18 @@ mod tests {
         // Shown by the user again: Enter is the primary button again.
         m.on(In::Open(Request::Show(DialogState::Available(rel("9.9.9")))));
         assert_eq!(m.on(In::Enter), vec![Act::Download(rel("9.9.9"))]);
+        // The first click makes an offered dialog the user's: Enter works.
+        let (mut m, _) = Machine::start(Request::Offer(DialogState::Error("offline".into())));
+        assert_eq!(m.on(In::Enter), vec![]);
+        assert_eq!(m.on(In::Click(Btn::Retry)), vec![Act::Check]);
+        m.on(In::Checked(Ok(Some(rel("9.9.9")))));
+        assert_eq!(m.on(In::Enter), vec![Act::Download(rel("9.9.9"))]);
+        // So does a click anywhere in the window.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (m, _) = Machine::start(Request::Offer(DialogState::UpToDate));
+        let mut d = Dialog::new(m, crate::theme::DARK, tx, rx);
+        d.on_event(Ev::Down { x: 5, y: 5 });
+        assert!(!d.m.unsolicited);
     }
 
     #[test]
@@ -1013,8 +1102,116 @@ mod tests {
         assert_eq!(m.on(In::Click(Btn::Cancel)), vec![Act::Cancel]);
         // Committed before the worker saw the flag: the install goes ahead.
         m.on(In::Fetched(Ok(())));
-        assert!(matches!(m.screen, Screen::Installing(_)));
+        assert!(matches!(m.screen, Screen::Installing { .. }));
         assert_eq!(m.on(In::Installed(Ok(Applied::RestartingNow))), vec![Act::Close]);
+    }
+
+    /// A verified file in a scratch dir, as `fetch_verified` returns it.
+    fn fetched_file(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = scratch(tag);
+        let file = dir.join("rustshot-9.9.9-setup.exe");
+        std::fs::write(&file, b"new").unwrap();
+        (dir, file)
+    }
+
+    fn installer(daemon: Option<Sender<HotEvent>>, applied: Arc<std::sync::atomic::AtomicBool>) -> Installer {
+        Installer {
+            daemon,
+            apply: Box::new(move |_, _| {
+                applied.store(true, Ordering::SeqCst);
+                Ok(Applied::RestartingNow)
+            }),
+        }
+    }
+
+    /// Cancelled after verification: the file is deleted and CANCELLED
+    /// reported; nothing is asked of the daemon or installed.
+    #[test]
+    fn worker_cancelled_after_verify_deletes_the_file() {
+        let (dir, file) = fetched_file("wcancel");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (dtx, drx) = std::sync::mpsc::channel();
+        let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let phase = AtomicU8::new(CANCELLED);
+        install(Ok((file.clone(), [0; 32])), &phase, &tx, &installer(Some(dtx), applied.clone()));
+        assert!(!file.exists());
+        assert!(matches!(rx.try_recv(), Ok(In::Fetched(Err(e))) if e == update::CANCELLED));
+        assert!(drx.try_recv().is_err() && !applied.load(Ordering::SeqCst));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `apply` (which starts the new version) runs only after the daemon
+    /// replied that no capture is open; then the daemon is told to quit.
+    #[test]
+    fn worker_installs_only_after_the_daemon_is_idle() {
+        let (dir, file) = fetched_file("widle");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (dtx, drx) = std::sync::mpsc::channel();
+        let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inst = installer(Some(dtx), applied.clone());
+        let f = file.clone();
+        let worker = std::thread::spawn(move || {
+            install(Ok((f, [0; 32])), &AtomicU8::new(RUNNING), &tx, &inst);
+        });
+        let Ok(HotEvent::RestartWhenIdle(reply)) = drx.recv_timeout(Duration::from_secs(5)) else {
+            panic!("the worker asks the daemon to go idle first");
+        };
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(5)), Ok(In::Fetched(Ok(())))));
+        // A capture is open: the dialog says so, nothing is installed.
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(5)), Ok(In::Waiting(true))));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!applied.load(Ordering::SeqCst), "apply before the idle reply");
+        reply.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(applied.load(Ordering::SeqCst));
+        assert!(matches!(drx.try_recv(), Ok(HotEvent::Restart)));
+        let rest: Vec<In> = rx.try_iter().collect();
+        assert!(matches!(&rest[..], [In::Waiting(false), In::Installed(Ok(Applied::RestartingNow))]), "{rest:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The daemon went away (quit while waiting, or never registered):
+    /// nothing is installed and the file is deleted.
+    #[test]
+    fn worker_aborts_without_a_daemon() {
+        for gone_while_waiting in [false, true] {
+            let (dir, file) = fetched_file(&format!("wgone{gone_while_waiting}"));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let daemon = if gone_while_waiting {
+                let (dtx, drx) = std::sync::mpsc::channel::<HotEvent>();
+                // The daemon quits: its receiver and the pending reply go.
+                std::thread::spawn(move || drop(drx.recv()));
+                Some(dtx)
+            } else {
+                None
+            };
+            install(Ok((file.clone(), [0; 32])), &AtomicU8::new(RUNNING), &tx, &installer(daemon, applied.clone()));
+            assert!(!applied.load(Ordering::SeqCst));
+            assert!(!file.exists());
+            let last = rx.try_iter().last();
+            assert!(matches!(last, Some(In::Installed(Err(_)))), "{last:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A failed install lifts the daemon's capture gate.
+    #[test]
+    fn worker_failed_install_releases_the_daemon() {
+        let (dir, file) = fetched_file("wfail");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (dtx, drx) = std::sync::mpsc::channel();
+        let inst = Installer { daemon: Some(dtx), apply: Box::new(|_, _| Err("denied".into())) };
+        let daemon = std::thread::spawn(move || {
+            let Ok(HotEvent::RestartWhenIdle(reply)) = drx.recv() else { panic!() };
+            reply.send(()).unwrap();
+            drx.recv().unwrap()
+        });
+        install(Ok((file.clone(), [0; 32])), &AtomicU8::new(RUNNING), &tx, &inst);
+        assert!(matches!(daemon.join().unwrap(), HotEvent::RestartAborted));
+        assert!(!file.exists());
+        assert!(matches!(rx.try_iter().last(), Some(In::Installed(Err(e))) if e == "Install failed: denied"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1189,7 +1386,8 @@ mod tests {
             ("downloading", at(Screen::Downloading { rel: r.clone(), got: 1_234_567, total: Some(3_400_000) })),
             ("verifying", at(Screen::Verifying(r.clone()))),
             ("cancelling", at(Screen::Cancelling(r.clone()))),
-            ("installing", at(Screen::Installing(r.clone()))),
+            ("installing", at(Screen::Installing { rel: r.clone(), waiting: false })),
+            ("waiting", at(Screen::Installing { rel: r.clone(), waiting: true })),
             (
                 "install-failed",
                 at(Screen::InstallFailed {
@@ -1272,6 +1470,9 @@ mod tests {
                 }
                 if let Some(n) = lay.notes {
                     assert!(n.h >= 40.0, "{name}: notes box keeps some height");
+                    // Whole 20 px lines inside 8 px padding: no partial row.
+                    let rows = (n.h - 16.0) / 20.0;
+                    assert!((rows - rows.round()).abs() < 1e-3, "{name}: {rows} rows");
                 }
                 if name.contains("install-failed") {
                     assert!(lay.notes.is_some(), "{name}: the notes stay visible");

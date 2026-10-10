@@ -435,7 +435,7 @@ mod imp {
             let (tx, rx) = mpsc::channel();
             g.listen(tx);
             assert!(matches!(acquire_at(&path), Some(Instance::Signalled)));
-            assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(HotEvent::Capture));
+            assert!(matches!(rx.recv_timeout(Duration::from_secs(2)), Ok(HotEvent::Capture)));
             drop(g);
             assert!(!path.exists());
             // A stale socket file is replaced.
@@ -482,7 +482,7 @@ mod imp {
             // The lock is held, so a second acquire must take the signal path.
             assert!(matches!(try_lock(&lock_path(&path)), Lock::Busy));
             assert!(matches!(acquire_at(&path), Some(Instance::Signalled)));
-            assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(HotEvent::Capture));
+            assert!(matches!(rx.recv_timeout(Duration::from_secs(2)), Ok(HotEvent::Capture)));
             drop(g);
             // Released with the guard: a new primary can start.
             assert!(matches!(acquire_at(&path), Some(Instance::Primary(_))));
@@ -526,6 +526,6 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         g.listen(tx);
         assert!(matches!(acquire_or_signal(), Instance::Signalled));
-        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(2)), Ok(HotEvent::Capture));
+        assert!(matches!(rx.recv_timeout(std::time::Duration::from_secs(2)), Ok(HotEvent::Capture)));
     }
 }

@@ -706,7 +706,8 @@ mod tests {
         std::fs::write(&real, "old").unwrap();
         let link = dir.join("config.toml");
         // Needs Developer Mode or admin rights; skip when not allowed.
-        if std::os::windows::fs::symlink_file(&real, &link).is_err() {
+        if let Err(e) = std::os::windows::fs::symlink_file(&real, &link) {
+            eprintln!("skipped write_atomic_writes_through_symlinks: cannot create a symlink ({e})");
             let _ = std::fs::remove_dir_all(&dir);
             return;
         }

@@ -780,6 +780,15 @@ pub fn wrap(text: &str, max_w: f32, measure: impl Fn(&str) -> f32) -> Vec<String
 
 /// Line pitch of wrapped body text (logical px).
 const LINE_H: f32 = 20.0;
+/// Vertical padding inside a text view, each side (logical px).
+const VIEW_PAD_Y: f32 = 8.0;
+
+/// The tallest text-view height up to `h` whose body shows whole lines
+/// only (at least `min_lines`), logical px.
+pub fn text_view_fit(h: f32, min_lines: usize) -> f32 {
+    let n = ((h - 2.0 * VIEW_PAD_Y) / LINE_H).floor().max(min_lines as f32);
+    n * LINE_H + 2.0 * VIEW_PAD_Y
+}
 
 impl Ui<'_> {
     /// Wrapped text filling the width; `muted` for secondary text. Lines
@@ -827,7 +836,7 @@ impl Ui<'_> {
                 .collect()
         };
         let mut lines = wrap_all(self, inner_w);
-        let view_h = r.h / self.k - 2.0 * 8.0;
+        let view_h = r.h / self.k - 2.0 * VIEW_PAD_Y;
         let mut max = (lines.len() as f32 * LINE_H - view_h).max(0.0);
         if max > 0.0 {
             // Leave room for the scroll thumb.
@@ -862,7 +871,7 @@ impl Ui<'_> {
         let th = self.theme;
         let k = fade(self);
         fill(self, r, RADIUS, th.bg_hover.fade(0.6 * k));
-        let body = FRect { x: r.x, y: r.y + self.px(8.0), w: r.w, h: r.h - self.px(16.0) };
+        let body = FRect { x: r.x, y: r.y + self.px(VIEW_PAD_Y), w: r.w, h: r.h - self.px(2.0 * VIEW_PAD_Y) };
         let font = &crate::fonts::UI;
         let px = self.px(text_size());
         let lh = self.px(LINE_H);

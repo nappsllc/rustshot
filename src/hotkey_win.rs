@@ -40,7 +40,7 @@ pub fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEv
             if msg.message == WM_HOTKEY {
                 let which = msg.wParam.0 as i32;
                 if let Some((_, _, ev)) = specs.iter().find(|(id, _, _)| *id == which)
-                    && tx.send(*ev).is_err()
+                    && tx.send(ev.clone()).is_err()
                 {
                     break; // receiver dropped
                 }

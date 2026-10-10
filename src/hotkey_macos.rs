@@ -153,7 +153,7 @@ fn install() {
                         continue;
                     };
                     regs.push((key as u32, carbon_mods(mods), *id, spec.as_str()));
-                    map.push((*id as u32, *ev));
+                    map.push((*id as u32, ev.clone()));
                 }
                 None => eprintln!("warning: invalid hotkey {spec:?}"),
             }
@@ -273,7 +273,7 @@ unsafe extern "C" fn hotkey_handler(
         }
         match ctx.map.iter().find(|(k, _)| *k == id.id) {
             Some((_, ev)) => {
-                let _ = ctx.tx.send(*ev); // receiver gone = app exiting
+                let _ = ctx.tx.send(ev.clone()); // receiver gone = app exiting
                 0
             }
             None => NOT_HANDLED,
