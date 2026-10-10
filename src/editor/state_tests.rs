@@ -30,6 +30,13 @@ fn quiet(mut a: App) -> App {
     a
 }
 
+/// One second before now, for wheel-throttle stamps (no underflow panic
+/// on a clock that started less than a second ago).
+fn a_second_ago() -> Instant {
+    let now = Instant::now();
+    now.checked_sub(Duration::from_secs(1)).unwrap_or(now)
+}
+
 fn ed(a: &mut App) -> &mut Edit {
     edit_of(a)
 }
@@ -151,6 +158,31 @@ fn new_selection_is_clamped_to_the_shot() {
     let mut a = app(None);
     drag(&mut a, (1000, 600), (5000, 700));
     assert_eq!(ed(&mut a).sel, Some(r(1000.0, 600.0, 440.0, 100.0)));
+}
+
+#[test]
+fn shift_drag_past_the_shot_keeps_the_anchor_and_stays_square_inside() {
+    // (anchor, pointer far past the shot, expected square). 1440x900 shot.
+    for (from, to, want) in [
+        ((1000, 600), (5000, 4000), r(1000.0, 600.0, 300.0, 300.0)), // bottom-right corner
+        ((100, 200), (-500, -300), r(0.0, 100.0, 100.0, 100.0)),      // top-left corner
+        ((1300, 100), (3000, -50), r(1300.0, 0.0, 100.0, 100.0)),     // top-right corner
+        ((200, 800), (-400, 1200), r(100.0, 800.0, 100.0, 100.0)),    // bottom-left corner
+        ((1000, 600), (5000, 700), r(1000.0, 600.0, 300.0, 300.0)),   // right edge
+        ((400, 500), (300, -2000), r(0.0, 100.0, 400.0, 400.0)),       // top edge
+        ((400, 300), (-900, 350), r(0.0, 300.0, 400.0, 400.0)),       // left edge
+        ((700, 400), (750, 3000), r(700.0, 400.0, 500.0, 500.0)),     // bottom edge
+    ] {
+        let mut a = app(None);
+        let _m = hold(SHIFT);
+        drag(&mut a, from, to);
+        let s = ed(&mut a).sel.unwrap();
+        assert_eq!(s, want, "{from:?} -> {to:?}");
+        assert_eq!(s.w, s.h, "square {from:?} -> {to:?}");
+        assert!(s.x >= 0.0 && s.y >= 0.0 && s.x1() <= 1440.0 && s.y1() <= 900.0, "inside {s:?}");
+        let corners = [(s.x, s.y), (s.x1(), s.y), (s.x, s.y1()), (s.x1(), s.y1())];
+        assert!(corners.contains(&(from.0 as f32, from.1 as f32)), "anchor fixed {from:?} {s:?}");
+    }
 }
 
 #[test]
@@ -549,7 +581,7 @@ fn text_commit_cancel_and_click_outside() {
     assert_eq!(ed(&mut a).text.as_ref().map(|t| t.pos), Some(Pt::new(700.0, 600.0)));
     // The wheel does not change sizes while typing.
     let before = ed(&mut a).sizes.font;
-    ed(&mut a).last_wheel = Instant::now() - Duration::from_secs(1);
+    ed(&mut a).last_wheel = a_second_ago();
     a.on_event(Ev::Wheel { delta: 120, x: 0, y: 0 });
     assert_eq!(ed(&mut a).sizes.font, before);
 }
@@ -627,7 +659,7 @@ fn undo_limit_drops_the_oldest_states() {
 fn wheel_and_size_acts_change_the_active_tool_size() {
     let mut a = app(Some(r(100.0, 100.0, 600.0, 400.0)));
     let wheel = |a: &mut App, delta: i32| {
-        ed(a).last_wheel = Instant::now() - Duration::from_secs(1);
+        ed(a).last_wheel = a_second_ago();
         a.on_event(Ev::Wheel { delta, x: 10, y: 10 });
     };
     let line = ed(&mut a).sizes.line;

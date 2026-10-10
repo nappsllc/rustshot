@@ -894,8 +894,11 @@ mod tests {
         let text = String::from_utf8_lossy(&out.stdout);
         println!("{text}");
         assert!(out.status.success(), "leak probe failed:\n{text}\n{}", String::from_utf8_lossy(&out.stderr));
-        assert!(text.contains("1 passed"), "the probe ran:\n{text}");
+        assert!(text.contains(LEAK_PROBE_DONE), "the probe ran to the end:\n{text}");
     }
+
+    /// Printed by `window_leak_probe` once its checks passed.
+    const LEAK_PROBE_DONE: &str = "rustshot-leak-probe: done";
 
     /// Run alone in a child process by the test above: five windows in a
     /// row leave the GDI/USER object counts where they were (three rounds:
@@ -926,6 +929,7 @@ mod tests {
         let _ = unsafe { windows::Win32::Foundation::CloseHandle(me) };
         println!("(gdi, user) objects before -> after 5 windows: {seen:?}");
         assert!(ok, "GDI/USER objects grew over 5 windows ((gdi, user) before -> after): {seen:?}");
+        println!("{LEAK_PROBE_DONE}");
     }
 
     /// Two `run_window` threads at once: the "overlay-style" window goes

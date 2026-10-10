@@ -639,6 +639,9 @@ mod name_tests {
 /// Every platform: named instances (unique per test, so the tests run in
 /// parallel beside each other and beside the user's daemon), second-launch
 /// signalling, and recovery from a holder that died.
+///
+/// Run locally on Windows, these tests briefly show tray icons of their
+/// own named instances (they never touch the default instance).
 #[cfg(test)]
 mod tests {
     use super::{Instance, imp};

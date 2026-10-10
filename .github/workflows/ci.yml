@@ -38,13 +38,19 @@ jobs:
       # windows (the overlay, run_window, the Settings window, the update
       # dialog) open for about a second and close themselves.
       - name: X11 capture and windows under Xvfb
+        timeout-minutes: 10
         env:
           RUSTSHOT_TEST_AUTOCLOSE_MS: "1000"
-        run: >-
-          timeout 300 xvfb-run -a -s "-screen 0 1600x900x24"
-          cargo test --bin rustshot -- --ignored --test-threads=1 --nocapture
-          live_monitor_capture live_desktop_capture live_window_lifecycle
-          interactive_window_renders_rect window_smoke
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/test-logs"
+          timeout 300 xvfb-run -a -s "-screen 0 1600x900x24"             cargo test --bin rustshot -- --ignored --test-threads=1 --nocapture             live_monitor_capture live_desktop_capture live_window_lifecycle             interactive_window_renders_rect window_smoke             2>&1 | tee "$RUNNER_TEMP/test-logs/xvfb.log"
+      - name: Upload Xvfb test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-linux-xvfb
+          path: ${{ runner.temp }}/test-logs
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Build
@@ -62,9 +68,11 @@ jobs:
             dist/*.deb
             dist/*.AppImage
 
-  # Line coverage per file into the job summary (no threshold yet).
+  # Line coverage per file into the job summary (no threshold yet). Never
+  # turns a run red.
   coverage:
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -217,27 +225,6 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Build
         run: cargo build --release
-      # The runner has an interactive desktop: the live capture, window,
-      # tray and clipboard tests run here (not the benchmarks, previews,
-      # network or pick-a-folder ones).
-      - name: Live desktop tests
-        env:
-          RUSTSHOT_TEST_AUTOCLOSE_MS: "1000"
-        run: >-
-          cargo test --bin rustshot -- --ignored --test-threads=1 --nocapture
-          live_monitor_capture live_desktop_capture live_window_lifecycle
-          interactive_window_renders_rect window_smoke present_colors_round_trip
-          live_icon_added_and_removed live_clipboard_roundtrip
-      # The e2e suite drives the release exe with posted input. Its daemons
-      # use their own instance name, and every launch its own APPDATA.
-      - name: End-to-end
-        env:
-          RUSTSHOT_INSTANCE: ci-e2e-${{ github.run_id }}
-          RUSTSHOT_E2E_BIN: ${{ github.workspace }}/target/release/rustshot.exe
-          APPDATA: ${{ runner.temp }}/e2e-appdata
-        run: |
-          New-Item -ItemType Directory -Force $env:APPDATA | Out-Null
-          cargo test --test e2e -- --include-ignored --test-threads=1 --nocapture
       - name: Installer
         run: |
           choco install nsis -y --no-progress
@@ -264,3 +251,48 @@ jobs:
         with:
           name: rustshot-windows-msix
           path: dist/*.msix
+
+  # Real windows on the runner's interactive desktop. A separate job so it
+  # gates pushes and PRs but never a release: release.yml reuses this file
+  # on tag pushes, where the job is skipped.
+  desktop-e2e:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+      # The live capture, window, tray and clipboard tests (not the
+      # benchmarks, previews, network or pick-a-folder ones).
+      - name: Live desktop tests
+        timeout-minutes: 10
+        shell: bash
+        env:
+          RUSTSHOT_TEST_AUTOCLOSE_MS: "1000"
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/test-logs"
+          cargo test --bin rustshot -- --ignored --test-threads=1 --nocapture             live_monitor_capture live_desktop_capture live_window_lifecycle             interactive_window_renders_rect window_smoke present_colors_round_trip             live_icon_added_and_removed live_clipboard_roundtrip             2>&1 | tee "$RUNNER_TEMP/test-logs/live-desktop.log"
+      # The e2e suite drives the release exe with posted input. Its daemons
+      # use their own instance name, and every launch its own APPDATA.
+      - name: End-to-end
+        timeout-minutes: 10
+        shell: bash
+        env:
+          RUSTSHOT_INSTANCE: ci-e2e-${{ github.run_id }}
+          RUSTSHOT_E2E_BIN: ${{ github.workspace }}/target/release/rustshot.exe
+          APPDATA: ${{ runner.temp }}/e2e-appdata
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/test-logs" "$(cygpath -u "$APPDATA")"
+          cargo test --test e2e -- --include-ignored --test-threads=1 --nocapture             2>&1 | tee "$RUNNER_TEMP/test-logs/e2e.log"
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-windows-desktop
+          path: |
+            ${{ runner.temp }}/test-logs
+            ${{ runner.temp }}/e2e-appdata

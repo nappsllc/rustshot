@@ -879,7 +879,7 @@ impl App {
                         // at the edge instead of pushing the rect back in.
                         let p = Pt::new(p.x.clamp(0.0, img.0), p.y.clamp(0.0, img.1));
                         let cur = if mods.shift {
-                            constrain_square(anchor, p)
+                            square_within(anchor, constrain_square(anchor, p), img)
                         } else {
                             p
                         };
@@ -1709,6 +1709,18 @@ fn constrain_square(start: Pt, cur: Pt) -> Pt {
         start.x + side.copysign(dx),
         start.y + side.copysign(dy),
     )
+}
+
+/// Shrink a Shift-constrained square so it fits inside the shot without
+/// moving `anchor`: the side is limited by the room from the anchor to the
+/// shot edge in the drag direction on both axes.
+fn square_within(anchor: Pt, cur: Pt, img: (f32, f32)) -> Pt {
+    let dx = cur.x - anchor.x;
+    let dy = cur.y - anchor.y;
+    let room_x = if dx < 0.0 { anchor.x } else { img.0 - anchor.x };
+    let room_y = if dy < 0.0 { anchor.y } else { img.1 - anchor.y };
+    let side = dx.abs().min(room_x.max(0.0)).min(room_y.max(0.0));
+    Pt::new(anchor.x + side.copysign(dx), anchor.y + side.copysign(dy))
 }
 
 /// Compute the selection rect while resizing with a handle.

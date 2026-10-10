@@ -229,6 +229,8 @@ fn text_tool_types_and_accepts() {
     );
 }
 
+/// Run locally, this briefly shows the tray icon of its own named daemon
+/// instance (it never runs beside, or touches, the default one).
 #[test]
 #[ignore = "live display access"]
 fn daemon_stays_alive() {
