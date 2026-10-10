@@ -2545,12 +2545,14 @@ mod tests {
 
     #[test]
     fn settled_editor_is_not_stale() {
-        let now = Instant::now();
         let mut app = preview_app(theme::DARK, Some(FRect { x: 10.0, y: 10.0, w: 200.0, h: 100.0 }));
         let e = edit_of(&mut app);
         for t in [&mut e.mo.dim, &mut e.mo.bar, &mut e.mo.pop, &mut e.mo.hint, &mut e.mo.hover] {
             t.snap(t.target());
         }
+        // Taken after setup: a slow setup under a loaded test run must not
+        // make `now` predate the editor's own timestamps.
+        let now = Instant::now();
         assert!(!stale(e, None, now), "idle tick: no frame");
         e.hover = Some(0);
         e.hover_at = now;
