@@ -1,5 +1,7 @@
-//! Overlay window surface shared by every platform: input events, modifier
-//! state, the framebuffer driver trait, and virtual-key constants.
+//! Window surface shared by every platform: input events, modifier state,
+//! the framebuffer driver trait, and virtual-key constants. Two window
+//! kinds share the `Driver` trait: the fullscreen overlay (`run`) and a
+//! normal decorated top-level window (`run_window`, for dialogs/Settings).
 //! Per-OS implementations live in `wind_win.rs` / `wind_linux.rs` /
 //! `wind_macos.rs`.
 
@@ -49,8 +51,91 @@ pub enum Ev {
     Up { x: i32, y: i32 },
     Wheel { delta: i32, x: i32, y: i32 },
     Key { vk: u32, up: bool, repeat: bool, mods: Mods },
+    /// Text input, one UTF-16 code unit per event (WM_CHAR parity on every
+    /// backend). Characters outside the BMP arrive as two events, a high
+    /// then a low surrogate: text consumers must buffer a high surrogate and
+    /// combine it with the next unit (`char::decode_utf16`), dropping an
+    /// unpaired one. Control codes (Backspace 0x08, Ctrl+letter, ...) also
+    /// arrive here and are for the consumer to filter.
     Char(u16),
     Timer,
+    #[cfg_attr(not(test), allow(dead_code))]
+    /// `run_window` only: the close button (or Alt+F4 / WM_DELETE_WINDOW)
+    /// was pressed. Nothing closes by itself: the driver calls
+    /// `wind::close(hwnd)` to end the loop, or ignores it to stay open.
+    Close,
+    /// `run_window` only: new client size in physical pixels. Also sent
+    /// once right after `on_create`, so the driver always knows its size.
+    #[cfg_attr(not(test), allow(dead_code))] // read by the later dialog/Settings drivers
+    Resize(u32, u32),
+    /// `run_window` only: the window gained (true) or lost keyboard focus.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Focus(bool),
+}
+
+/// A normal decorated top-level window for `run_window`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // used by the update dialog / Settings (later tasks)
+pub struct WindowSpec {
+    /// Title bar text (passed through as is).
+    pub title: String,
+    /// Initial client size in logical pixels (scaled by the monitor's DPI).
+    pub w: u32,
+    pub h: u32,
+    /// Whether the user can resize/maximise the window.
+    pub resizable: bool,
+    /// Minimum client size in logical pixels (only enforced when resizable).
+    pub min: (u32, u32),
+}
+
+/// Logical size → physical pixels at `scale` (never below 1 px).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn to_phys(v: u32, scale: f32) -> u32 {
+    ((v as f32 * scale).round() as u32).max(1)
+}
+
+/// Top-left that centres a `w`×`h` outer rect inside `area` (x, y, w, h),
+/// clamped so the title bar never starts above/left of the area.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn centre_in(area: (i32, i32, i32, i32), w: i32, h: i32) -> (i32, i32) {
+    let (ax, ay, aw, ah) = area;
+    (ax + ((aw - w) / 2).max(0), ay + ((ah - h) / 2).max(0))
+}
+
+/// Window icon as `_NET_WM_ICON` data: `[w, h, ARGB pixels...]` decoded from
+/// an embedded PNG (any 8-bit colour type).
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn icon_argb(png_bytes: &[u8]) -> Option<Vec<u32>> {
+    let mut dec = png::Decoder::new(png_bytes);
+    dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = dec.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let (w, h) = (info.width, info.height);
+    let px = |r: u8, g: u8, b: u8, a: u8| (a as u32) << 24 | (r as u32) << 16 | (g as u32) << 8 | b as u32;
+    let data = &buf[..info.buffer_size()];
+    let mut out = Vec::with_capacity(2 + (w * h) as usize);
+    out.extend([w, h]);
+    match info.color_type {
+        png::ColorType::Rgba => out.extend(data.as_chunks::<4>().0.iter().map(|p| px(p[0], p[1], p[2], p[3]))),
+        png::ColorType::Rgb => out.extend(data.as_chunks::<3>().0.iter().map(|p| px(p[0], p[1], p[2], 255))),
+        png::ColorType::GrayscaleAlpha => {
+            out.extend(data.as_chunks::<2>().0.iter().map(|p| px(p[0], p[0], p[0], p[1])))
+        }
+        png::ColorType::Grayscale => out.extend(data.iter().map(|&v| px(v, v, v, 255))),
+        png::ColorType::Indexed => return None, // EXPAND turns palettes into RGB(A)
+    }
+    (out.len() == 2 + (w * h) as usize).then_some(out)
+}
+
+/// `Xft.dpi` from an X resource-manager string (`XResourceManagerString`)
+/// as a scale factor (96 dpi = 1.0); `None` when absent or nonsensical.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn xft_scale(resources: &str) -> Option<f32> {
+    resources.lines().find_map(|l| {
+        let v = l.strip_prefix("Xft.dpi:")?.trim().parse::<f32>().ok()?;
+        (48.0..=960.0).contains(&v).then_some(v / 96.0)
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -212,6 +297,100 @@ mod tests {
         let code = run(&mut d);
         assert!(d.created);
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn logical_to_physical_and_centring() {
+        assert_eq!(to_phys(400, 1.0), 400);
+        assert_eq!(to_phys(400, 1.5), 600);
+        assert_eq!(to_phys(301, 1.25), 376);
+        assert_eq!(to_phys(0, 2.0), 1);
+        assert_eq!(centre_in((0, 0, 1920, 1040), 400, 300), (760, 370));
+        assert_eq!(centre_in((-1920, 0, 1920, 1080), 400, 300), (-1160, 390));
+        // Larger than the work area: pinned to its top-left.
+        assert_eq!(centre_in((100, 50, 800, 600), 1000, 700), (100, 50));
+    }
+
+    #[test]
+    fn window_icon_png_decodes_to_argb() {
+        let d = icon_argb(include_bytes!("../packaging/icons/rustshot-48.png")).expect("decodes");
+        assert_eq!(&d[..2], &[48, 48]);
+        assert_eq!(d.len(), 2 + 48 * 48);
+        assert!(d[2..].iter().any(|p| p >> 24 == 0xff), "has opaque pixels");
+        assert!(icon_argb(b"not a png").is_none());
+    }
+
+    #[test]
+    fn xft_dpi_parses() {
+        assert_eq!(xft_scale("Xft.antialias:	1
+Xft.dpi:	144
+"), Some(1.5));
+        assert_eq!(xft_scale("Xft.dpi: 96"), Some(1.0));
+        assert_eq!(xft_scale("Xcursor.size: 24
+"), None);
+        assert_eq!(xft_scale("Xft.dpi:	abc
+"), None);
+        assert_eq!(xft_scale("Xft.dpi:	0
+"), None);
+    }
+
+    /// Interactive (X11 / macOS main thread): a 400x300 window rendering a
+    /// filled rect; Esc or the close button closes it, as does
+    /// `RUSTSHOT_TEST_AUTOCLOSE_MS`. Windows has its own variant in
+    /// wind_win.rs (posted WM_CLOSE + pixel readback).
+    /// `cargo test interactive_window -- --ignored --nocapture --test-threads=1`
+    #[cfg(not(windows))]
+    #[test]
+    #[ignore = "interactive: opens a window"]
+    fn interactive_window_renders_rect() {
+        struct Rect {
+            hwnd: Hwnd,
+            fb: PixBuf,
+            deadline: Option<std::time::Instant>,
+            painted: bool,
+        }
+        impl Driver for Rect {
+            fn on_create(&mut self, hwnd: Hwnd) {
+                self.hwnd = hwnd;
+                println!("created, scale {}", scale(hwnd));
+            }
+            fn on_event(&mut self, ev: Ev) -> bool {
+                match ev {
+                    Ev::Resize(w, h) => {
+                        println!("resize {w}x{h}");
+                        self.fb = PixBuf::new(w, h);
+                    }
+                    Ev::Focus(f) => println!("focus {f}"),
+                    Ev::Key { vk: key::ESCAPE, up: false, .. } | Ev::Close => close(self.hwnd),
+                    Ev::Timer if self.painted && self.deadline.is_some_and(|d| std::time::Instant::now() >= d) => {
+                        close(self.hwnd)
+                    }
+                    _ => {}
+                }
+                false
+            }
+            fn frame(&mut self) -> Option<&mut PixBuf> {
+                let (w, h) = self.fb.dimensions();
+                for (i, p) in self.fb.as_raw_mut().as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    let (x, y) = (i as u32 % w, i as u32 / w);
+                    let inside = x >= w / 4 && x < w * 3 / 4 && y >= h / 4 && y < h * 3 / 4;
+                    *p = if inside { [64, 128, 255, 255] } else { [24, 24, 28, 255] };
+                }
+                self.painted = true;
+                Some(&mut self.fb)
+            }
+            fn cursor(&self) -> Cursor {
+                Cursor::Arrow
+            }
+        }
+        let deadline = std::env::var("RUSTSHOT_TEST_AUTOCLOSE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+        let mut d = Rect { hwnd: Hwnd::default(), fb: PixBuf::new(1, 1), deadline, painted: false };
+        let spec = WindowSpec { title: "rustshot window test".into(), w: 400, h: 300, resizable: true, min: (200, 150) };
+        run_window(spec, &mut d).expect("window loop");
+        assert!(d.painted);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 ﻿//! X11 overlay window: override-redirect surface, event pump (Key/Button/
 //! Motion/Expose → `Ev`), variable timer cadence (`wind::tick_ms`) and framebuffer presentation.
 //! X11/Xorg only — Wayland has no client-side override-redirect overlay.
+//! Also the decorated `run_window` (dialogs/Settings), on its own Display.
 
 use super::*;
 
@@ -244,10 +245,56 @@ struct XExposeEvent {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct XConfigureEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut c_void,
+    event: c_ulong,
+    window: c_ulong,
+    x: c_int,
+    y: c_int,
+    width: c_int,
+    height: c_int,
+    border_width: c_int,
+    above: c_ulong,
+    override_redirect: c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct XClientMessageEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut c_void,
+    window: c_ulong,
+    message_type: c_ulong,
+    format: c_int,
+    data: [c_long; 5],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct XFocusChangeEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *mut c_void,
+    window: c_ulong,
+    mode: c_int,
+    detail: c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 union XEvent {
     type_: c_int,
     key: XKeyButtonEvent,
     expose: XExposeEvent,
+    configure: XConfigureEvent,
+    client: XClientMessageEvent,
+    focus: XFocusChangeEvent,
     pad: [c_ulong; 24],
 }
 
@@ -317,8 +364,10 @@ std::thread_local! {
 // --- public API -----------------------------------------------------------
 
 /// Ask for a repaint of the window's client area.
-pub fn invalidate(_hwnd: Hwnd) {
-    PRESENT.store(true, Ordering::SeqCst);
+pub fn invalidate(hwnd: Hwnd) {
+    if !with_slot(hwnd, |s| s.present = true) {
+        PRESENT.store(true, Ordering::SeqCst);
+    }
 }
 
 /// The event loop reads `tick_ms()` each pass; nothing to re-arm.
@@ -356,11 +405,13 @@ pub fn hide(hwnd: Hwnd) {
     });
 }
 
-pub fn close(_hwnd: Hwnd) {
+pub fn close(hwnd: Hwnd) {
     // Never destroy the window from here: callers run inside event handling
     // on the pump thread, exactly like DestroyWindow on Win32 (whose effect
     // is also deferred until the current dispatch returns).
-    QUIT.store(true, Ordering::SeqCst);
+    if !with_slot(hwnd, |s| s.quit = true) {
+        QUIT.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Create the (initially hidden) overlay and pump events until quit.
@@ -461,6 +512,331 @@ pub fn run(driver: &mut dyn Driver) -> i32 {
         MAIN_WINDOW.store(0, Ordering::SeqCst);
         XCloseDisplay(dpy);
         0
+    }
+}
+
+// --- decorated window (run_window) ----------------------------------------
+
+/// Per-thread state of a running `run_window` (win 0 = none). `close`,
+/// `invalidate` and `scale` route here for that window, so a dialog never
+/// touches the overlay's process-wide QUIT/PRESENT flags.
+#[derive(Clone, Copy)]
+struct WinSlot {
+    win: c_ulong,
+    quit: bool,
+    present: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
+    scale: f32,
+}
+
+const NO_SLOT: WinSlot = WinSlot { win: 0, quit: false, present: false, scale: 1.0 };
+
+std::thread_local! {
+    static WINDOWED: Cell<WinSlot> = const { Cell::new(NO_SLOT) };
+}
+
+/// Apply `f` to this thread's `run_window` slot when `hwnd` is that window.
+fn with_slot(hwnd: Hwnd, f: impl FnOnce(&mut WinSlot)) -> bool {
+    WINDOWED.with(|c| {
+        let mut s = c.get();
+        if s.win == 0 || s.win != hwnd.0 {
+            return false;
+        }
+        f(&mut s);
+        c.set(s);
+        true
+    })
+}
+
+#[cfg_attr(not(test), allow(unused_imports))]
+pub use window::{run_window, scale};
+
+/// The decorated window proper (no caller outside tests until the update
+/// dialog / Settings land, hence the dead-code allowance).
+mod window {
+    #![cfg_attr(not(test), allow(dead_code))]
+    use super::*;
+
+    #[allow(clashing_extern_declarations)]
+    #[link(name = "X11")]
+    unsafe extern "C" {
+        fn XInternAtom(dpy: *mut c_void, name: *const c_char, only_if_exists: c_int) -> c_ulong;
+        fn XChangeProperty(
+            dpy: *mut c_void,
+            w: c_ulong,
+            property: c_ulong,
+            type_: c_ulong,
+            format: c_int,
+            mode: c_int,
+            data: *const u8,
+            nelements: c_int,
+        ) -> c_int;
+        fn XSetWMProtocols(dpy: *mut c_void, w: c_ulong, protocols: *mut c_ulong, count: c_int) -> c_int;
+        fn XSetWMNormalHints(dpy: *mut c_void, w: c_ulong, hints: *mut XSizeHints);
+        fn XSetWMHints(dpy: *mut c_void, w: c_ulong, hints: *mut XWMHints) -> c_int;
+        fn XResourceManagerString(dpy: *mut c_void) -> *mut c_char;
+    }
+
+    const FOCUS_IN: c_int = 9;
+    const FOCUS_OUT: c_int = 10;
+    const CONFIGURE_NOTIFY: c_int = 22;
+    const CLIENT_MESSAGE: c_int = 33;
+
+    /// DPI scale of a `run_window` window (from `Xft.dpi`, 1.0 = 96 dpi); 1.0
+    /// for anything else (the overlay works in physical pixels).
+    pub fn scale(hwnd: Hwnd) -> f32 {
+        let mut out = 1.0;
+        with_slot(hwnd, |s| out = s.scale);
+        out
+    }
+
+    /// XSizeHints (Xutil.h).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct XSizeHints {
+        flags: c_long,
+        x: c_int,
+        y: c_int,
+        width: c_int,
+        height: c_int,
+        min_width: c_int,
+        min_height: c_int,
+        max_width: c_int,
+        max_height: c_int,
+        width_inc: c_int,
+        height_inc: c_int,
+        min_aspect: [c_int; 2],
+        max_aspect: [c_int; 2],
+        base_width: c_int,
+        base_height: c_int,
+        win_gravity: c_int,
+    }
+
+    /// XWMHints (Xutil.h).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct XWMHints {
+        flags: c_long,
+        input: c_int,
+        initial_state: c_int,
+        icon_pixmap: c_ulong,
+        icon_window: c_ulong,
+        icon_x: c_int,
+        icon_y: c_int,
+        icon_mask: c_ulong,
+        window_group: c_ulong,
+    }
+
+    const US_POSITION: c_long = 1 << 0;
+    const P_POSITION: c_long = 1 << 2;
+    const P_MIN_SIZE: c_long = 1 << 4;
+    const P_MAX_SIZE: c_long = 1 << 5;
+    const INPUT_HINT: c_long = 1 << 0;
+    const XA_ATOM: c_ulong = 4;
+    const XA_CARDINAL: c_ulong = 6;
+    const PROP_MODE_REPLACE: c_int = 0;
+    const CW_BIT_GRAVITY: c_ulong = 1 << 4;
+    const NORTH_WEST_GRAVITY: c_int = 1;
+    const NOTIFY_GRAB: c_int = 1;
+    const NOTIFY_UNGRAB: c_int = 2;
+    const NOTIFY_POINTER: c_int = 5;
+
+    /// 48 px app icon for `_NET_WM_ICON` (decoded once per window).
+    const ICON_PNG: &[u8] = include_bytes!("../packaging/icons/rustshot-48.png");
+
+    unsafe fn atom(dpy: *mut c_void, name: &core::ffi::CStr) -> c_ulong {
+        unsafe { XInternAtom(dpy, name.as_ptr(), 0) }
+    }
+
+    /// Format-32 property data travels as C longs (64-bit on LP64).
+    unsafe fn set_prop32(dpy: *mut c_void, win: c_ulong, prop: c_ulong, ty: c_ulong, data: &[c_ulong]) {
+        unsafe {
+            XChangeProperty(dpy, win, prop, ty, 32, PROP_MODE_REPLACE, data.as_ptr().cast(), data.len() as c_int);
+        }
+    }
+
+    /// Monitor rect (x, y, w, h) under the pointer: primary, then any, then
+    /// a 1920x1080 guess when enumeration fails entirely.
+    fn monitor_under_cursor() -> (i32, i32, i32, i32) {
+        let (cx, cy) = crate::capture::cursor_pos();
+        let mons = crate::capture::monitors().unwrap_or_default();
+        mons.iter()
+            .find(|m| m.contains(cx, cy))
+            .or_else(|| mons.iter().find(|m| m.primary))
+            .or(mons.first())
+            .map(|m| (m.x, m.y, m.w as i32, m.h as i32))
+            .unwrap_or((0, 0, 1920, 1080))
+    }
+
+    /// Open a normal decorated top-level window (WM_DELETE_WINDOW, size hints,
+    /// `_NET_WM_NAME`, `_NET_WM_ICON`) centred on the monitor under the
+    /// pointer and pump its events until the driver calls `wind::close(hwnd)`.
+    /// Callable from any thread: every call opens its own Display connection
+    /// (`init_x11` has run `XInitThreads`). The close button only sends
+    /// `Ev::Close`. `Ev::Resize` (physical px) follows `on_create` and every
+    /// size change; `wind::scale(hwnd)` is `Xft.dpi / 96`.
+    pub fn run_window(spec: WindowSpec, driver: &mut dyn Driver) -> anyhow::Result<()> {
+        init_x11();
+        unsafe {
+            let dpy = XOpenDisplay(core::ptr::null());
+            if dpy.is_null() {
+                anyhow::bail!("failed to open X display");
+            }
+            let rm = XResourceManagerString(dpy);
+            let s = if rm.is_null() {
+                None
+            } else {
+                xft_scale(&core::ffi::CStr::from_ptr(rm).to_string_lossy())
+            }
+            .unwrap_or(1.0);
+            let (pw, ph) = (to_phys(spec.w, s), to_phys(spec.h, s));
+            let (x, y) = centre_in(monitor_under_cursor(), pw as i32, ph as i32);
+            let screen = XDefaultScreen(dpy);
+            let root = XRootWindow(dpy, screen);
+            let mut attrs: XSetWindowAttributes = core::mem::zeroed();
+            attrs.event_mask = EVENT_MASK as c_long;
+            // No background: the server never clears to black before a frame.
+            attrs.bit_gravity = NORTH_WEST_GRAVITY;
+            let win = XCreateWindow(
+                dpy,
+                root,
+                x,
+                y,
+                pw,
+                ph,
+                0,
+                0,
+                INPUT_OUTPUT,
+                core::ptr::null_mut(),
+                CW_EVENT_MASK | CW_BIT_GRAVITY,
+                &mut attrs,
+            );
+            let utf8 = atom(dpy, c"UTF8_STRING");
+            for prop in [atom(dpy, c"_NET_WM_NAME"), atom(dpy, c"WM_NAME")] {
+                XChangeProperty(
+                    dpy,
+                    win,
+                    prop,
+                    utf8,
+                    8,
+                    PROP_MODE_REPLACE,
+                    spec.title.as_ptr(),
+                    spec.title.len() as c_int,
+                );
+            }
+            if let Some(icon) = icon_argb(ICON_PNG) {
+                let data: Vec<c_ulong> = icon.iter().map(|&v| v as c_ulong).collect();
+                set_prop32(dpy, win, atom(dpy, c"_NET_WM_ICON"), XA_CARDINAL, &data);
+            }
+            let normal = atom(dpy, c"_NET_WM_WINDOW_TYPE_NORMAL");
+            set_prop32(dpy, win, atom(dpy, c"_NET_WM_WINDOW_TYPE"), XA_ATOM, &[normal]);
+            let wm_protocols = atom(dpy, c"WM_PROTOCOLS");
+            let mut wm_delete = atom(dpy, c"WM_DELETE_WINDOW");
+            XSetWMProtocols(dpy, win, &mut wm_delete, 1);
+            let mut hints = XSizeHints { flags: US_POSITION | P_POSITION | P_MIN_SIZE, x, y, ..Default::default() };
+            if spec.resizable {
+                (hints.min_width, hints.min_height) = (to_phys(spec.min.0, s) as c_int, to_phys(spec.min.1, s) as c_int);
+            } else {
+                hints.flags |= P_MAX_SIZE;
+                (hints.min_width, hints.min_height) = (pw as c_int, ph as c_int);
+                (hints.max_width, hints.max_height) = (pw as c_int, ph as c_int);
+            }
+            XSetWMNormalHints(dpy, win, &mut hints);
+            let mut wmh = XWMHints { flags: INPUT_HINT, input: 1, ..Default::default() };
+            XSetWMHints(dpy, win, &mut wmh);
+            let gc = XCreateGC(dpy, win, 0, core::ptr::null_mut());
+
+            let prev_dpy = RUN_DPY.with(|c| c.replace(dpy));
+            let prev_slot = WINDOWED.with(|c| c.replace(WinSlot { win, quit: false, present: false, scale: s }));
+            let quit = || WINDOWED.with(|c| c.get().quit);
+            let mut size = (pw, ph);
+            driver.on_create(Hwnd(win));
+            if !quit() {
+                driver.on_event(Ev::Resize(pw, ph));
+            }
+            if !quit() {
+                XMapRaised(dpy, win);
+                XFlush(dpy);
+            }
+
+            let mut lost = false;
+            let mut down: HashSet<u32> = HashSet::new();
+            let mut cursor: Option<Cursor> = None;
+            let mut cursors: [c_ulong; 8] = [0; 8];
+            let mut next_tick = Instant::now() + Duration::from_millis(tick_ms());
+            while !quit() {
+                next_tick = next_tick.min(Instant::now() + Duration::from_millis(tick_ms()));
+                let mut repaint = false;
+                if XPending(dpy) == 0 {
+                    let wait = next_tick.saturating_duration_since(Instant::now()).as_micros().div_ceil(1000) as c_int;
+                    let mut pfd = PollFd { fd: XConnectionNumber(dpy), events: POLLIN, revents: 0 };
+                    poll(&mut pfd, 1, wait);
+                    if pfd.revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
+                        lost = true;
+                        break;
+                    }
+                }
+                if Instant::now() >= next_tick {
+                    next_tick = Instant::now() + Duration::from_millis(tick_ms());
+                    repaint |= driver.on_event(Ev::Timer);
+                }
+                while XPending(dpy) > 0 && !quit() {
+                    let mut ev: XEvent = core::mem::zeroed();
+                    XNextEvent(dpy, &mut ev);
+                    match ev.type_ {
+                        CLIENT_MESSAGE => {
+                            let c = ev.client;
+                            if c.message_type == wm_protocols && c.data[0] as c_ulong == wm_delete {
+                                driver.on_event(Ev::Close);
+                                repaint = true;
+                            }
+                        }
+                        CONFIGURE_NOTIFY => {
+                            let c = ev.configure;
+                            let now = (c.width.max(1) as u32, c.height.max(1) as u32);
+                            if c.window == win && now != size {
+                                size = now;
+                                driver.on_event(Ev::Resize(now.0, now.1));
+                                repaint = true;
+                            }
+                        }
+                        FOCUS_IN | FOCUS_OUT => {
+                            let f = ev.focus;
+                            if f.mode != NOTIFY_GRAB && f.mode != NOTIFY_UNGRAB && f.detail != NOTIFY_POINTER {
+                                driver.on_event(Ev::Focus(ev.type_ == FOCUS_IN));
+                                repaint = true;
+                            }
+                        }
+                        _ => repaint |= dispatch(dpy, win, &mut ev, driver, &mut down),
+                    }
+                }
+                let mut present_req = false;
+                with_slot(Hwnd(win), |s| present_req = core::mem::take(&mut s.present));
+                repaint |= present_req;
+                if repaint
+                    && !quit()
+                    && let Some(fb) = driver.frame()
+                {
+                    present(dpy, win, gc, fb);
+                }
+                let want = driver.cursor();
+                if cursor != Some(want) {
+                    set_cursor(dpy, win, want, &mut cursors);
+                    cursor = Some(want);
+                }
+            }
+            driver.on_quit();
+            XFreeGC(dpy, gc);
+            XDestroyWindow(dpy, win);
+            XFlush(dpy);
+            WINDOWED.with(|c| c.set(prev_slot));
+            RUN_DPY.with(|c| c.set(prev_dpy));
+            XCloseDisplay(dpy);
+            if lost {
+                anyhow::bail!("X connection lost");
+            }
+            Ok(())
+        }
     }
 }
 

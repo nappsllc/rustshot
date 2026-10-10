@@ -967,6 +967,8 @@ impl Driver for App {
             }
             Ev::Char(c) => self.char_input(c),
             Ev::Timer => return self.tick(),
+            // Decorated-window events (`run_window`); the overlay never gets them.
+            Ev::Close | Ev::Resize(..) | Ev::Focus(_) => return false,
         }
         self.pump();
         // Only `Ev::Timer` consults this value (returned from `tick`);

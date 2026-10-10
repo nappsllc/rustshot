@@ -5,6 +5,7 @@
 //! registered OS hotkeys only dispatch through the process' event loop, so
 //! `hotkey_macos` parses on its own thread and hands registration/dispatch
 //! over via `HotkeyHook` instead of owning a `CFRunLoop` nobody spins.
+//! Also the decorated `run_window` (titled NSWindow; main thread only).
 
 use super::*;
 
@@ -245,8 +246,10 @@ std::thread_local! {
 // --- public API -----------------------------------------------------------
 
 /// Ask for a repaint of the window's client area.
-pub fn invalidate(_hwnd: Hwnd) {
-    PRESENT.store(true, Ordering::SeqCst);
+pub fn invalidate(hwnd: Hwnd) {
+    if !with_slot(hwnd, |s| s.present = true) {
+        PRESENT.store(true, Ordering::SeqCst);
+    }
 }
 
 /// The event loop reads `tick_ms()` each pass; nothing to re-arm.
@@ -302,8 +305,10 @@ pub fn hide(hwnd: Hwnd) {
 /// Never destroy the window from here: callers run inside driver callbacks
 /// on the pump thread, exactly like `DestroyWindow` on Win32 (whose effect
 /// is also deferred until the current dispatch returns).
-pub fn close(_hwnd: Hwnd) {
-    QUIT.store(true, Ordering::SeqCst);
+pub fn close(hwnd: Hwnd) {
+    if !with_slot(hwnd, |s| s.quit = true) {
+        QUIT.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Create the (initially hidden) overlay and pump messages until quit.
@@ -522,6 +527,362 @@ fn overlay_class() -> *mut c_void {
 /// `-canBecomeKeyWindow` → YES.
 unsafe extern "C" fn can_become_key(_this: *mut c_void, _cmd: usize) -> i8 {
     1
+}
+
+// --- decorated window (run_window) ----------------------------------------
+
+/// Per-thread state of a running `run_window` (win 0 = none). `close` and
+/// `invalidate` route here for that window, so a dialog never touches the
+/// overlay's QUIT/PRESENT flags.
+#[derive(Clone, Copy)]
+struct WinSlot {
+    win: usize,
+    quit: bool,
+    present: bool,
+    /// The close button fired `performClose:` (turned into `Ev::Close`).
+    close_req: bool,
+}
+
+const NO_SLOT: WinSlot = WinSlot { win: 0, quit: false, present: false, close_req: false };
+
+std::thread_local! {
+    static WINDOWED: Cell<WinSlot> = const { Cell::new(NO_SLOT) };
+}
+
+/// Apply `f` to this thread's `run_window` slot when `hwnd` is that window.
+fn with_slot(hwnd: Hwnd, f: impl FnOnce(&mut WinSlot)) -> bool {
+    WINDOWED.with(|c| {
+        let mut s = c.get();
+        if s.win == 0 || s.win != hwnd.0 {
+            return false;
+        }
+        f(&mut s);
+        c.set(s);
+        true
+    })
+}
+
+#[cfg_attr(not(test), allow(unused_imports))]
+pub use window::{run_window, scale};
+
+/// The decorated window proper (no caller outside tests until the update
+/// dialog / Settings land, hence the dead-code allowance). Compile-checked
+/// only so far: it has not been run on a Mac yet.
+mod window {
+    #![cfg_attr(not(test), allow(dead_code))]
+    use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_msgSend_stret();
+    }
+
+    /// A message returning a CGRect. 32 bytes come back through a hidden
+    /// pointer on x86-64, which needs `objc_msgSend_stret`; arm64 returns
+    /// it via x8 through plain `objc_msgSend`.
+    unsafe fn msg_rect(recv: *mut c_void, sel: usize) -> CGRect {
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let f: unsafe extern "C" fn(*mut c_void, usize) -> CGRect =
+                    core::mem::transmute(objc_msgSend_stret as unsafe extern "C" fn());
+                f(recv, sel)
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                msg0(recv, sel)
+            }
+        }
+    }
+
+    /// Backing scale of a window (2.0 on Retina): points -> pixels.
+    pub fn scale(hwnd: Hwnd) -> f32 {
+        if hwnd.0 == 0 {
+            return 1.0;
+        }
+        let s: f64 = unsafe { msg0(hwnd.0 as *mut c_void, objc_sel(c"backingScaleFactor")) };
+        if s > 0.0 { s as f32 } else { 1.0 }
+    }
+
+    static WINDOW_CLASS: AtomicUsize = AtomicUsize::new(0);
+
+    /// NSWindow subclass whose `performClose:` (the close button's action)
+    /// only records the request: the driver decides, as on Win32/X11.
+    fn window_class() -> *mut c_void {
+        unsafe {
+            let cached = WINDOW_CLASS.load(Ordering::SeqCst);
+            if cached != 0 {
+                return cached as *mut c_void;
+            }
+            let base = objc_cls(c"NSWindow");
+            if base.is_null() {
+                return core::ptr::null_mut();
+            }
+            let class = objc_allocateClassPair(base, c"RustshotWindow".as_ptr(), 0);
+            if class.is_null() {
+                return objc_cls(c"RustshotWindow"); // registered already
+            }
+            let imp: unsafe extern "C" fn(*mut c_void, usize, *mut c_void) = perform_close;
+            class_addMethod(class, objc_sel(c"performClose:"), imp as *const c_void, c"v@:@".as_ptr());
+            objc_registerClassPair(class);
+            WINDOW_CLASS.store(class as usize, Ordering::SeqCst);
+            class
+        }
+    }
+
+    /// `-performClose:` → flag `Ev::Close` for the pump.
+    unsafe extern "C" fn perform_close(this: *mut c_void, _cmd: usize, _sender: *mut c_void) {
+        with_slot(Hwnd(this as usize), |s| s.close_req = true);
+    }
+
+    /// Content size in points (the content view's bounds).
+    unsafe fn content_size(window: *mut c_void) -> (f64, f64) {
+        unsafe {
+            let view: *mut c_void = msg0(window, objc_sel(c"contentView"));
+            if view.is_null() {
+                return (0.0, 0.0);
+            }
+            let r = msg_rect(view, objc_sel(c"bounds"));
+            (r.size.width, r.size.height)
+        }
+    }
+
+    fn phys(size: (f64, f64), s: f64) -> (u32, u32) {
+        (((size.0 * s).round() as u32).max(1), ((size.1 * s).round() as u32).max(1))
+    }
+
+    /// Open a normal titled NSWindow centred on the display under the
+    /// pointer and pump events until the driver calls `wind::close(hwnd)`.
+    /// The close button only sends `Ev::Close`; `Ev::Resize` (pixels)
+    /// follows `on_create` and every size/backing-scale change; mouse
+    /// coordinates are client pixels, top-left origin.
+    ///
+    /// Limitation: AppKit only works on the main thread, so this refuses to
+    /// run elsewhere — and the daemon's main thread is busy in the overlay
+    /// pump, so dialogs on macOS need that pump to host them (later work).
+    pub fn run_window(spec: WindowSpec, driver: &mut dyn Driver) -> anyhow::Result<()> {
+        let _outer = Pool::new();
+        unsafe {
+            let is_main: i8 = msg0(objc_cls(c"NSThread"), objc_sel(c"isMainThread"));
+            if is_main == 0 {
+                anyhow::bail!("run_window: AppKit windows must be created on the main thread");
+            }
+            let app_cls = objc_cls(c"NSApplication");
+            if app_cls.is_null() {
+                anyhow::bail!("failed to load AppKit (NSApplication missing)");
+            }
+            let app: *mut c_void = msg0(app_cls, objc_sel(c"sharedApplication"));
+            if MAIN_WINDOW.load(Ordering::SeqCst) == 0 {
+                let _: () = msg0(app, objc_sel(c"finishLaunching"));
+            }
+            let class = window_class();
+            if class.is_null() {
+                anyhow::bail!("failed to create the window class");
+            }
+            let (w, h) = (spec.w.max(1) as f64, spec.h.max(1) as f64);
+            let content = CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: CGSize { width: w, height: h } };
+            // Titled | Closable | Miniaturizable (| Resizable)
+            let style: u64 = 1 | 2 | 4 | if spec.resizable { 8 } else { 0 };
+            let win: *mut c_void = msg0(class, objc_sel(c"alloc"));
+            let win: *mut c_void = msg4(
+                win,
+                objc_sel(c"initWithContentRect:styleMask:backing:defer:"),
+                content,
+                style,
+                2u64, // NSBackingStoreBuffered
+                0i64, // defer = NO
+            );
+            if win.is_null() {
+                anyhow::bail!("failed to create NSWindow");
+            }
+            let _: () = msg1(win, objc_sel(c"setReleasedWhenClosed:"), 0i64);
+            let _: () = msg1(win, objc_sel(c"setTitle:"), ns_string(&spec.title));
+            if spec.resizable {
+                let min = CGSize { width: spec.min.0 as f64, height: spec.min.1 as f64 };
+                let _: () = msg1(win, objc_sel(c"setContentMinSize:"), min);
+            }
+            let _: () = msg1(win, objc_sel(c"setAcceptsMouseMovedEvents:"), 1i64);
+            let view: *mut c_void = msg0(objc_cls(c"NSView"), objc_sel(c"alloc"));
+            let view: *mut c_void = msg1(view, objc_sel(c"initWithFrame:"), content);
+            if !view.is_null() {
+                let _: () = msg1(view, objc_sel(c"setWantsLayer:"), 1i64);
+                let _: () = msg1(win, objc_sel(c"setContentView:"), view);
+                let _: () = msg0(view, objc_sel(c"release")); // the window retains it
+            }
+            // Centre on the display under the pointer (Quartz points, y
+            // down); the title bar adds to the frame above the content.
+            let (cx, cy) = crate::capture::cursor_pos();
+            let mons = crate::capture::monitors().unwrap_or_default();
+            if let Some(m) = mons.iter().find(|m| m.contains(cx, cy)).or(mons.first()) {
+                let (x, y) = centre_in((m.x, m.y, m.w as i32, m.h as i32), w as i32, h as i32 + 28);
+                let top_left = CGPoint { x: x as f64, y: crate::capture::main_display_height() - y as f64 };
+                let _: () = msg1(win, objc_sel(c"setFrameTopLeftPoint:"), top_left);
+            } else {
+                let _: () = msg0(win, objc_sel(c"center"));
+            }
+            let hwnd = Hwnd(win as usize);
+            let mut s = scale(hwnd) as f64;
+            set_layer_scale(win, s);
+            let prev = WINDOWED.with(|c| c.replace(WinSlot { win: hwnd.0, ..NO_SLOT }));
+            let quit = || WINDOWED.with(|c| c.get().quit);
+            let mut size = phys(content_size(win), s);
+            driver.on_create(hwnd);
+            if !quit() {
+                driver.on_event(Ev::Resize(size.0, size.1));
+            }
+            if !quit() {
+                let _: () = msg1(app, objc_sel(c"activateIgnoringOtherApps:"), 1i64);
+                let _: () = msg1(win, objc_sel(c"makeKeyAndOrderFront:"), core::ptr::null_mut::<c_void>());
+            }
+            let mut key = false;
+            let mut cursor: Option<Cursor> = None;
+            let mut next_tick = Instant::now() + Duration::from_millis(tick_ms());
+            while !quit() {
+                next_tick = next_tick.min(Instant::now() + Duration::from_millis(tick_ms()));
+                let pool = Pool::new();
+                let mut repaint = false;
+                let mut first = true;
+                while !quit() {
+                    let wait = if first {
+                        first = false;
+                        next_tick.saturating_duration_since(Instant::now()).as_secs_f64()
+                    } else {
+                        0.0
+                    };
+                    let deadline: *mut c_void =
+                        msg1(objc_cls(c"NSDate"), objc_sel(c"dateWithTimeIntervalSinceNow:"), wait);
+                    let ev: *mut c_void = msg4(
+                        app,
+                        objc_sel(c"nextEventMatchingMask:untilDate:mode:dequeue:"),
+                        u64::MAX,
+                        deadline,
+                        ns_string("kCFRunLoopDefaultMode"),
+                        1i64,
+                    );
+                    if ev.is_null() {
+                        break;
+                    }
+                    let target: *mut c_void = msg0(ev, objc_sel(c"window"));
+                    let ty: u64 = msg0(ev, objc_sel(c"type"));
+                    let ours = target == win;
+                    if ours {
+                        let (_, ch) = content_size(win);
+                        repaint |= dispatch_window(ev, ty, driver, ch, s);
+                    }
+                    // Keys stay ours (no responder chain: it would beep);
+                    // everything else also goes to AppKit so the title bar,
+                    // close button and resize edges work.
+                    if !(ours && (ty == KEY_DOWN || ty == KEY_UP)) {
+                        let _: () = msg1(app, objc_sel(c"sendEvent:"), ev);
+                    }
+                }
+                let mut close_req = false;
+                with_slot(hwnd, |v| close_req = core::mem::take(&mut v.close_req));
+                if close_req {
+                    driver.on_event(Ev::Close);
+                    repaint = true;
+                }
+                let now_s = scale(hwnd) as f64;
+                if now_s != s {
+                    s = now_s;
+                    set_layer_scale(win, s);
+                }
+                let now = phys(content_size(win), s);
+                if !quit() && now != size {
+                    size = now;
+                    driver.on_event(Ev::Resize(now.0, now.1));
+                    repaint = true;
+                }
+                let is_key: i8 = msg0(win, objc_sel(c"isKeyWindow"));
+                if !quit() && (is_key != 0) != key {
+                    key = is_key != 0;
+                    driver.on_event(Ev::Focus(key));
+                    repaint = true;
+                }
+                if !quit() && Instant::now() >= next_tick {
+                    next_tick = Instant::now() + Duration::from_millis(tick_ms());
+                    repaint |= driver.on_event(Ev::Timer);
+                }
+                with_slot(hwnd, |v| repaint |= core::mem::take(&mut v.present));
+                if repaint
+                    && !quit()
+                    && let Some(fb) = driver.frame()
+                {
+                    present(win, &*fb);
+                }
+                let want = driver.cursor();
+                if cursor != Some(want) {
+                    set_cursor(want);
+                    cursor = Some(want);
+                }
+                drop(pool);
+            }
+            driver.on_quit();
+            let _: () = msg1(win, objc_sel(c"orderOut:"), core::ptr::null_mut::<c_void>());
+            let _: () = msg0(win, objc_sel(c"close"));
+            let _: () = msg0(win, objc_sel(c"release"));
+            WINDOWED.with(|c| c.set(prev));
+            Ok(())
+        }
+    }
+
+    /// The layer shows frames at pixel density (2x images on Retina).
+    unsafe fn set_layer_scale(win: *mut c_void, s: f64) {
+        unsafe {
+            let view: *mut c_void = msg0(win, objc_sel(c"contentView"));
+            if view.is_null() {
+                return;
+            }
+            let layer: *mut c_void = msg0(view, objc_sel(c"layer"));
+            if !layer.is_null() {
+                let _: () = msg1(layer, objc_sel(c"setContentsScale:"), s);
+            }
+        }
+    }
+
+    /// Mouse events in client pixels (top-left origin); keys as the overlay.
+    unsafe fn dispatch_window(ev: *mut c_void, ty: u64, driver: &mut dyn Driver, content_h: f64, s: f64) -> bool {
+        unsafe {
+            let pos = || {
+                let p: CGPoint = msg0(ev, objc_sel(c"locationInWindow"));
+                ((p.x * s).round() as i32, ((content_h - p.y) * s).round() as i32)
+            };
+            match ty {
+                MOUSE_MOVED | LEFT_DRAGGED => {
+                    let (x, y) = pos();
+                    driver.on_event(Ev::Move { x, y });
+                    false
+                }
+                LEFT_DOWN => {
+                    let (x, y) = pos();
+                    driver.on_event(Ev::Down { x, y });
+                    true
+                }
+                LEFT_UP => {
+                    let (x, y) = pos();
+                    driver.on_event(Ev::Up { x, y });
+                    true
+                }
+                SCROLL_WHEEL => {
+                    let dy: f64 = msg0(ev, objc_sel(c"scrollingDeltaY"));
+                    let mut delta = (dy * 120.0).round() as i32;
+                    if delta == 0 {
+                        delta = if dy < 0.0 { -1 } else { 1 };
+                    }
+                    let inverted: i8 = msg0(ev, objc_sel(c"isDirectionInvertedFromDevice"));
+                    if inverted != 0 {
+                        delta = -delta;
+                    }
+                    let (x, y) = pos();
+                    driver.on_event(Ev::Wheel { delta, x, y });
+                    true
+                }
+                KEY_DOWN | KEY_UP => dispatch_nsevent(ev, driver),
+                _ => false,
+            }
+        }
+    }
 }
 
 // --- event pump -----------------------------------------------------------

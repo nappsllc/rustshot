@@ -1,14 +1,20 @@
-//! Win32 overlay window implementation: class registration, message pump,
-//! input event delivery, and framebuffer presentation (StretchDIBits).
+//! Win32 window implementation: the overlay and the decorated `run_window`
+//! (class registration, message pumps, input event delivery) and
+//! framebuffer presentation (StretchDIBits).
 
 use super::*;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateRectRgn, DeleteObject, EndPaint, GetRegionData, GetUpdateRgn,
-    InvalidateRect, ScreenToClient, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, PAINTSTRUCT, RGNDATA, RGNDATAHEADER, SRCCOPY,
+    BeginPaint, CreateRectRgn, DeleteObject, EndPaint, GetMonitorInfoW, GetRegionData,
+    GetUpdateRgn, InvalidateRect, MonitorFromPoint, ScreenToClient, StretchDIBits, UpdateWindow,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    PAINTSTRUCT, RGNDATA, RGNDATAHEADER, SRCCOPY,
+};
+use windows::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, GetDpiForMonitor, GetDpiForWindow, SetThreadDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
@@ -138,7 +144,20 @@ unsafe extern "system" fn wndproc(
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
         let drv = &mut **slot;
-        match msg {
+        if msg == WM_DESTROY {
+            drv.on_quit();
+            PostQuitMessage(0);
+            return LRESULT(0);
+        }
+        common(hwnd, msg, wp, lp, drv).unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp))
+    }
+}
+
+/// Input, timer and paint messages shared by the overlay and `run_window`;
+/// `None` = not handled here.
+unsafe fn common(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, drv: &mut dyn Driver) -> Option<LRESULT> {
+    unsafe {
+        Some(match msg {
             WM_MOUSEMOVE => {
                 // No automatic repaint: the driver calls `invalidate` itself
                 // when a move actually changes what should be on screen.
@@ -225,13 +244,8 @@ unsafe extern "system" fn wndproc(
                 LRESULT(1)
             }
             WM_ERASEBKGND => LRESULT(1),
-            WM_DESTROY => {
-                drv.on_quit();
-                PostQuitMessage(0);
-                LRESULT(0)
-            }
-            _ => DefWindowProcW(hwnd, msg, wp, lp),
-        }
+            _ => return None,
+        })
     }
 }
 
@@ -355,6 +369,267 @@ pub fn run(driver: &mut dyn Driver) -> i32 {
     }
 }
 
+// --- decorated window (run_window) ----------------------------------------
+
+/// State behind GWLP_USERDATA of a `run_window` window (lives on
+/// `run_window`'s stack frame for the whole loop).
+struct WinState<'a> {
+    drv: *mut (dyn Driver + 'a),
+    /// Set right before `on_create`: CreateWindowEx already sends WM_SIZE
+    /// etc., which must not reach a driver that has no handle yet.
+    ready: core::cell::Cell<bool>,
+    /// WM_DESTROY seen: the loop ends.
+    done: core::cell::Cell<bool>,
+    /// Last size sent as `Ev::Resize` (WM_SIZE repeats it on show/restore).
+    size: core::cell::Cell<(u32, u32)>,
+    min: (u32, u32),
+    resizable: bool,
+    style: WINDOW_STYLE,
+    ex_style: WINDOW_EX_STYLE,
+}
+
+const WINDOW_CLASS: PCWSTR = w!("rustshot_window");
+static WINDOW_CLASS_ONCE: std::sync::Once = std::sync::Once::new();
+
+/// Register the decorated-window class once (any thread may be first).
+/// Icons come from the exe's icon resource (ID 1, embedded by build.rs);
+/// shared handles, so nothing is destroyed. Builds without the resource
+/// (tests, non-MSVC) fall back to the default icon.
+unsafe fn register_window_class(h: HINSTANCE) {
+    WINDOW_CLASS_ONCE.call_once(|| unsafe {
+        let icon = |cx, cy| {
+            LoadImageW(Some(h), PCWSTR(std::ptr::without_provenance(1)) /* MAKEINTRESOURCE(1) */, IMAGE_ICON, cx, cy, LR_SHARED)
+                .map(|i| HICON(i.0))
+                .unwrap_or_default()
+        };
+        let mut wc: WNDCLASSEXW = std::mem::zeroed();
+        wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = Some(wndproc_window);
+        wc.hInstance = h;
+        wc.hCursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
+        wc.hIcon = icon(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+        wc.hIconSm = icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+        wc.lpszClassName = WINDOW_CLASS;
+        let _ = RegisterClassExW(&wc);
+    });
+}
+
+/// DPI scale of a window (1.0 = 96 dpi): logical -> physical px factor.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn scale(hwnd: HWND) -> f32 {
+    match unsafe { GetDpiForWindow(hwnd) } {
+        0 => 1.0,
+        dpi => dpi as f32 / 96.0,
+    }
+}
+
+unsafe extern "system" fn wndproc_window(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        if msg == WM_NCCREATE {
+            let cs = &*(lp.0 as *const CREATESTRUCTW);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+        let st = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WinState<'static>;
+        if st.is_null() {
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+        let st = &*st;
+        match msg {
+            WM_GETMINMAXINFO => {
+                if st.resizable {
+                    let dpi = GetDpiForWindow(hwnd).max(96);
+                    let s = dpi as f32 / 96.0;
+                    let mut rc = RECT {
+                        left: 0,
+                        top: 0,
+                        right: to_phys(st.min.0, s) as i32,
+                        bottom: to_phys(st.min.1, s) as i32,
+                    };
+                    let _ = AdjustWindowRectExForDpi(&mut rc, st.style, false, st.ex_style, dpi);
+                    let mmi = &mut *(lp.0 as *mut MINMAXINFO);
+                    mmi.ptMinTrackSize = POINT { x: rc.right - rc.left, y: rc.bottom - rc.top };
+                }
+                return LRESULT(0);
+            }
+            WM_DPICHANGED => {
+                // Moved onto a monitor with another scale: take the size
+                // Windows suggests (keeps the logical size); WM_SIZE follows.
+                let r = &*(lp.0 as *const RECT);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                return LRESULT(0);
+            }
+            WM_NCDESTROY => {
+                // The state dies with run_window's frame: never reach it again.
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
+            _ => {}
+        }
+        if !st.ready.get() {
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+        let drv = &mut *st.drv;
+        match msg {
+            WM_CLOSE => {
+                // Never DefWindowProc (it would destroy): the driver decides.
+                drv.on_event(Ev::Close);
+                if !st.done.get() {
+                    request(hwnd, drv);
+                }
+                LRESULT(0)
+            }
+            WM_SIZE => {
+                if wp.0 != SIZE_MINIMIZED as usize {
+                    let size = ((lp.0 & 0xffff) as u32, ((lp.0 >> 16) & 0xffff) as u32);
+                    if st.size.replace(size) != size {
+                        drv.on_event(Ev::Resize(size.0, size.1));
+                    }
+                    invalidate(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_SETFOCUS | WM_KILLFOCUS => {
+                drv.on_event(Ev::Focus(msg == WM_SETFOCUS));
+                request(hwnd, drv);
+                LRESULT(0)
+            }
+            // Borders/caption keep their resize/arrow cursors.
+            WM_SETCURSOR if (lp.0 & 0xffff) as u32 != HTCLIENT => DefWindowProcW(hwnd, msg, wp, lp),
+            WM_DESTROY => {
+                st.done.set(true);
+                drv.on_quit();
+                LRESULT(0)
+            }
+            _ => common(hwnd, msg, wp, lp, drv).unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp)),
+        }
+    }
+}
+
+/// Open a normal decorated, per-monitor-DPI-aware top-level window centred
+/// on the monitor under the cursor and pump this thread's messages until
+/// it is destroyed. Callable from any thread (each thread has its own
+/// queue): the close button only sends `Ev::Close`; the driver ends the
+/// loop with `wind::close(hwnd)` from one of its callbacks. The driver
+/// gets `Ev::Resize` (physical px) right after `on_create` and on every
+/// resize; `wind::scale(hwnd)` gives the DPI factor. A `WM_QUIT` that
+/// arrives meanwhile (another window on this thread quitting) closes the
+/// window and is re-posted for the caller's own loop.
+#[cfg_attr(not(test), allow(dead_code))] // used by the update dialog / Settings (later tasks)
+pub fn run_window(spec: WindowSpec, drv: &mut dyn Driver) -> anyhow::Result<()> {
+    unsafe {
+        // Per thread, so it holds even where the process never opted in.
+        let prev = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let r = window_loop(&spec, drv);
+        if !prev.0.is_null() {
+            SetThreadDpiAwarenessContext(prev);
+        }
+        r
+    }
+}
+
+unsafe fn window_loop(spec: &WindowSpec, drv: &mut dyn Driver) -> anyhow::Result<()> {
+    unsafe {
+        let h = HINSTANCE(module_handle()?);
+        register_window_class(h);
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let _ = GetMonitorInfoW(mon, &mut mi);
+        let (mut dx, mut dy) = (96u32, 96u32);
+        let dpi = if GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy).is_ok() { dx.max(96) } else { 96 };
+        let s = dpi as f32 / 96.0;
+        let style = if spec.resizable {
+            WS_OVERLAPPEDWINDOW
+        } else {
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+        };
+        let ex_style = WS_EX_APPWINDOW;
+        let mut rc = RECT { left: 0, top: 0, right: to_phys(spec.w, s) as i32, bottom: to_phys(spec.h, s) as i32 };
+        let _ = AdjustWindowRectExForDpi(&mut rc, style, false, ex_style, dpi);
+        let (ow, oh) = (rc.right - rc.left, rc.bottom - rc.top);
+        let wa = mi.rcWork;
+        let (x, y) = centre_in((wa.left, wa.top, wa.right - wa.left, wa.bottom - wa.top), ow, oh);
+        let title: Vec<u16> = spec.title.encode_utf16().chain(Some(0)).collect();
+        let st = WinState {
+            drv: drv as *mut (dyn Driver + '_),
+            ready: core::cell::Cell::new(false),
+            done: core::cell::Cell::new(false),
+            size: core::cell::Cell::new((0, 0)),
+            min: spec.min,
+            resizable: spec.resizable,
+            style,
+            ex_style,
+        };
+        let hwnd = CreateWindowExW(
+            ex_style,
+            WINDOW_CLASS,
+            PCWSTR(title.as_ptr()),
+            style,
+            x,
+            y,
+            ow,
+            oh,
+            None,
+            None,
+            Some(h),
+            Some(&raw const st as *const core::ffi::c_void),
+        )?;
+        st.ready.set(true);
+        (*st.drv).on_create(hwnd);
+        if !st.done.get() {
+            let mut cr = RECT::default();
+            let _ = GetClientRect(hwnd, &mut cr);
+            let size = (cr.right.max(0) as u32, cr.bottom.max(0) as u32);
+            st.size.set(size);
+            (*st.drv).on_event(Ev::Resize(size.0, size.1));
+        }
+        if !st.done.get() {
+            let _ = SetTimer(Some(hwnd), 1, tick_ms() as u32, None);
+            // Tests never steal the user's focus.
+            if cfg!(test) {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            } else {
+                let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+                let _ = SetForegroundWindow(hwnd);
+            }
+            let _ = UpdateWindow(hwnd);
+        }
+        let mut quit = None;
+        let mut msg = MSG::default();
+        while !st.done.get() {
+            match GetMessageW(&mut msg, None, 0, 0).0 {
+                0 => {
+                    quit = Some(msg.wParam.0 as i32);
+                    break;
+                }
+                -1 => break,
+                _ => {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        }
+        if !st.done.get() {
+            let _ = DestroyWindow(hwnd);
+        }
+        if let Some(code) = quit {
+            PostQuitMessage(code);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +676,204 @@ mod tests {
                 let q = &out[i * 4..i * 4 + 3];
                 assert_eq!([q[2], q[1], q[0]], [p[0], p[1], p[2]], "pixel {i}: BGRA {q:?}");
             }
+        }
+    }
+
+    /// Records what `run_window` delivers; ignores the first close request
+    /// (the window must stay open) and closes on the second.
+    struct Closer {
+        hwnd: HWND,
+        fb: PixBuf,
+        created: bool,
+        first: Option<&'static str>,
+        size: (u32, u32),
+        closes: u32,
+        frames: u32,
+        quit: bool,
+    }
+
+    impl Driver for Closer {
+        fn on_create(&mut self, hwnd: HWND) {
+            self.hwnd = hwnd;
+            self.created = true;
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+        }
+        fn on_event(&mut self, ev: Ev) -> bool {
+            self.first.get_or_insert(match ev {
+                Ev::Resize(..) => "resize",
+                _ => "other",
+            });
+            match ev {
+                Ev::Resize(w, h) => {
+                    self.size = (w, h);
+                    self.fb = PixBuf::new(w, h);
+                }
+                Ev::Close => {
+                    self.closes += 1;
+                    if self.closes == 1 {
+                        unsafe {
+                            let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                        }
+                    } else {
+                        close(self.hwnd);
+                    }
+                }
+                _ => {}
+            }
+            false
+        }
+        fn frame(&mut self) -> Option<&mut PixBuf> {
+            self.frames += 1;
+            self.fb.as_raw_mut().fill(0x80);
+            Some(&mut self.fb)
+        }
+        fn cursor(&self) -> Cursor {
+            Cursor::Arrow
+        }
+        fn on_quit(&mut self) {
+            self.quit = true;
+        }
+    }
+
+    fn run_closer() -> Closer {
+        let mut d = Closer {
+            hwnd: HWND::default(),
+            fb: PixBuf::new(1, 1),
+            created: false,
+            first: None,
+            size: (0, 0),
+            closes: 0,
+            frames: 0,
+            quit: false,
+        };
+        let spec = WindowSpec {
+            title: "rustshot wind test".into(),
+            w: 400,
+            h: 300,
+            resizable: true,
+            min: (200, 150),
+        };
+        run_window(spec, &mut d).expect("window loop");
+        d
+    }
+
+    /// `run_window` on a non-main thread: the loop survives an ignored
+    /// WM_CLOSE, ends when the driver closes, paints at least once, and
+    /// repeated windows leave the GDI/USER object counts where they were
+    /// (retried: other tests in this process may hold objects meanwhile).
+    #[test]
+    fn run_window_closes_on_request_without_leaks() {
+        use windows::Win32::System::Threading::{
+            GetGuiResources, OpenProcess, GR_GDIOBJECTS, GR_USEROBJECTS, PROCESS_QUERY_INFORMATION,
+        };
+        std::thread::spawn(|| {
+            let d = run_closer();
+            assert!(d.created);
+            assert_eq!(d.first, Some("resize"), "first event is the initial size");
+            assert!(d.size.0 >= 400 && d.size.1 >= 300, "client {:?} at scale >= 1", d.size);
+            assert_eq!(d.closes, 2, "the first close was ignored");
+            assert!(d.quit, "on_quit ran");
+            assert!(d.frames >= 1, "painted");
+            assert!(unsafe { !IsWindow(Some(d.hwnd)).as_bool() }, "window destroyed");
+            // A real handle: the GetCurrentProcess pseudo handle reads 0.
+            let me = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, false, std::process::id()) }
+                .expect("process handle");
+            let count = || unsafe { (GetGuiResources(me, GR_GDIOBJECTS), GetGuiResources(me, GR_USEROBJECTS)) };
+            let mut seen = Vec::new();
+            let ok = (0..3).any(|_| {
+                let before = count();
+                for _ in 0..5 {
+                    run_closer();
+                }
+                let after = count();
+                seen.push((before, after));
+                after.0 <= before.0 && after.1 <= before.1
+            });
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(me) };
+            println!("(gdi, user) objects before -> after 5 windows: {seen:?}");
+            assert!(ok, "GDI/USER objects grew over 5 windows ((gdi, user) before -> after): {seen:?}");
+        })
+        .join()
+        .expect("window thread");
+    }
+
+    /// Interactive: a 400x300 window rendering a filled rect; close it
+    /// with its close button or Esc. `RUSTSHOT_TEST_AUTOCLOSE_MS=1500`
+    /// samples the rect's centre pixel from the window DC, then posts
+    /// WM_CLOSE (the close-button path) instead of waiting for a human.
+    /// `cargo test interactive_window -- --ignored --nocapture`
+    #[test]
+    #[ignore = "interactive: opens a window"]
+    fn interactive_window_renders_rect() {
+        use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
+        const FILL: [u8; 4] = [64, 128, 255, 255];
+        struct Rect {
+            hwnd: HWND,
+            fb: PixBuf,
+            deadline: Option<std::time::Instant>,
+            sampled: Option<u32>,
+            painted: bool,
+        }
+        impl Driver for Rect {
+            fn on_create(&mut self, hwnd: HWND) {
+                self.hwnd = hwnd;
+                let icon = unsafe { GetClassLongPtrW(hwnd, GCLP_HICON) } != 0;
+                println!("created, scale {}, class icon from the exe resource: {icon}", scale(hwnd));
+            }
+            fn on_event(&mut self, ev: Ev) -> bool {
+                match ev {
+                    Ev::Resize(w, h) => {
+                        println!("resize {w}x{h}");
+                        self.fb = PixBuf::new(w, h);
+                    }
+                    Ev::Focus(f) => println!("focus {f}"),
+                    Ev::Key { vk: key::ESCAPE, up: false, .. } | Ev::Close => close(self.hwnd),
+                    Ev::Timer
+                        if self.painted
+                            && self.sampled.is_none()
+                            && self.deadline.is_some_and(|d| std::time::Instant::now() >= d) =>
+                    {
+                        let (w, h) = self.fb.dimensions();
+                        unsafe {
+                            let dc = GetDC(Some(self.hwnd));
+                            self.sampled = Some(GetPixel(dc, w as i32 / 2, h as i32 / 2).0);
+                            ReleaseDC(Some(self.hwnd), dc);
+                            let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                        }
+                    }
+                    _ => {}
+                }
+                false
+            }
+            fn frame(&mut self) -> Option<&mut PixBuf> {
+                let (w, h) = self.fb.dimensions();
+                for (i, p) in self.fb.as_raw_mut().as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    let (x, y) = (i as u32 % w, i as u32 / w);
+                    let inside = x >= w / 4 && x < w * 3 / 4 && y >= h / 4 && y < h * 3 / 4;
+                    *p = if inside { FILL } else { [24, 24, 28, 255] };
+                }
+                self.painted = true;
+                Some(&mut self.fb)
+            }
+            fn cursor(&self) -> Cursor {
+                Cursor::Arrow
+            }
+        }
+        let deadline = std::env::var("RUSTSHOT_TEST_AUTOCLOSE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+        let mut d = Rect { hwnd: HWND::default(), fb: PixBuf::new(1, 1), deadline, sampled: None, painted: false };
+        let spec = WindowSpec { title: "rustshot window test".into(), w: 400, h: 300, resizable: true, min: (200, 150) };
+        run_window(spec, &mut d).expect("window loop");
+        assert!(d.painted);
+        if deadline.is_some() {
+            // COLORREF is 0x00BBGGRR.
+            let want = u32::from_le_bytes([FILL[0], FILL[1], FILL[2], 0]);
+            println!("centre pixel {:#08x?}, want {want:#08x}", d.sampled);
+            assert_eq!(d.sampled, Some(want));
         }
     }
 }
