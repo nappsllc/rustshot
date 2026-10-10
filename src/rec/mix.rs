@@ -5,16 +5,35 @@
 //! output timeline: `pos` is where the output position falls inside it, in
 //! input frames, and a negative `pos` is lead silence before its first
 //! sample. While a source delivers continuously, its samples follow on one
-//! another, so jitter shorter than the time buffered ahead does nothing.
+//! another, so jitter shorter than the time buffered ahead (the session's
+//! audio lag) does nothing.
+//!
 //! When it runs dry (everything it gave was played) it is in a *gap*: it
-//! adds silence, and the first input read after the gap is placed to start
-//! at the clock time it was read ([`Mixer::feed`]'s `now`). So a source
-//! that sends nothing for seconds (WASAPI loopback while nothing plays) and
-//! then resumes plays from the moment it resumed, whether the output runs
-//! behind the clock (the session's lag) or not, and whether the input
-//! comes in small packets or one burst. The error is at most one packet
-//! (its samples were captured just before they were read, but are played
-//! from the read on).
+//! adds silence, and the first input read after the gap is placed by when
+//! it was captured. A source that knows that passes it from
+//! [`AudioSource::read_timed`]; otherwise the input is assumed to *end* at
+//! the clock time it was read ([`Mixer::feed`]'s `now`), i.e. to start one
+//! input-length before it. That one rule covers both ways a gap ends:
+//!
+//! - after a true gap (WASAPI loopback sends nothing while nothing plays),
+//!   real-time packets start one packet before their read, about when they
+//!   were captured; the error is at most the time between capture and read
+//!   (one packet plus one encode tick), and early rather than late;
+//! - after a delivery stall, the backlog captured during it arrives at
+//!   once and lands at its capture time, so the audio after the stall is
+//!   not offset (placing it from its read on would leave the source a
+//!   stall-length late for the rest of the recording).
+//!
+//! Input placed before the output position covers time that already went
+//! out (as silence): that part is dropped, so what follows stays in place
+//! instead of everything after it shifting late. A backlog no longer than
+//! the lag is never cut this way.
+//!
+//! Known limitation: placement is by the recording clock (`Instant`), and
+//! a continuous source then just follows on, so a device whose sample clock
+//! drifts against it (tens of ppm are common) slowly runs ahead or behind
+//! until a gap re-places it. Over a long recording that can show as A/V
+//! offset; a source with capture timestamps (Task 2) may compensate.
 
 use super::AudioSource;
 use std::time::Duration;
@@ -36,17 +55,31 @@ struct Input {
     /// Output position inside `buf` in input frames (fractional); negative
     /// = that much lead silence before `buf[0]`.
     pos: f64,
-    /// Ran dry: silent, and the next input is placed at its arrival.
+    /// Ran dry: silent (and `buf` empty); the next input is placed by its
+    /// capture time.
     gap: bool,
     scratch: Vec<f32>,
 }
 
+/// Where output frame `produced` (48 kHz) falls in input that starts at
+/// `start`, in input frames at `rate` (negative = lead silence before it).
+/// Exact for whole frames, so float error never skips a sample.
+fn place(produced: u64, start: Duration, rate: u32) -> f64 {
+    let (rate, out) = (i128::from(rate), i128::from(RATE));
+    let num = i128::from(produced) * rate * 1_000_000_000 - start.as_nanos() as i128 * out * rate;
+    let den = out * 1_000_000_000;
+    num.div_euclid(den) as f64 + num.rem_euclid(den) as f64 / den as f64
+}
+
 impl Input {
     /// Read what the source has and append it to `buf` as stereo frames.
-    /// Input that ends a gap starts `lead` after the output position.
-    fn read(&mut self, lead: Duration) {
+    /// Input that ends a gap is placed by its capture time (see the module
+    /// docs); `now` is the clock time of the read and `produced` the output
+    /// position in output frames.
+    fn read(&mut self, now: Duration, produced: u64) {
         self.scratch.clear();
-        self.src.read(&mut self.scratch);
+        let (_, ts) = self.src.read_timed(&mut self.scratch);
+        let before = self.buf.len();
         let ch = usize::from(self.src.channels().max(1));
         if ch == 1 {
             self.buf.extend(self.scratch.iter().map(|&s| [s, s]));
@@ -55,11 +88,29 @@ impl Input {
             let whole = self.scratch.len() / ch * ch;
             self.buf.extend(self.scratch[..whole].chunks(ch).map(|f| [f[0], f[1]]));
         }
-        if self.gap && !self.buf.is_empty() {
+        let added = self.buf.len() - before;
+        let rate = self.src.rate().max(1);
+        if self.gap && added > 0 {
+            let start = ts.unwrap_or_else(|| {
+                let len = Duration::from_nanos((added as u128 * 1_000_000_000 / u128::from(rate)) as u64);
+                now.saturating_sub(len)
+            });
+            self.pos = place(produced, start, rate);
+            if self.pos >= self.buf.len() as f64 {
+                // All of it is older than the output position.
+                self.buf.clear();
+                self.pos = 0.0;
+                return;
+            }
             self.gap = false;
-            self.pos = -lead.as_secs_f64() * f64::from(self.src.rate());
+            if self.pos >= 1.0 {
+                // Its head covers time already produced: dropped.
+                let past = self.pos as usize;
+                self.buf.drain(..past);
+                self.pos -= past as f64;
+            }
         }
-        let cap = self.src.rate() as usize * MAX_AHEAD_SECS;
+        let cap = rate as usize * MAX_AHEAD_SECS;
         let ahead = self.buf.len().saturating_sub(self.pos.max(0.0) as usize);
         if ahead > cap {
             let cut = ahead - cap;
@@ -126,7 +177,8 @@ fn frames_at(t: Duration) -> u64 {
 }
 
 impl Mixer {
-    /// Every source starts in a gap: its first input plays from when it is read.
+    /// Every source starts in a gap: its first input is placed by its
+    /// capture time (input from before time zero starts at zero).
     pub fn new(sources: Vec<Box<dyn AudioSource>>) -> Mixer {
         let inputs = sources
             .into_iter()
@@ -148,14 +200,11 @@ impl Mixer {
     }
 
     /// Read what every source has now; `now` is the recording clock's time
-    /// of this read, where input that ends a gap starts (never before
-    /// [`Mixer::position`]).
+    /// of this read, where input that ends a gap (and has no timestamp)
+    /// ends. Input placed before [`Mixer::position`] loses that part.
     pub fn feed(&mut self, now: Duration) {
-        let lead = Duration::from_nanos(
-            (u128::from(frames_at(now).saturating_sub(self.produced)) * 1_000_000_000 / u128::from(RATE)) as u64,
-        );
         for s in &mut self.inputs {
-            s.read(lead);
+            s.read(now, self.produced);
         }
     }
 
@@ -179,10 +228,10 @@ impl Mixer {
     }
 
     /// Throw away the input available now (while paused); every source is
-    /// then in a gap, so what it sends next plays from when it is read.
+    /// then in a gap, so what it sends next is placed by its capture time.
     pub fn discard(&mut self) {
         for s in &mut self.inputs {
-            s.read(Duration::ZERO);
+            s.read(Duration::ZERO, 0);
             s.buf.clear();
             s.pos = 0.0;
             s.gap = true;
@@ -190,9 +239,9 @@ impl Mixer {
     }
 
     /// Whether a [`Mixer::pull`] to `until` would have every source's
-    /// input (as of the last feed). A source in a gap does not count: what
-    /// it sends next starts at its arrival, so waiting for it cannot fill
-    /// the time before.
+    /// input (as of the last feed). A source in a gap does not count: it
+    /// has nothing pending, and what it sends next is placed by its own
+    /// capture time whenever it comes.
     pub fn covered(&self, until: Duration) -> bool {
         let frames = frames_at(until).saturating_sub(self.produced) as f64;
         self.inputs.iter().all(|s| s.gap || s.available() >= frames * f64::from(s.src.rate()) / f64::from(RATE))
@@ -248,7 +297,8 @@ mod tests {
 
     #[test]
     fn resamples_44k1_to_48k() {
-        let mut m = fed(vec![fake(44_100, 1, sine(44_100, 1000.0, 1.1))]);
+        let mut m = fed(vec![fake(44_100, 1, sine(44_100, 1000.0, 1.0))]);
+        assert_eq!(m.inputs[0].buf.len(), 44_100, "within the cap: nothing trimmed");
         let out = m.pull(Duration::from_secs(1));
         assert_eq!(out.len(), 48_000 * 2, "one second of stereo");
         assert_eq!(m.position(), Duration::from_secs(1));
@@ -329,67 +379,216 @@ mod tests {
         }
     }
 
-    /// Runs a mixer like the session's encode loop: every 10 ms of clock
-    /// time `t` up to 4.5 s, `deliver(t)` samples are queued, the mixer is
-    /// fed at `t` and pulled to `t - AUDIO_LAG`. Returns the output (stereo).
-    fn run_lagged(deliver: impl Fn(u64) -> usize) -> Vec<f32> {
+    /// The sample a test device captures at frame `c` (48 kHz): a 1 s
+    /// sawtooth in [0.1, 0.9), so each output sample tells when (within a
+    /// second) it was captured.
+    fn saw(c: u64) -> f32 {
+        0.1 + 0.8 * (c % 48_000) as f32 / 48_000.0
+    }
+
+    /// For each non-silent frame of `out` (stereo, from [`saw`]): its output
+    /// frame and how many frames after its capture it plays.
+    fn offsets(out: &[f32]) -> Vec<(usize, i64)> {
+        let frames = out.as_chunks::<2>().0.iter().enumerate();
+        frames
+            .filter(|(_, f)| f[0] != 0.0)
+            .map(|(k, f)| {
+                let c = ((f64::from(f[0]) - 0.1) / 0.8 * 48_000.0).round() as i64;
+                let d = (k as i64 - c).rem_euclid(48_000);
+                (k, if d > 24_000 { d - 48_000 } else { d })
+            })
+            .collect()
+    }
+
+    fn worst(o: &[(usize, i64)]) -> Option<(usize, i64)> {
+        o.iter().copied().max_by_key(|&(_, d)| d.abs())
+    }
+
+    /// Runs a mixer like the session's encode loop over a 48 kHz mono
+    /// device for `total_ms` of clock time. At every 10 ms tick `t` the
+    /// device captures the last 10 ms if `capturing(t)` (loopback captures
+    /// nothing while nothing plays) and hands over everything it holds if
+    /// `delivers(t)` (otherwise it is stalled and holds it); then the mixer
+    /// is fed at `t` and pulled to `t - AUDIO_LAG`. Returns the output
+    /// (stereo) and how many frames were captured.
+    fn run_device(total_ms: u64, capturing: impl Fn(u64) -> bool, delivers: impl Fn(u64) -> bool) -> (Vec<f32>, usize) {
         let q = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut m = Mixer::new(vec![Box::new(Queued(q.clone()))]);
-        let mut out = Vec::new();
-        for ms in (0..=4500).step_by(10) {
-            q.lock().unwrap().extend(std::iter::repeat_n(0.5f32, deliver(ms)));
+        let (mut held, mut out, mut captured) = (Vec::new(), Vec::new(), 0);
+        for ms in (0..=total_ms).step_by(10) {
+            if ms > 0 && capturing(ms) {
+                held.extend((ms * 48 - 480..ms * 48).map(saw));
+                captured += 480;
+            }
+            if delivers(ms) {
+                q.lock().unwrap().append(&mut held);
+            }
             let t = Duration::from_millis(ms);
             m.feed(t);
             out.extend(m.pull(t.saturating_sub(AUDIO_LAG)));
         }
-        out
-    }
-
-    /// Asserts that the 1 s tone of 0.5 is (nearly) all in `out` and starts
-    /// within 10 ms of 3 s, when it was first read.
-    fn assert_tone_at_3s(out: &[f32]) {
-        let first = out.iter().position(|&v| v != 0.0).expect("the tone is in the output") / 2;
-        let onset = Duration::from_secs_f64(first as f64 / 48_000.0);
-        assert!(onset.abs_diff(Duration::from_secs(3)) <= Duration::from_millis(10), "tone at {onset:?}");
-        let tone = out.iter().filter(|&&v| v == 0.5).count() / 2;
-        assert!(tone >= 48_000 * 95 / 100, "{tone} of 48000 tone frames played");
-        assert!(out.iter().all(|&v| v == 0.0 || v == 0.5));
+        (out, captured)
     }
 
     #[test]
-    fn a_long_gap_then_real_time_input_plays_at_its_arrival() {
-        // Loopback sends nothing for 3 s (nothing plays), then a 1 s tone in
-        // 10 ms packets, each read when it is due, while the output runs a
-        // lag behind the clock.
-        let out = run_lagged(|ms| if (3000..4000).contains(&ms) { 480 } else { 0 });
-        assert_tone_at_3s(&out);
-        assert_eq!(out.iter().filter(|&&v| v == 0.5).count() / 2, 48_000, "nothing dropped");
+    fn a_long_gap_then_real_time_input_plays_at_its_capture_time() {
+        // Loopback captures nothing for 3 s (nothing plays), then a 1 s
+        // tone in 10 ms packets, each read when it is due.
+        let (out, captured) = run_device(4500, |ms| (3010..=4000).contains(&ms), |_| true);
+        let o = offsets(&out);
+        let onset = Duration::from_secs_f64(o[0].0 as f64 / 48_000.0);
+        assert!(onset.abs_diff(Duration::from_secs(3)) <= Duration::from_millis(10), "onset at {onset:?}");
+        assert_eq!(o.len(), captured, "every frame played");
+        assert!(o.iter().all(|&(_, d)| d.abs() <= 480), "worst {:?}", worst(&o));
     }
 
     #[test]
-    fn a_long_gap_then_a_burst_plays_from_its_arrival() {
-        // The same tone, all at once at 3 s: not placed a lag early.
-        let out = run_lagged(|ms| if ms == 3000 { 48_000 } else { 0 });
-        assert_tone_at_3s(&out);
+    fn a_burst_after_a_gap_is_a_backlog() {
+        // 3 s of nothing, then 80 ms handed over at once at 3 s (within the
+        // lag): all of it, ending at its arrival, i.e. at its capture time.
+        let (out, captured) = run_device(3500, |ms| (2930..=3000).contains(&ms), |ms| ms >= 3000);
+        let o = offsets(&out);
+        assert_eq!((o[0].0, o.len(), captured), (48 * 2920, 48 * 80, 48 * 80));
+        assert!(o.iter().all(|&(_, d)| d == 0), "worst {:?}", worst(&o));
+        // A 1 s backlog: what is older than the output position (2.89 s)
+        // already went out as silence and is dropped; the rest is in place.
+        let (out, _) = run_device(3500, |ms| (2010..=3000).contains(&ms), |ms| ms >= 3000);
+        let o = offsets(&out);
+        assert_eq!((o[0].0, o.len()), (48 * 2890, 48 * 110));
+        assert!(o.iter().all(|&(_, d)| d == 0), "worst {:?}", worst(&o));
     }
 
     #[test]
-    fn late_input_after_running_dry_is_played_not_skipped() {
+    fn a_stall_longer_than_the_lag_leaves_no_offset() {
+        // A continuous device stalls for 150 ms (the lag is 100 ms), then
+        // hands over its backlog at once.
+        let (out, _) = run_device(3000, |_| true, |ms| !(1510..1660).contains(&ms));
+        let o = offsets(&out);
+        assert!(o.iter().all(|&(_, d)| d.abs() <= 480), "worst {:?}", worst(&o));
+        // After the stall: in place and contiguous up to the output's end.
+        let after: Vec<_> = o.iter().filter(|&&(k, _)| k >= 48 * 1700).collect();
+        assert!(after.iter().all(|&&(_, d)| d == 0));
+        assert_eq!(after.len(), 48 * (2900 - 1700));
+    }
+
+    #[test]
+    fn repeated_stalls_do_not_accumulate() {
+        // A 150 ms stall every second from 1.5 s on.
+        let (out, _) = run_device(6000, |_| true, |ms| ms < 1000 || !(510..660).contains(&(ms % 1000)));
+        let o = offsets(&out);
+        assert!(o.iter().all(|&(_, d)| d.abs() <= 480), "worst {:?}", worst(&o));
+        let last: Vec<_> = o.iter().filter(|&&(k, _)| k >= 48 * 5700).collect();
+        assert!(last.iter().all(|&&(_, d)| d == 0));
+        assert_eq!(last.len(), 48 * (5900 - 5700));
+    }
+
+    #[test]
+    fn jitter_within_the_lag_is_seamless() {
+        // Packets 0 and 20 ms apart, alternating.
+        let (out, captured) = run_device(3000, |_| true, |ms| ms % 20 == 0);
+        let o = offsets(&out);
+        assert_eq!(o.len(), out.len() / 2, "no inserted silence");
+        assert_eq!(o.len(), 48 * 2900);
+        assert!(captured >= o.len() && o.iter().all(|&(_, d)| d == 0), "worst {:?}", worst(&o));
+    }
+
+    #[test]
+    fn sources_at_different_rates_stay_aligned() {
+        // A at 44.1 kHz on the left, B at 48 kHz on the right, both a square
+        // wave switching every 100 ms, in real-time 10 ms packets.
+        let sq = |c: usize, rate: usize| if (c * 10 / rate) % 2 == 1 { 0.5f32 } else { 0.25 };
+        let a: Vec<f32> = (0..44_100 * 103 / 10).flat_map(|c| [sq(c, 44_100), 0.0]).collect();
+        let b: Vec<f32> = (0..48_000 * 103 / 10).flat_map(|c| [0.0, sq(c, 48_000)]).collect();
+        let mut m = Mixer::new(vec![
+            Box::new(Fake { rate: 44_100, ch: 2, data: a, at: 0, chunk: 441 * 2 }),
+            Box::new(Fake { rate: 48_000, ch: 2, data: b, at: 0, chunk: 480 * 2 }),
+        ]);
+        let mut out = Vec::new();
+        for ms in (10..=10_200).step_by(10) {
+            let t = Duration::from_millis(ms);
+            m.feed(t);
+            out.extend(m.pull(t.saturating_sub(AUDIO_LAG)));
+        }
+        let edges = |ch: usize| -> Vec<usize> {
+            let v: Vec<bool> = out.as_chunks::<2>().0.iter().map(|f| f[ch] > 0.375).collect();
+            (1..v.len()).filter(|&k| v[k] != v[k - 1]).collect()
+        };
+        let (l, r) = (edges(0), edges(1));
+        assert_eq!(l.len(), r.len());
+        assert!(l.len() >= 99, "{} edges", l.len());
+        for (i, (&x, &y)) in l.iter().zip(&r).enumerate() {
+            let want = (i + 1) * 4800;
+            assert!(x.abs_diff(want) <= 240 && y.abs_diff(want) <= 240, "edge {i}: {x} / {y}, want {want}");
+        }
+    }
+
+    /// Hands out what the test queued, stamped with the time it gave.
+    #[allow(clippy::type_complexity)]
+    struct Timed(std::sync::Arc<std::sync::Mutex<(Vec<f32>, Option<Duration>)>>);
+
+    impl AudioSource for Timed {
+        fn rate(&self) -> u32 {
+            48_000
+        }
+        fn channels(&self) -> u16 {
+            1
+        }
+        fn read(&mut self, out: &mut Vec<f32>) -> usize {
+            self.read_timed(out).0
+        }
+        fn read_timed(&mut self, out: &mut Vec<f32>) -> (usize, Option<Duration>) {
+            let mut q = self.0.lock().unwrap();
+            let n = q.0.len();
+            out.append(&mut q.0);
+            (n, q.1.take())
+        }
+    }
+
+    #[test]
+    fn timed_input_is_placed_by_its_timestamp() {
+        let q = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), None)));
+        let mut m = Mixer::new(vec![Box::new(Timed(q.clone()))]);
+        let ms = Duration::from_millis;
+        m.feed(ms(0));
+        assert!(m.pull(ms(1000)).iter().all(|&v| v == 0.0));
+        // 100 ms captured from 0.95 s, read at 1.2 s (the end anchor would
+        // say 1.1 s): the 50 ms before the position are dropped.
+        *q.lock().unwrap() = (vec![0.5; 4800], Some(ms(950)));
+        m.feed(ms(1200));
+        let o = m.pull(ms(1100));
+        assert!(o[..4800].iter().all(|&v| v == 0.5) && o[4800..].iter().all(|&v| v == 0.0));
+        // Stamped ahead of the position: lead silence up to it.
+        *q.lock().unwrap() = (vec![0.25; 480], Some(ms(1300)));
+        m.feed(ms(1150));
+        let o = m.pull(ms(1400));
+        assert!(o[..19_200].iter().all(|&v| v == 0.0) && o[19_200..20_160].iter().all(|&v| v == 0.25));
+        assert!(o[20_160..].iter().all(|&v| v == 0.0));
+        // Entirely before the position: dropped, still in a gap.
+        *q.lock().unwrap() = (vec![0.75; 480], Some(ms(1000)));
+        m.feed(ms(1450));
+        assert!(m.covered(ms(1500)));
+        assert!(m.pull(ms(1500)).iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn input_after_running_dry_lands_at_its_capture_time() {
         let q = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut m = Mixer::new(vec![Box::new(Queued(q.clone()))]);
         m.feed(Duration::ZERO);
         assert!(m.pull(Duration::from_millis(50)).iter().all(|&v| v == 0.0));
         assert!(m.covered(Duration::from_millis(60)), "a source in a gap is not waited for");
+        // 100 ms read at 150 ms: it ends there, so it starts at the position.
         q.lock().unwrap().extend((0..4800).map(|i| if i < 2400 { 0.25f32 } else { 0.75 }));
-        m.feed(Duration::from_millis(50));
+        m.feed(Duration::from_millis(150));
         assert!(m.covered(Duration::from_millis(150)) && !m.covered(Duration::from_millis(151)));
         let o = m.pull(Duration::from_millis(150));
         assert!(o[..4800].iter().all(|&v| v == 0.25) && o[4800..].iter().all(|&v| v == 0.75), "all of it, in order");
-        // Input read ahead of the output position starts at its read time.
+        // 10 ms read at 170 ms, ahead of the position: 160..170 ms.
         q.lock().unwrap().extend([0.5f32; 480]);
         m.feed(Duration::from_millis(170));
         let o = m.pull(Duration::from_millis(180));
-        assert!(o[..1920].iter().all(|&v| v == 0.0) && o[1920..].iter().all(|&v| v == 0.5));
+        assert!(o[..960].iter().all(|&v| v == 0.0) && o[960..1920].iter().all(|&v| v == 0.5));
+        assert!(o[1920..].iter().all(|&v| v == 0.0));
     }
 
     #[test]

@@ -410,18 +410,23 @@ fn session_pause_flushes_audio_and_skips_what_came_while_paused() {
     // The pause is seen: audio up to it, then what came while paused is
     // dropped (before that audio is pushed, so nothing queued below is).
     wait_until("audio to the pause", || frames(&run.log) == 14_400);
-    // Read at the resume (clock 300 ms), it plays from there.
+    // Clock 450 ms: the output reaches 350 ms (silence, the mic has nothing
+    // since the resume). Every read from then on is at 450 ms.
+    run.time.set_ms(2150);
+    wait_until("audio to 350 ms", || frames(&run.log) == 16_800);
+    // 100 ms read at 450 ms: captured since 350 ms, and placed there.
     q.lock().unwrap().extend(std::iter::repeat_n(0.2f32, 4800));
     wait_until("the input read after the resume", || q.lock().unwrap().is_empty());
-    run.time.set_ms(2100);
     s.stop().unwrap();
     let log = run.log.lock().unwrap();
     assert_eq!(log.frames, ms(&[300]));
     assert_contiguous(&log);
-    assert_eq!(log.audio_frames(), 19_200, "0.3 s before the pause and 0.1 s after");
+    assert_eq!(log.audio_frames(), 21_600, "0.3 s before the pause, 0.15 s after");
     let (before, after) = log.pcm.split_at(28_800);
     assert!(before.iter().all(|&v| v == 0.1), "up to the pause");
-    assert!(after.iter().all(|&v| v == 0.2), "after the resume; nothing from the pause");
+    let (silent, after) = after.split_at(4800);
+    assert!(silent.iter().all(|&v| v == 0.0), "nothing from the pause");
+    assert!(after.iter().all(|&v| v == 0.2), "after the resume, at its capture time");
 }
 
 #[test]

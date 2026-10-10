@@ -120,7 +120,8 @@ pub trait FrameSource: Send {
 ///
 /// A source may have gaps: it can deliver nothing for a while (WASAPI
 /// loopback sends no packets while nothing plays). The mixer treats a gap
-/// as silence and plays what comes after it from the time it was read;
+/// as silence and places what comes after it so that it ends at the time
+/// it was read (or at its own timestamp, see [`AudioSource::read_timed`]);
 /// samples are assumed to arrive in step with the clock otherwise (see
 /// [`mix`] for the timing).
 pub trait AudioSource: Send {
@@ -129,6 +130,14 @@ pub trait AudioSource: Send {
     /// Append the samples available now (interleaved f32) to `out`, without
     /// blocking; returns how many samples were appended.
     fn read(&mut self, out: &mut Vec<f32>) -> usize;
+    /// [`AudioSource::read`], plus the recording clock's time at which the
+    /// first appended sample was captured, when the source knows it (e.g.
+    /// from the device's capture timestamps). The mixer uses it to place
+    /// input that ends a gap; `None` (the default) makes it assume the
+    /// input ends at the time it was read.
+    fn read_timed(&mut self, out: &mut Vec<f32>) -> (usize, Option<Duration>) {
+        (self.read(out), None)
+    }
 }
 
 /// Writes the recording; created by the caller on [`RecSpec::part_path`].
@@ -675,9 +684,10 @@ fn push_pcm(enc: &mut dyn VideoEncoder, pcm: &[f32], ts: Duration) -> Result<()>
 ///
 /// Only sources still delivering are waited for. One that delivered nothing
 /// it had not already played by `until - lag` (it ran dry, e.g. a silent
-/// loopback) is in a gap, and [`Mixer::covered`] skips it: anything it sends
-/// now would start at its arrival, which is not before `until`. With only
-/// such sources there is no wait at all.
+/// loopback) is in a gap, and [`Mixer::covered`] skips it: there is no sign
+/// it has anything more (what it does send during the wait is still placed
+/// by its capture time and mixed). With only such sources there is no wait
+/// at all.
 fn flush(m: &mut Mixer, until: Duration) -> (Duration, Vec<f32>) {
     let ts = m.position();
     m.feed(until);
