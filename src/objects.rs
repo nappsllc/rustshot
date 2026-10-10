@@ -1,4 +1,4 @@
-﻿use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
+use crate::text::AnnotFont;
 use crate::pixbuf::PixBuf;
 use crate::raster::{Blend, Surf};
 use crate::uifb::C4;
@@ -176,43 +176,6 @@ fn arrow_geometry(a: Pt, b: Pt, width: f32) -> Option<([Pt; 2], [Pt; 3])> {
     Some(([a, base], [b, p1, p2]))
 }
 
-fn draw_text(
-    sf: &mut Surf,
-    font: &FontArc,
-    size: f32,
-    text: &str,
-    top: Pt,
-    color: C4,
-) {
-    let (bx0, by0, bx1, by1) = sf.bounds();
-    let scale = PxScale::from(size);
-    let sfont = font.as_scaled(scale);
-    let ascent = sfont.ascent();
-    let descent = sfont.descent(); // negative
-    let gap = sfont.line_gap();
-    let line_height = (ascent - descent + gap).max(size * 1.1);
-    let mut y = top.y + ascent;
-    for line in text.split('\n') {
-        let mut x = top.x;
-        for ch in line.chars() {
-            let gid = font.glyph_id(ch);
-            let glyph = gid.with_scale_and_position(scale, ab_glyph::point(x, y));
-            if let Some(og) = font.outline_glyph(glyph) {
-                let bounds = og.px_bounds();
-                og.draw(|gx, gy, cov| {
-                    let px = bounds.min.x.floor() as i32 + gx as i32;
-                    let py = bounds.min.y.floor() as i32 + gy as i32;
-                    if px >= bx0 && py >= by0 && px < bx1 && py < by1 {
-                        sf.blend_px(px, py, color, cov, Blend::Normal);
-                    }
-                });
-            }
-            x += sfont.h_advance(gid);
-        }
-        y += line_height;
-    }
-}
-
 /// Mosaic `r`. The cell grid is anchored at the rect's corner in image
 /// coordinates; cells are clipped to the surface window (exact when the
 /// window contains the rect).
@@ -328,7 +291,7 @@ impl Obj {
     /// Conservative bounds of every pixel `render` may touch (half the
     /// stroke width, arrowhead, AA and glyph overhang included); `None`
     /// when it draws nothing.
-    pub fn bounds(&self, font: Option<&FontArc>) -> Option<FRect> {
+    pub fn bounds(&self, font: Option<&AnnotFont>) -> Option<FRect> {
         fn bbox(pts: &[Pt], m: f32) -> Option<FRect> {
             let first = pts.first()?;
             let (mut x0, mut y0, mut x1, mut y1) = (first.x, first.y, first.x, first.y);
@@ -349,16 +312,10 @@ impl Obj {
             Obj::Rect { r, width, .. } | Obj::Ellipse { r, width, .. } => Some(grow(r, m(*width))),
             Obj::Pixelate { r, .. } | Obj::Invert { r } => Some(grow(r, 1.0)),
             Obj::Text { pos, text, size, .. } => {
-                let font = font?;
-                let sfont = font.as_scaled(PxScale::from(*size));
-                let lh = (sfont.ascent() - sfont.descent() + sfont.line_gap()).max(size * 1.1);
-                let (mut w, mut n) = (0.0f32, 0);
-                for line in text.split('\n') {
-                    w = w.max(line.chars().map(|c| sfont.h_advance(font.glyph_id(c))).sum());
-                    n += 1;
-                }
+                let (w, h, _) = font?.measure(text, *size);
+                // Overhang, rounding to whole pixels and AA bleed.
                 let m = size + 2.0;
-                Some(FRect { x: pos.x - m, y: pos.y - m, w: w + 2.0 * m, h: lh * n as f32 + 2.0 * m })
+                Some(FRect { x: pos.x - m, y: pos.y - m, w: w + 2.0 * m, h: h + 2.0 * m })
             }
         }
     }
@@ -380,7 +337,7 @@ impl Obj {
     }
 
     /// Bake this object into the image.
-    pub fn render(&self, buf: &mut PixBuf, font: Option<&FontArc>) {
+    pub fn render(&self, buf: &mut PixBuf, font: Option<&AnnotFont>) {
         self.render_into(&mut Surf::from_buf(buf), font);
     }
 
@@ -388,7 +345,7 @@ impl Obj {
     /// order). Pixelate/invert read the surface's own pixels, so the caller
     /// pre-fills it with the background; pixelate is exact when the surface
     /// window contains the whole rect.
-    pub fn render_into(&self, sf: &mut Surf, font: Option<&FontArc>) {
+    pub fn render_into(&self, sf: &mut Surf, font: Option<&AnnotFont>) {
         match self {
             Obj::Line { a, b, color, width } => {
                 sf.stroke_polyline(&[*a, *b], *width, *color, Blend::Normal);
@@ -423,7 +380,7 @@ impl Obj {
                 size,
             } => {
                 if let Some(font) = font {
-                    draw_text(sf, font, *size, text, *pos, *color);
+                    font.render(sf, text, *size, *pos, *color);
                 }
             }
             Obj::Pixelate { r, cell } => pixelate(sf, *r, *cell),
@@ -531,7 +488,7 @@ mod tests {
         for (n, o) in objs.iter().enumerate() {
             check(&format!("obj {n}"), |s| o.render_into(s, None));
         }
-        if let Some(font) = crate::fonts::load_system_font() {
+        if let Some(font) = AnnotFont::load() {
             let t = Obj::Text {
                 pos: Pt::new(22.0, 16.0),
                 text: "Hello\nWorld wy".into(),

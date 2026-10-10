@@ -53,7 +53,10 @@ SOFTWARE.
 ## Inter — SIL Open Font License 1.1
 
 `assets/fonts/Inter-Medium.subset.ttf` is a subset of Inter by Rasmus
-Andersson (https://rsms.me/inter). The full license text follows at the end of this file.
+Andersson (https://rsms.me/inter). The build bakes its outlines and metrics
+into the executable (a derivative of the font under the same license); the
+Linux build also embeds the TTF itself as the annotation-text fallback. The
+full license text follows at the end of this file.
 
 ## Rust crates (statically linked or build-time)
 
@@ -61,10 +64,15 @@ All are GPL-3.0-compatible (Apache-2.0, MIT, Zlib, 0BSD, Unicode-3.0, IJG).
 Full texts: https://www.apache.org/licenses/LICENSE-2.0,
 https://opensource.org/license/mit, https://zlib.net/zlib_license.html.
 
+The outline coverage rasteriser in `src/raster.rs` (`Coverage`, used for the
+baked UI font) follows the algorithm of ab_glyph_rasterizer, itself derived
+from font-rs (Copyright 2015 Google Inc.; modifications Copyright 2020 Alex
+Butler), Apache-2.0.
+
 | Crate | License |
 |---|---|
-| ab_glyph 0.2.32 | Apache-2.0 |
-| ab_glyph_rasterizer 0.1.10 | Apache-2.0 |
+| ab_glyph 0.2.32 | Apache-2.0 (build-time; linked on Linux only) |
+| ab_glyph_rasterizer 0.1.10 | Apache-2.0 (build-time; linked on Linux only) |
 | adler2 2.0.1 | 0BSD OR MIT OR Apache-2.0 |
 | anyhow 1.0.104 | MIT OR Apache-2.0 |
 | bitflags 1.3.2 | MIT/Apache-2.0 |
@@ -75,13 +83,13 @@ https://opensource.org/license/mit, https://zlib.net/zlib_license.html.
 | jpeg-encoder 0.6.1 | (MIT OR Apache-2.0) AND IJG |
 | miniz_oxide 0.8.9 | MIT OR Zlib OR Apache-2.0 |
 | miniz_oxide 0.9.1 | MIT OR Zlib OR Apache-2.0 |
-| owned_ttf_parser 0.25.1 | Apache-2.0 |
+| owned_ttf_parser 0.25.1 | Apache-2.0 (build-time; linked on Linux only) |
 | png 0.17.16 | MIT OR Apache-2.0 |
 | proc-macro2 1.0.107 | MIT OR Apache-2.0 |
 | quote 1.0.47 | MIT OR Apache-2.0 |
 | simd-adler32 0.3.10 | MIT |
 | syn 2.0.119 | MIT OR Apache-2.0 |
-| ttf-parser 0.25.1 | MIT OR Apache-2.0 |
+| ttf-parser 0.25.1 | MIT OR Apache-2.0 (build-time; linked on Linux only) |
 | unicode-ident 1.0.26 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | windows 0.62.2 | MIT OR Apache-2.0 |
 | windows-collections 0.3.2 | MIT OR Apache-2.0 |

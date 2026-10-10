@@ -13,7 +13,7 @@ use crate::objects::{CellGrid, FRect, Obj, Pt};
 use crate::pixbuf::PixBuf;
 use crate::raster::{Order, Surf};
 use crate::theme::Theme;
-use crate::uifb::{text_width, Fb, C4};
+use crate::uifb::{Fb, C4};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -589,7 +589,7 @@ impl Edit {
     }
 
     fn ui<'a>(&'a self, sc: &'a Scene) -> Ui<'a> {
-        Ui { th: &sc.th, s: sc.s, font: self.ui_font.as_ref() }
+        Ui { th: &sc.th, s: sc.s, font: self.ui_font }
     }
 
     fn el_bounds(&self, sc: &Scene, e: El) -> Vec<PxRect> {
@@ -609,7 +609,7 @@ impl Edit {
                 let lw = sc.s.round().max(1.0);
                 let m = lw / 2.0 + 2.0;
                 let b = FRect { x: t.boxr.x - m, y: t.boxr.y - m, w: t.boxr.w + 2.0 * m, h: t.boxr.h + 2.0 * m };
-                let tw = self.font.as_ref().map_or(0.0, |f| text_width(f, t.px, &t.text));
+                let tw = self.font.as_ref().map_or(0.0, |f| f.line_width(&t.text, t.px));
                 let g = t.px + 2.0;
                 let txt = FRect { x: t.pos.x - g, y: t.pos.y - g, w: tw + 2.0 * g + 2.0 * sc.s, h: t.px * 1.15 + 2.0 * g };
                 vec![px_bounds(b), px_bounds(txt)]
@@ -690,10 +690,11 @@ impl Edit {
             let s = sc.s;
             f.stroke_dashed_rect(t.boxr, 4.0 * s, 3.0 * s, s.round().max(1.0), sc.th.accent);
             if let Some(font) = self.font.as_ref() {
-                f.draw_text(font, t.px, &t.text, t.pos.x, t.pos.y, t.color);
+                // Drawn exactly as the committed text object renders.
+                font.render(&mut f.surf(), &t.text, t.px, t.pos, t.color);
                 if let Some(caret) = t.caret {
                     let before = t.text.get(..caret).unwrap_or("");
-                    let cx = t.pos.x + text_width(font, t.px, before);
+                    let cx = t.pos.x + font.line_width(before, t.px);
                     f.fill_rect(
                         cx.round() as i32,
                         t.pos.y.round() as i32,
@@ -766,7 +767,7 @@ fn stable_draft(prev: &Scene, now: &Scene) -> Option<PxRect> {
 /// the bounds of objects past the first changed one. The whole image when
 /// there is no previous scene, or size, scale, theme or dim alpha changed,
 /// or a selection edge is fractional.
-pub fn dirty_rects(prev: Option<&Scene>, now: &Scene, font: Option<&ab_glyph::FontArc>) -> Vec<PxRect> {
+pub fn dirty_rects(prev: Option<&Scene>, now: &Scene, font: Option<&crate::text::AnnotFont>) -> Vec<PxRect> {
     let img = PxRect::image(now.size);
     let whole = vec![img];
     let Some(prev) = prev else { return whole };

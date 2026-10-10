@@ -9,10 +9,11 @@ use crate::objects::{FRect, Obj, Pt};
 use crate::pixbuf::PixBuf;
 use crate::theme::{self, Theme};
 use crate::raster::Order;
-use crate::uifb::{text_width, C4};
+use crate::uifb::C4;
 use compose::PixBufBackdrop;
 use crate::wind::{self, Cursor, Driver, Ev, Hwnd, Mods};
-use ab_glyph::FontArc;
+use crate::fonts::UiFont;
+use crate::text::AnnotFont;
 use chrome::ToastKind;
 use toolbar::{Act, Toolbar};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -165,8 +166,8 @@ pub fn run(
         RunKind::Daemon => crate::update::spawn_checker(cfg.check_updates),
         RunKind::OneShot => None,
     };
-    let font = fonts::load_system_font();
-    let ui_font = fonts::ui_font().or_else(|| font.clone());
+    let font = AnnotFont::load();
+    let ui_font = Some(fonts::ui_font());
     let mut app = App {
         cfg,
         kind,
@@ -224,8 +225,8 @@ struct App {
     updates: Option<Receiver<crate::update::Release>>,
     /// A newer release found; announced on the next capture.
     update_pending: Option<crate::update::Release>,
-    font: Option<FontArc>,
-    ui_font: Option<FontArc>,
+    font: Option<AnnotFont>,
+    ui_font: Option<&'static UiFont>,
     notice: Option<Toast>,
     hwnd: Hwnd,
     /// Last known mouse position (client == image coordinates).
@@ -412,7 +413,7 @@ impl App {
             last_wheel: Instant::now(),
             font: self.font.clone(),
             th,
-            ui_font: self.ui_font.clone(),
+            ui_font: self.ui_font,
             hover: None,
             hover_at: Instant::now(),
             pressed: None,
@@ -1279,9 +1280,9 @@ struct Edit {
     dirty: bool,
     notice: Option<Toast>,
     last_wheel: Instant,
-    font: Option<FontArc>,
+    font: Option<AnnotFont>,
     th: Theme,
-    ui_font: Option<FontArc>,
+    ui_font: Option<&'static UiFont>,
     /// Toolbar item under the pointer and since when (tooltip delay).
     hover: Option<usize>,
     hover_at: Instant,
@@ -1631,9 +1632,9 @@ fn resize_rect(
 
 /// Dashed box around the text draft: 4 px padding, at least 24×28; the text
 /// itself is drawn at `td.pos`, exactly where the committed object renders.
-fn text_box_rect(win_w: f32, td: &TextDraft, font_px: f32, font: Option<&FontArc>, s: f32) -> FRect {
+fn text_box_rect(win_w: f32, td: &TextDraft, font_px: f32, font: Option<&AnnotFont>, s: f32) -> FRect {
     let pad = 4.0 * s;
-    let tw = font.map(|f| text_width(f, font_px, &td.text)).unwrap_or(0.0);
+    let tw = font.map(|f| f.line_width(&td.text, font_px)).unwrap_or(0.0);
     let w = (tw + 2.0 * pad + 2.0 * s).max(24.0 * s);
     let h = (font_px * 1.15 + 2.0 * pad).max(28.0 * s);
     let x = (td.pos.x - pad).min((win_w - w).max(0.0));
@@ -1898,8 +1899,8 @@ mod tests {
     fn preview_app_with(th: Theme, sel: Option<FRect>, shot: Shot) -> App {
         let theme_name = if th == theme::DARK { "dark" } else { "light" };
         let cfg = Config { theme: theme_name.into(), ..Config::default() };
-        let font = fonts::load_system_font();
-        let ui_font = fonts::ui_font().or_else(|| font.clone());
+        let font = AnnotFont::load();
+        let ui_font = Some(fonts::ui_font());
         let mut shot = shot;
         let base = std::mem::take(&mut shot.image);
         let edit = Edit {
@@ -1939,7 +1940,7 @@ mod tests {
             last_wheel: Instant::now(),
             font: font.clone(),
             th,
-            ui_font: ui_font.clone(),
+            ui_font,
             hover: None,
             hover_at: Instant::now(),
             pressed: None,
@@ -2161,6 +2162,17 @@ mod tests {
         let text = "Check this".to_string();
         e.text = Some(TextDraft { pos: Pt::new(400.0, 300.0), caret: text.len(), text, at: Instant::now() });
         save(&mut app, "dark-text.png");
+
+        let mut app = annotated(theme::LIGHT, big);
+        let e = edit_of(&mut app);
+        e.objects.push(Obj::Text {
+            pos: Pt::new(300.0, 420.0),
+            text: "Annotation text\nПривет, мир · مرحبا · 你好".into(),
+            color: C4::rgb(240, 68, 56),
+            size: 28.0,
+        });
+        e.dirty = true;
+        save(&mut app, "light-text-object.png");
 
         let mut app = preview_app(theme::DARK, None);
         save(&mut app, "dark-hint.png");

@@ -7,10 +7,22 @@ license = "GPL-3.0-only"
 description = "Screenshot and annotation tool (Flameshot-style, written in Rust)"
 
 [dependencies]
-ab_glyph = "0.2"
 anyhow = "1"
 jpeg-encoder = { version = "0.6", default-features = false, features = ["std"] }
 png = "0.17"
+
+# The UI font is baked at build time (build.rs); annotation text uses the OS
+# text renderer (GDI, CoreText) except on Linux, which rasterises a system
+# font with ab_glyph.
+[target.'cfg(target_os = "linux")'.dependencies]
+ab_glyph = "0.2"
+
+[build-dependencies]
+ab_glyph = "0.2"
+
+# Tests compare the baked font against ab_glyph's own layout and coverage.
+[dev-dependencies]
+ab_glyph = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

@@ -17,7 +17,7 @@ use super::{Dimmer, Edit};
 use crate::objects::Obj;
 use crate::raster::{Order, Surf};
 use crate::uifb::C4;
-use ab_glyph::FontArc;
+use crate::text::AnnotFont;
 use anyhow::{anyhow, Result};
 use std::cell::RefCell;
 use windows::Win32::Graphics::Gdi::{
@@ -329,7 +329,7 @@ impl GdiScreen {
     /// appended objects are rendered into the existing layer (grown when
     /// needed, keeping its pixels); anything else rebuilds it. No objects:
     /// no layer.
-    pub fn set_objects(&mut self, objects: &[Obj], font: Option<&FontArc>) {
+    pub fn set_objects(&mut self, objects: &[Obj], font: Option<&AnnotFont>) {
         let img = PxRect::image(self.size);
         let rect = objects
             .iter()

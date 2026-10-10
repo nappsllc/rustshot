@@ -8,13 +8,13 @@ use crate::keymap::{Chord, Keymap};
 use crate::objects::FRect;
 use crate::theme::{rgba, Theme, SHADOW};
 use crate::uifb::{text_height, text_width, Fb, C4};
-use ab_glyph::FontArc;
+use crate::fonts::UiFont;
 
 /// Tokens, DPI scale and UI font: what every chrome call needs.
 pub struct Ui<'a> {
     pub th: &'a Theme,
     pub s: f32,
-    pub font: Option<&'a FontArc>,
+    pub font: Option<&'a UiFont>,
 }
 
 impl Ui<'_> {
