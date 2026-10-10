@@ -147,3 +147,13 @@
 - [ ] Re-run e2e tests; Windows Sandbox clean-system harness, extended with: Settings window opens from the tray; Ctrl+S writes into the dated folder; portable self-update from a local fixture.
 - [ ] Update README (Saving, Shortcuts table, Settings, Updates incl. the integrity limitation), `docs/STORES.md` if store behaviour changed, metainfo/NSIS untouched (no release in this plan).
 - [ ] Final whole-branch review; fix wave; push `handroll`; CI green on all 5 jobs.
+
+### Task 10: Test hardening
+Baseline (cargo llvm-cov, Windows, 024a5fe): 69.7% lines overall; `editor/mod.rs` 56%, `main.rs` 44%, `capture.rs` 47%, `instance.rs` 0% (tests ignored), Windows platform files 0–6%.
+**Files:** tests in `src/editor/mod.rs` (or a new `src/editor/tests.rs`), `src/instance.rs`, `tests/e2e.rs`, `.github/workflows/ci.yml`.
+- [ ] Editor state-machine tests driving `on_event` with synthetic input: selection create/move/resize from every handle, clamping to the shot and across monitors, every drawing tool's draft→commit, text editing (insert, caret moves, multi-line, commit/cancel), undo/redo across tools and the undo limit, palette/size changes, toast lifecycle, accept/cancel paths, upload result handling (injected receiver). Target ≥ 80% lines in `editor/mod.rs`.
+- [ ] `instance.rs`: make the ignored tests deterministic (unique instance names per test, no shared global state, explicit synchronisation instead of sleeps) and un-ignore them; cover second-launch signalling and stale-lock recovery on all platforms the CI runs.
+- [ ] `main.rs` CLI: argument parsing and command dispatch tests for every subcommand without touching the screen (pure parse → `Cmd`).
+- [ ] CI: run the e2e tests on the Windows runner (`cargo test -- --include-ignored` for the e2e suite with a unique instance name; the runner has an interactive desktop session); Linux job runs tests under `xvfb-run` including X11 capture and window tests (enable the ignored X11 ones there).
+- [ ] Coverage job (Linux + Windows) running `cargo llvm-cov --summary-only` and printing the table in the job summary; no threshold gate yet.
+- [ ] Report the before/after coverage table.
