@@ -354,8 +354,6 @@ pub fn hide(hwnd: Hwnd) {
             XFlush(dpy);
         }
     });
-    // An idle daemon keeps no frame-sized staging buffer around.
-    BGRX.with_borrow_mut(|b| *b = Vec::new());
 }
 
 pub fn close(_hwnd: Hwnd) {
@@ -674,49 +672,44 @@ struct XImageHead {
     data: *mut c_char,
 }
 
-std::thread_local! {
-    /// B,G,R,X staging buffer for `present`, reused across frames.
-    static BGRX: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
 /// Present an unpremultiplied RGBA framebuffer (converted to B,G,R,X for the
 /// server's little-endian 32 bpp ZPixmap format, like StretchDIBits does).
-fn present(dpy: *mut c_void, win: c_ulong, gc: *mut c_void, fb: &PixBuf) {
+///
+/// Converts `fb` in place (no staging copy), so it holds B,G,R,X afterwards.
+/// Sound because every repaint calls `Driver::frame()` first, which rewrites
+/// the whole buffer; nothing presents the same frame twice.
+fn present(dpy: *mut c_void, win: c_ulong, gc: *mut c_void, fb: &mut PixBuf) {
     let (w, h) = fb.dimensions();
     if w == 0 || h == 0 {
         return;
     }
-    BGRX.with_borrow_mut(|bgrx| {
-        bgrx.resize(fb.as_raw().len(), 0);
-        for (o, i) in bgrx.as_chunks_mut::<4>().0.iter_mut().zip(fb.as_raw().as_chunks::<4>().0) {
-            *o = [i[2], i[1], i[0], 255];
+    for p in fb.as_raw_mut().as_chunks_mut::<4>().0.iter_mut() {
+        *p = [p[2], p[1], p[0], 255];
+    }
+    unsafe {
+        let screen = XDefaultScreen(dpy);
+        // Standard Xorg TrueColor: depth 24 with 32 bpp pads.
+        let image = XCreateImage(
+            dpy,
+            XDefaultVisual(dpy, screen),
+            XDefaultDepth(dpy, screen) as c_uint,
+            Z_PIXMAP,
+            0,
+            fb.as_raw_mut().as_mut_ptr() as *mut c_char,
+            w as c_uint,
+            h as c_uint,
+            32,
+            (w * 4) as c_int,
+        );
+        if image.is_null() {
+            return;
         }
-        unsafe {
-            let screen = XDefaultScreen(dpy);
-            // Standard Xorg TrueColor: depth 24 with 32 bpp pads.
-            let image = XCreateImage(
-                dpy,
-                XDefaultVisual(dpy, screen),
-                XDefaultDepth(dpy, screen) as c_uint,
-                Z_PIXMAP,
-                0,
-                bgrx.as_mut_ptr() as *mut c_char,
-                w as c_uint,
-                h as c_uint,
-                32,
-                (w * 4) as c_int,
-            );
-            if image.is_null() {
-                return;
-            }
-            XPutImage(dpy, win, gc, image, 0, 0, 0, 0, w as c_uint, h as c_uint);
-            // XPutImage copied the pixels synchronously. The buffer stays
-            // ours (reused next frame): detach it so XDestroyImage frees
-            // only the XImage header.
-            (*(image as *mut XImageHead)).data = core::ptr::null_mut();
-            XDestroyImage(image);
-        }
-    });
+        XPutImage(dpy, win, gc, image, 0, 0, 0, 0, w as c_uint, h as c_uint);
+        // XPutImage copied the pixels synchronously. The buffer stays
+        // the frame's: detach it so XDestroyImage frees only the header.
+        (*(image as *mut XImageHead)).data = core::ptr::null_mut();
+        XDestroyImage(image);
+    }
 }
 
 /// Map `Cursor` to an XC_* shape from cursorfont.h (cached per run).

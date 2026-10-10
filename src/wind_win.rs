@@ -186,34 +186,33 @@ unsafe extern "system" fn wndproc(
     }
 }
 
-thread_local! {
-    /// BGRA staging buffer for `present`, reused across paints (resized
-    /// only when the overlay size changes).
-    static BGRA: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// RGBA bytes -> BGRA bytes (R/B swapped), one pass, no allocation.
+/// RGBA <-> BGRA: swap the R and B bytes of every pixel in place (its own
+/// inverse), one pass, no allocation.
 /// (`BI_BITFIELDS` masks would let GDI read RGBA directly, but its
 /// conversion path is ~40x slower than this swap plus a BI_RGB blit.)
-pub(crate) fn rgba_to_bgra(src: &[u8], dst: &mut [u8]) {
+pub(crate) fn swap_rb(buf: &mut [u8]) {
     // Two pixels per step (the release profile is size-optimised, so no
     // auto-vectorisation): keep G/A, exchange the R and B bytes.
-    let (d8, dt) = dst.as_chunks_mut::<8>();
-    let (s8, st) = src.as_chunks::<8>();
-    for (o, i) in d8.iter_mut().zip(s8) {
-        let v = u64::from_le_bytes(*i);
+    let (b8, bt) = buf.as_chunks_mut::<8>();
+    for o in b8.iter_mut() {
+        let v = u64::from_le_bytes(*o);
         let ga = v & 0xFF00_FF00_FF00_FF00;
         let r = v & 0x0000_00FF_0000_00FF;
         let b = v & 0x00FF_0000_00FF_0000;
         *o = (ga | (r << 16) | (b >> 16)).to_le_bytes();
     }
-    for (o, i) in dt.as_chunks_mut::<4>().0.iter_mut().zip(st.as_chunks::<4>().0) {
-        *o = [i[2], i[1], i[0], i[3]];
+    for o in bt.as_chunks_mut::<4>().0.iter_mut() {
+        *o = [o[2], o[1], o[0], o[3]];
     }
 }
 
 /// Present an unpremultiplied RGBA framebuffer as top-down BGRA.
-fn present(hdc: windows::Win32::Graphics::Gdi::HDC, fb: &PixBuf) {
+///
+/// Converts `fb` to BGRA in place (no staging copy), so its contents are
+/// BGRA afterwards. Sound because every paint (WM_PAINT) calls
+/// `Driver::frame()` first, which rewrites the whole buffer; nothing
+/// presents the same frame twice.
+fn present(hdc: windows::Win32::Graphics::Gdi::HDC, fb: &mut PixBuf) {
     let (w, h) = fb.dimensions();
     if w == 0 || h == 0 {
         return;
@@ -225,27 +224,24 @@ fn present(hdc: windows::Win32::Graphics::Gdi::HDC, fb: &PixBuf) {
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB.0;
-    BGRA.with_borrow_mut(|bgra| {
-        bgra.resize(fb.as_raw().len(), 0);
-        rgba_to_bgra(fb.as_raw(), bgra);
-        unsafe {
-            StretchDIBits(
-                hdc,
-                0,
-                0,
-                w as i32,
-                h as i32,
-                0,
-                0,
-                w as i32,
-                h as i32,
-                Some(bgra.as_ptr() as *const _),
-                &bmi,
-                DIB_RGB_COLORS,
-                SRCCOPY,
-            );
-        }
-    });
+    swap_rb(fb.as_raw_mut());
+    unsafe {
+        StretchDIBits(
+            hdc,
+            0,
+            0,
+            w as i32,
+            h as i32,
+            0,
+            0,
+            w as i32,
+            h as i32,
+            Some(fb.as_raw().as_ptr() as *const _),
+            &bmi,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+    }
 }
 
 /// Position + show the overlay at an exact physical rect and take focus.
@@ -261,8 +257,6 @@ pub fn hide(hwnd: HWND) {
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
-    // An idle daemon keeps no frame-sized staging buffer around.
-    BGRA.with_borrow_mut(|b| *b = Vec::new());
 }
 
 pub fn close(hwnd: HWND) {
@@ -334,7 +328,7 @@ mod tests {
             [1, 2, 3, 255],
             [250, 128, 7, 255],
         ];
-        let fb = PixBuf::from_raw(4, 2, px.concat()).unwrap();
+        let mut fb = PixBuf::from_raw(4, 2, px.concat()).unwrap();
         unsafe {
             let dc = CreateCompatibleDC(None);
             assert!(!dc.is_invalid());
@@ -348,7 +342,7 @@ mod tests {
             let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
             let bmp = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
             let old = SelectObject(dc, bmp.into());
-            present(dc, &fb);
+            present(dc, &mut fb);
             let _ = GdiFlush();
             let out = std::slice::from_raw_parts(bits as *const u8, 4 * 2 * 4).to_vec();
             SelectObject(dc, old);

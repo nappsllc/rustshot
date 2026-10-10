@@ -86,7 +86,13 @@ pub trait Driver {
     fn on_event(&mut self, ev: Ev) -> bool;
     /// Compose the current frame as unpremultiplied RGBA, top-down, into a
     /// buffer the driver keeps across frames (no per-frame allocation).
-    fn frame(&mut self) -> Option<&PixBuf>;
+    ///
+    /// The buffer is handed out mutably because the presenter converts it
+    /// in place (R/B swap) instead of keeping a frame-sized staging copy.
+    /// Contract: the driver fully rewrites it on every call, and backends
+    /// present each returned frame at most once (every paint path calls
+    /// `frame()` first), so its contents after presenting are dead.
+    fn frame(&mut self) -> Option<&mut PixBuf>;
     /// Cursor for WM_SETCURSOR.
     fn cursor(&self) -> Cursor;
     /// Window is being destroyed (loop ends after this).
@@ -163,8 +169,8 @@ mod tests {
         fn on_event(&mut self, _ev: Ev) -> bool {
             false
         }
-        fn frame(&mut self) -> Option<&PixBuf> {
-            Some(&self.fb)
+        fn frame(&mut self) -> Option<&mut PixBuf> {
+            Some(&mut self.fb)
         }
         fn cursor(&self) -> Cursor {
             Cursor::Arrow

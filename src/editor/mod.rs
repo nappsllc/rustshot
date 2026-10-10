@@ -358,7 +358,6 @@ impl App {
         // The capture is held once, as `base`; `shot` keeps only geometry.
         let mut shot = shot;
         let base = std::mem::take(&mut shot.image);
-        let composed = base.clone();
         let sel = initial_sel.filter(|r| !r.is_trivial());
         let accept_now = accept_on_select && sel.is_some();
         let th = theme::resolve(&cfg);
@@ -366,7 +365,7 @@ impl App {
             mo: Motion::new(Instant::now()),
             shot,
             base,
-            composed,
+            composed: None,
             frame: PixBuf::default(),
             caret_drawn: None,
             toast_drawn: None,
@@ -456,7 +455,7 @@ impl App {
             w: edit.shot.size.0 as f32,
             h: edit.shot.size.1 as f32,
         });
-        let img = crop_to_image(&edit.composed, sel);
+        let img = crop_to_image(edit.composed(), sel);
         let g = (
             (sel.x.round() as i32) + edit.shot.origin.0,
             (sel.y.round() as i32) + edit.shot.origin.1,
@@ -1002,7 +1001,7 @@ impl Driver for App {
         true
     }
 
-    fn frame(&mut self) -> Option<&PixBuf> {
+    fn frame(&mut self) -> Option<&mut PixBuf> {
         let State::Edit(edit) = &mut self.st else { return None };
         let edit: &mut Edit = edit;
         if edit.dirty {
@@ -1061,10 +1060,10 @@ impl Driver for App {
         // Borrowed out of `edit` while drawing (chrome reads `edit`), put
         // back below; allocated once per capture.
         let mut img = std::mem::take(&mut edit.frame);
-        if img.dimensions() != edit.composed.dimensions() {
-            img = PixBuf::new(edit.composed.width(), edit.composed.height());
+        if img.dimensions() != edit.base.dimensions() {
+            img = PixBuf::new(edit.base.width(), edit.base.height());
         }
-        compose_dimmed(&mut img, &edit.composed, rects, dim);
+        compose_dimmed(&mut img, edit.composed(), rects, dim);
         if let Some(d) = &edit.draft {
             d.render(&mut img, edit.font.as_ref());
         }
@@ -1139,7 +1138,7 @@ impl Driver for App {
         edit.toast_drawn = edit.notice.as_ref().or(self.notice.as_ref()).map(|t| t.at);
         wind::set_fast_timer(self.hwnd, animating(edit, self.notice.as_ref(), now));
         edit.frame = img;
-        Some(&edit.frame)
+        Some(&mut edit.frame)
     }
 
     fn cursor(&self) -> Cursor {
@@ -1274,8 +1273,10 @@ struct Edit {
     shot: Shot,
     /// The capture (moved out of `shot.image`, which stays empty).
     base: PixBuf,
-    /// `base` with the committed objects baked in.
-    composed: PixBuf,
+    /// `base` with the committed objects baked in; `None` while there are
+    /// none (identical to `base`, so no second full-size buffer). Read it
+    /// through `composed()`.
+    composed: Option<PixBuf>,
     /// Display buffer `frame()` composes into; reused across frames,
     /// allocated on the first frame of a capture.
     frame: PixBuf,
@@ -1321,11 +1322,23 @@ const HANDLE_HIT: f32 = 10.0; // handle hit radius, logical px (20 px target)
 const CLICK_PX: f32 = 2.5; // movement below this counts as a click
 
 impl Edit {
+    /// The capture with committed objects baked in.
+    fn composed(&self) -> &PixBuf {
+        self.composed.as_ref().unwrap_or(&self.base)
+    }
+
     fn rebuild(&mut self) {
-        // In place: no fourth full-size buffer while re-baking.
-        self.composed.as_raw_mut().copy_from_slice(self.base.as_raw());
-        for o in &self.objects {
-            o.render(&mut self.composed, self.font.as_ref());
+        if self.objects.is_empty() {
+            // Nothing to bake (e.g. undid the last object): drop the copy.
+            self.composed = None;
+        } else {
+            // Re-bake in place; allocate only when it was `None`.
+            let base = &self.base;
+            let composed = self.composed.get_or_insert_with(|| base.clone());
+            composed.as_raw_mut().copy_from_slice(base.as_raw());
+            for o in &self.objects {
+                o.render(composed, self.font.as_ref());
+            }
         }
         self.dirty = false;
     }
@@ -1944,7 +1957,7 @@ mod tests {
         let edit = Edit {
             mo: Motion::new(Instant::now()),
             shot,
-            composed: base.clone(),
+            composed: None,
             base,
             frame: PixBuf::default(),
             caret_drawn: None,
@@ -2024,6 +2037,70 @@ mod tests {
         });
         e.dirty = true;
         app
+    }
+
+    fn one_rect(sel: FRect) -> Obj {
+        Obj::Rect {
+            r: FRect { x: sel.x + 40.0, y: sel.y + 40.0, w: sel.w * 0.35, h: sel.h * 0.3 },
+            color: C4::rgb(240, 68, 56),
+            width: 3.0,
+        }
+    }
+
+    /// A fresh edit has no `composed` copy; frame and export match what a
+    /// materialised copy of `base` would give.
+    #[test]
+    fn fresh_edit_has_no_composed_and_output_matches_base() {
+        let sel = FRect { x: 100.0, y: 80.0, w: 300.0, h: 200.0 };
+        let mut app = preview_app(theme::DARK, Some(sel));
+        let e = edit_of(&mut app);
+        assert!(e.composed.is_none());
+        assert!(std::ptr::eq(e.composed(), &e.base));
+        let want_crop = crop_to_image(&e.base.clone(), sel);
+        assert!(crop_to_image(e.composed(), sel) == want_crop);
+        let got = app.frame().expect("frame").clone();
+        // Same edit with an explicit identical copy of base.
+        let mut app2 = preview_app(theme::DARK, Some(sel));
+        let e2 = edit_of(&mut app2);
+        e2.composed = Some(e2.base.clone());
+        let want = app2.frame().expect("frame").clone();
+        // Animation state starts at the same instant-ish; compare the
+        // captured area inside the selection, which no tween touches.
+        let (x0, y0) = (sel.x as u32 + 8, sel.y as u32 + 8);
+        let w = sel.w as u32 - 16;
+        let h = sel.h as u32 - 16;
+        assert!(got.crop(x0, y0, w, h) == want.crop(x0, y0, w, h));
+        assert!(edit_of(&mut app).composed.is_none(), "frame() must not allocate it");
+    }
+
+    /// Committing an object allocates `composed`; undoing back to zero
+    /// objects drops it; redo brings it back.
+    #[test]
+    fn composed_allocated_on_commit_and_dropped_on_undo() {
+        let sel = FRect { x: 100.0, y: 80.0, w: 300.0, h: 200.0 };
+        let mut app = preview_app(theme::DARK, Some(sel));
+        let e = edit_of(&mut app);
+        e.commit_object(one_rect(sel));
+        e.rebuild();
+        assert!(e.composed.is_some());
+        assert!(e.composed() != &e.base, "object is baked in");
+        e.undo();
+        e.rebuild();
+        assert!(e.composed.is_none());
+        assert!(e.composed() == &e.base);
+        e.redo();
+        e.rebuild();
+        assert!(e.composed.is_some() && e.composed() != &e.base);
+    }
+
+    /// The Windows/Linux presenters convert the frame in place: no
+    /// staging thread-local remains (structural check on the source).
+    #[test]
+    fn presenters_have_no_staging_buffer() {
+        for src in [include_str!("../wind_win.rs"), include_str!("../wind_linux.rs")] {
+            let prod = src.split("#[cfg(test)]").next().unwrap();
+            assert!(!prod.contains("static BGRA") && !prod.contains("static BGRX"), "staging buffer is back");
+        }
     }
 
     #[test]
@@ -2402,14 +2479,13 @@ mod tests {
                 }
             }
             let (mut tf, mut tp) = (Vec::new(), Vec::new());
-            let mut scratch = Vec::new();
             for _ in 0..30 {
                 let t0 = Instant::now();
                 let fb = app.frame().expect("frame");
                 let t1 = Instant::now();
-                bench_present_prep(fb, &mut scratch);
+                bench_present_prep(fb);
                 let t2 = Instant::now();
-                std::hint::black_box(&scratch);
+                std::hint::black_box(&*fb);
                 tf.push((t1 - t0).as_secs_f64() * 1000.0);
                 tp.push((t2 - t1).as_secs_f64() * 1000.0);
             }
@@ -2419,9 +2495,10 @@ mod tests {
     }
 
     /// What `wind_win::present` does before StretchDIBits.
-    fn bench_present_prep(fb: &PixBuf, scratch: &mut Vec<u8>) {
-        scratch.resize(fb.as_raw().len(), 0);
+    fn bench_present_prep(fb: &mut PixBuf) {
         #[cfg(windows)]
-        crate::wind::rgba_to_bgra(fb.as_raw(), scratch);
+        crate::wind::swap_rb(fb.as_raw_mut());
+        #[cfg(not(windows))]
+        let _ = fb;
     }
 }

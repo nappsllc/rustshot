@@ -415,7 +415,7 @@ fn pump_loop(driver: &mut dyn Driver) -> i32 {
             if repaint && !QUIT.load(Ordering::SeqCst)
                 && let Some(fb) = driver.frame()
             {
-                present(window, fb);
+                present(window, &*fb);
             }
             let want = driver.cursor();
             if cursor != Some(want) {
