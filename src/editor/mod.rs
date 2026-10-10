@@ -87,11 +87,6 @@ impl Toast {
         Toast { text: text.into(), kind, at: Instant::now(), ttl }
     }
 
-    fn with_ttl(mut self, ms: f32) -> Self {
-        self.ttl = ms;
-        self
-    }
-
     fn ttl_ms(&self) -> f32 {
         self.ttl
     }
@@ -168,6 +163,10 @@ pub fn run(
         g.listen(h.sender());
         crate::tray::spawn(h.sender());
     }
+    if let Some(h) = &hot {
+        // An installed update stops the daemon through the Quit hotkey path.
+        crate::update_ui::set_quit_sender(h.sender());
+    }
     let updates = match kind {
         RunKind::Daemon => crate::update::spawn_checker(cfg.check_updates),
         RunKind::OneShot => None,
@@ -229,7 +228,7 @@ struct App {
     upload_slot: UploadSlot,
     /// Results from the background update checker (daemon only).
     updates: Option<Receiver<crate::update::Release>>,
-    /// A newer release found; announced on the next capture.
+    /// A newer release found; shown in the update dialog once no capture is up.
     update_pending: Option<crate::update::Release>,
     font: Option<AnnotFont>,
     ui_font: Option<&'static UiFont>,
@@ -268,6 +267,13 @@ impl App {
             while let Ok(r) = rx.try_recv() {
                 self.update_pending = Some(r);
             }
+        }
+        // Never over a capture in progress: the dialog would take its focus.
+        if matches!(self.st, State::Hidden)
+            && self.pending.is_none()
+            && let Some(r) = self.update_pending.take()
+        {
+            crate::update_ui::show(crate::update_ui::DialogState::Available(r));
         }
         if self.notice.as_ref().is_some_and(|t| t.expired(Instant::now())) {
             self.notice = None;
@@ -425,15 +431,6 @@ impl App {
             pressed: None,
             hot_handle: None,
         };
-        if let Some(r) = self.update_pending.take() {
-            edit.notice = Some(
-                Toast::new(
-                    format!("Rustshot {} is available — run `rustshot update`", r.version),
-                    ToastKind::Info,
-                )
-                .with_ttl(6000.0),
-            );
-        }
         if accept_now {
             edit.done = true;
             edit.cancelled = false;
@@ -2226,15 +2223,6 @@ mod tests {
         assert!(!t.expired(ms(1650)));
         assert!(t.expired(ms(1701)));
         assert!(t.animating(ms(10)) && !t.animating(ms(800)) && t.animating(ms(1500)));
-    }
-
-    #[test]
-    fn toast_custom_ttl() {
-        let t = Toast::new("x", ToastKind::Info).with_ttl(6000.0);
-        let at = t.at;
-        let ms = |n: u64| at + Duration::from_millis(n);
-        assert!(!t.expired(ms(6050)));
-        assert!(t.expired(ms(6101)));
     }
 
     #[test]

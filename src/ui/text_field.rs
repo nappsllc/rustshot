@@ -1,5 +1,6 @@
 //! Single-line text field: caret, selection, clipboard, horizontal scroll.
 //! No IME (out of scope) and no caret blink (frames are input-driven).
+#![allow(dead_code)] // Settings window (Task 8)
 
 use super::controls::{field_frame, text_size};
 use super::layout::H;

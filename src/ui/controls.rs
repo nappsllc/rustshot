@@ -68,6 +68,7 @@ fn fade(ui: &Ui) -> f32 {
 
 /// Text field / dropdown / shortcut box: subtle fill, 1 px border, accent
 /// border while focused.
+#[allow(dead_code)] // Settings window (Task 8)
 pub(super) fn field_frame(ui: &mut Ui, r: FRect, focused: bool, hovered: bool) {
     let th = ui.theme;
     let k = fade(ui);
@@ -101,6 +102,7 @@ fn press_logic(ui: &mut Ui, id: u64, r: FRect) -> (bool, bool, bool) {
 
 /// A table column: title and share of the width (the last takes the rest).
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Settings window (Task 8)
 pub struct Col<'a> {
     pub title: &'a str,
     pub frac: f32,
@@ -108,6 +110,7 @@ pub struct Col<'a> {
 
 /// A table row: one string per column; `error` paints it in the error colour.
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // Settings window (Task 8)
 pub struct Row<'a> {
     pub cells: &'a [&'a str],
     pub error: bool,
@@ -115,6 +118,7 @@ pub struct Row<'a> {
 
 /// Table selection and scroll offset (logical px).
 #[derive(Clone, Debug, Default, PartialEq)]
+#[allow(dead_code)] // Settings window (Task 8)
 pub struct TableState {
     pub selected: Option<usize>,
     pub scroll: f32,
@@ -122,6 +126,7 @@ pub struct TableState {
     pub body: Option<(FRect, f32)>,
 }
 
+#[allow(dead_code)] // Settings window (Task 8)
 impl TableState {
     /// Where row `i` was drawn last frame (physical px), when visible.
     pub fn row_rect(&self, i: usize) -> Option<FRect> {
@@ -137,6 +142,7 @@ impl TableState {
 
 impl Ui<'_> {
     /// One line of body text.
+    #[allow(dead_code)] // Settings window (Task 8)
     pub fn label(&mut self, s: &str) {
         self.text_line(s, text_size(), false);
     }
@@ -166,7 +172,7 @@ impl Ui<'_> {
     /// Push button; `primary` is the accent-filled default action.
     /// Clicked by mouse release over it or Enter/Space while focused.
     pub fn button(&mut self, id: &str, label: &str, primary: bool) -> bool {
-        let w = (tw(self, text_size(), label) + 2.0 * 16.0).max(84.0).ceil();
+        let w = self.button_width(label);
         let r = self.alloc(Some(w), H);
         let id = id_of(id);
         let focused = self.focusable(id);
@@ -203,6 +209,7 @@ impl Ui<'_> {
     }
 
     /// On/off switch. Returns whether it flipped.
+    #[allow(dead_code)] // Settings window (Task 8)
     pub fn toggle(&mut self, id: &str, on: &mut bool) -> bool {
         let r = self.alloc(Some(36.0), H);
         let id = id_of(id);
@@ -237,6 +244,7 @@ impl Ui<'_> {
 
     /// Choice from `items`; the list opens below the box (above when it
     /// would leave the window). Returns whether `sel` changed.
+    #[allow(dead_code)] // Settings window (Task 8)
     pub fn dropdown(&mut self, id: &str, items: &[&str], sel: &mut usize) -> bool {
         let wmax = items.iter().map(|s| tw(self, text_size(), s)).fold(0.0, f32::max);
         let r = self.alloc(Some((wmax + 12.0 + 16.0 + 10.0 + 12.0).max(120.0).ceil()), H);
@@ -348,6 +356,7 @@ impl Ui<'_> {
 
     /// Integer slider over `min..=max` with the value printed at its right.
     /// Drag, click, arrows (±1), PageUp/PageDown (±10), Home/End.
+    #[allow(dead_code)] // Settings window (Task 8)
     pub fn slider(&mut self, id: &str, v: &mut u8, min: u8, max: u8) -> bool {
         let r = self.alloc(None, H);
         let id = id_of(id);
@@ -420,6 +429,7 @@ impl Ui<'_> {
 
     /// Segmented tab bar; the current tab has the active-tool tint.
     /// Left/Right switch while focused. Returns whether `sel` changed.
+    #[allow(dead_code)] // Settings window (Task 8)
     pub fn tabs(&mut self, id: &str, labels: &[&str], sel: &mut usize) -> bool {
         let pad = 4.0;
         let ws: Vec<f32> = labels.iter().map(|s| (tw(self, text_size(), s) + 2.0 * 14.0).ceil()).collect();
@@ -485,6 +495,7 @@ impl Ui<'_> {
     /// Up/Down/Home/End/PageUp/PageDown while focused, wheel to scroll).
     /// Fills the width; height = `height(..)` or 8 rows. Returns whether
     /// the selection changed.
+    #[allow(dead_code)] // Settings window (Task 8)
     pub fn table(&mut self, id: &str, cols: &[Col], rows: &[Row], st: &mut TableState) -> bool {
         let r = self.alloc(None, ITEM_H * 9.0);
         let id = id_of(id);
@@ -626,6 +637,7 @@ impl Ui<'_> {
     /// Backspace clears, Tab moves on, a click elsewhere stops recording;
     /// modifier keys alone wait for the key. Esc is recorded like any key.
     /// Returns whether `chord` changed.
+    #[allow(dead_code)] // Settings window (Task 8)
     pub fn key_capture(&mut self, id: &str, chord: &mut Option<Chord>) -> bool {
         let r = self.alloc(Some(140.0), H);
         let id = id_of(id);
@@ -696,6 +708,7 @@ impl Ui<'_> {
     }
 }
 
+#[allow(dead_code)] // Settings window (Task 8)
 fn is_modifier(vk: u32) -> bool {
     matches!(vk, 0x10..=0x12 | 0x5B | 0x5C | 0xA0..=0xA5 | 0x14)
 }
@@ -730,5 +743,149 @@ pub(super) fn draw_popup(ui: &mut Ui, items: &[String], r: FRect, sel: usize, ho
             let ix = ir.x1() - ui.px(8.0) - isz;
             draw_icon(&mut ui.fb, "check", ix, cy - isz / 2.0, isz, th.accent_fg);
         }
+    }
+}
+
+/// Greedy word wrap of `text` to `max_w` (the unit of `measure`). Every
+/// `\n` starts a new line (empty source lines are kept); words are split
+/// at spaces, and a word wider than a whole line is broken between
+/// characters.
+pub fn wrap(text: &str, max_w: f32, measure: impl Fn(&str) -> f32) -> Vec<String> {
+    let mut out = Vec::new();
+    for src in text.split('\n') {
+        let src = src.trim_end_matches('\r');
+        let mut line = String::new();
+        for word in src.split(' ').filter(|w| !w.is_empty()) {
+            let joined = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+            if measure(&joined) <= max_w {
+                line = joined;
+                continue;
+            }
+            if !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+            }
+            // The word alone: break it if even that is too wide.
+            for ch in word.chars() {
+                line.push(ch);
+                if measure(&line) > max_w && line.chars().count() > 1 {
+                    line.pop();
+                    out.push(std::mem::replace(&mut line, ch.to_string()));
+                }
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// Line pitch of wrapped body text (logical px).
+const LINE_H: f32 = 20.0;
+
+impl Ui<'_> {
+    /// Wrapped text filling the width; `muted` for secondary text. Lines
+    /// past the height given by `height(..)` (default: all of them) are
+    /// not drawn.
+    pub fn paragraph(&mut self, s: &str, muted: bool) {
+        let w = self.bounds().w;
+        let lines = wrap(s, w, |t| tw(self, text_size(), t));
+        let r = self.alloc(None, lines.len() as f32 * LINE_H);
+        let c = if muted { self.theme.text_muted } else { self.theme.text };
+        let c = c.fade(fade(self));
+        let lh = self.px(LINE_H);
+        let n = ((r.h + 0.5) / lh).floor().max(0.0) as usize;
+        for (i, l) in lines.iter().take(n).enumerate() {
+            text(self, text_size(), l, r.x, r.y + (i as f32 + 0.5) * lh, c);
+        }
+    }
+
+    /// Bordered, read-only box of wrapped text (release notes) that
+    /// scrolls by wheel, and by Up/Down/PageUp/PageDown/Home/End while
+    /// focused. Fills the width; height = `height(..)` or 120. `scroll` is
+    /// the offset in logical px, clamped here.
+    pub fn text_view(&mut self, id: &str, s: &str, scroll: &mut f32) {
+        let r = self.alloc(None, 120.0);
+        let id = id_of(id);
+        let focused = self.focusable(id);
+        let pad = 12.0;
+        let inner_w = r.w / self.k - 2.0 * pad;
+        let mut lines = wrap(s, inner_w, |t| tw(self, text_size(), t));
+        let view_h = r.h / self.k - 2.0 * 8.0;
+        let mut max = (lines.len() as f32 * LINE_H - view_h).max(0.0);
+        if max > 0.0 {
+            // Leave room for the scroll thumb.
+            lines = wrap(s, inner_w - 8.0, |t| tw(self, text_size(), t));
+            max = (lines.len() as f32 * LINE_H - view_h).max(0.0);
+        }
+        if self.pressed_in(r) {
+            self.focus.set(Some(id), false);
+        }
+        if self.hovered(r) && self.input.wheel != 0 {
+            *scroll -= self.input.wheel as f32 / 120.0 * 3.0 * LINE_H;
+        }
+        if focused && self.enabled {
+            for (i, vk, m) in self.keys() {
+                if m.ctrl || m.alt {
+                    continue;
+                }
+                *scroll = match vk {
+                    key::UP => *scroll - LINE_H,
+                    key::DOWN => *scroll + LINE_H,
+                    key::PAGEUP => *scroll - view_h,
+                    key::PAGEDOWN => *scroll + view_h,
+                    key::HOME => 0.0,
+                    key::END => max,
+                    _ => continue,
+                };
+                self.consume(i);
+            }
+        }
+        *scroll = scroll.clamp(0.0, max);
+
+        let th = self.theme;
+        let k = fade(self);
+        fill(self, r, RADIUS, th.bg_hover.fade(0.6 * k));
+        let body = FRect { x: r.x, y: r.y + self.px(8.0), w: r.w, h: r.h - self.px(16.0) };
+        let font = &crate::fonts::UI;
+        let px = self.px(text_size());
+        let lh = self.px(LINE_H);
+        let off = self.px(*scroll);
+        let x = (r.x + self.px(pad)).round();
+        let c = th.text.fade(k);
+        let first = (off / lh).floor() as usize;
+        let shown = (body.h / lh).ceil() as usize + 1;
+        super::clipped(&mut self.fb, body, |fb| {
+            for (i, l) in lines.iter().enumerate().skip(first).take(shown) {
+                let cy = body.y + (i as f32 + 0.5) * lh - off;
+                fb.draw_text(font, px, l, x, (cy - text_height(font, px) / 2.0).round(), c);
+            }
+        });
+        if max > 0.0 {
+            let total = lines.len() as f32 * lh;
+            let th_h = (body.h * body.h / total).max(self.px(20.0));
+            let ty = body.y + (body.h - th_h) * (*scroll / max);
+            let w = self.px(4.0);
+            let tr = FRect { x: r.x1() - w - self.px(3.0), y: ty, w, h: th_h };
+            fill(self, tr, 2.0, th.text_muted.fade(0.5 * k));
+        }
+        ring(self, r, RADIUS, th.border.fade(k));
+        if show_focus(self, id) {
+            focus_ring(self, r, RADIUS);
+        }
+    }
+
+    /// A Lucide icon (`icon_path` name) in a `size` box, vertically centred
+    /// in a row.
+    pub fn icon(&mut self, name: &str, size: f32, c: C4) {
+        let h = if self.lay.in_row() { H } else { size };
+        let r = self.alloc(Some(size), h);
+        let s = self.px(size);
+        let c = c.fade(fade(self));
+        draw_icon(&mut self.fb, name, r.x, (r.y + (r.h - s) / 2.0).round(), s, c);
+    }
+
+    /// Width `button` takes for `label` (logical px), for laying out a
+    /// right-aligned button row.
+    pub fn button_width(&self, label: &str) -> f32 {
+        (tw(self, text_size(), label) + 2.0 * 16.0).max(84.0).ceil()
     }
 }

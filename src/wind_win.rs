@@ -451,7 +451,6 @@ unsafe fn register_window_class(h: HINSTANCE) -> anyhow::Result<()> {
 }
 
 /// DPI scale of a window (1.0 = 96 dpi): logical -> physical px factor.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn scale(hwnd: HWND) -> f32 {
     match unsafe { GetDpiForWindow(hwnd) } {
         0 => 1.0,
@@ -551,6 +550,17 @@ unsafe extern "system" fn wndproc_window(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
     }
 }
 
+/// Bring a `run_window` window to the front, restoring it if minimised
+/// (best effort: Windows may only flash its taskbar button).
+pub fn raise(hwnd: HWND) {
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
 /// Open a normal decorated, per-monitor-DPI-aware top-level window centred
 /// on the monitor under the cursor and pump this thread's messages until
 /// it is destroyed. Callable from any thread (each thread has its own
@@ -560,7 +570,6 @@ unsafe extern "system" fn wndproc_window(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
 /// resize; `wind::scale(hwnd)` gives the DPI factor. A `WM_QUIT` that
 /// arrives meanwhile (another window on this thread quitting) closes the
 /// window and is re-posted for the caller's own loop.
-#[cfg_attr(not(test), allow(dead_code))] // used by the update dialog / Settings (later tasks)
 pub fn run_window(spec: WindowSpec, drv: &mut dyn Driver) -> anyhow::Result<()> {
     unsafe {
         // Per thread, so it holds even where the process never opted in.

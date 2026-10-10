@@ -164,6 +164,85 @@ pub fn load() -> Config {
     }
 }
 
+/// "Skip this version": set `skip_version` in `config.toml`, editing only
+/// that line (comments, unknown keys and even an invalid rest of the file
+/// stay as they are; a missing file is created with defaults). Written
+/// atomically.
+pub fn save_skip_version(version: &str) -> std::io::Result<()> {
+    let path = config_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => to_toml(&Config::default()),
+        Err(e) => return Err(e),
+    };
+    std::fs::create_dir_all(config_dir())?;
+    write_atomic(&path, with_skip_version(&text, version).as_bytes())
+}
+
+/// `text` with its top-level `skip_version` line replaced by `version`
+/// (inserted before the first `[table]`, or appended, when absent).
+pub fn with_skip_version(text: &str, version: &str) -> String {
+    let crlf = text.contains("\r\n");
+    let nl = if crlf { "\r\n" } else { "\n" };
+    let line = format!("skip_version = {}", toml_str(version));
+    let mut out = String::with_capacity(text.len() + line.len() + 2);
+    let mut done = false;
+    let mut top = true;
+    for raw in text.split_inclusive('\n') {
+        let body = strip_comment(raw).trim();
+        if top && body.starts_with('[') {
+            top = false;
+            if !done {
+                out.push_str(&line);
+                out.push_str(nl);
+                out.push_str(nl);
+                done = true;
+            }
+        }
+        let is_key = top && body.split_once('=').is_some_and(|(k, _)| k.trim() == "skip_version");
+        if is_key && !done {
+            out.push_str(&line);
+            out.push_str(if raw.ends_with('\n') { nl } else { "" });
+            done = true;
+        } else if !is_key {
+            out.push_str(raw);
+        }
+    }
+    if !done {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(nl);
+        }
+        out.push_str(&line);
+        out.push_str(nl);
+    }
+    out
+}
+
+/// Replace `path` with `bytes` via a sibling temp file and a rename, so a
+/// crash never leaves a half-written file.
+pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let r = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
+}
+
+/// A TOML basic string.
+fn toml_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// Validate that the config parses; used by `rustshot config --check`.
 pub fn check() -> Result<()> {
     let path = config_path();
@@ -318,7 +397,7 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
 /// Render the config as the same flat TOML subset.
 pub fn to_toml(c: &Config) -> String {
     fn q(s: &str) -> String {
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+        toml_str(s)
     }
     let colors: Vec<String> = c.user_colors.iter().map(|s| q(s)).collect();
     let mut out = format!(
@@ -524,6 +603,46 @@ pub fn parse_color(s: &str) -> Option<(u8, u8, u8, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_version_edits_only_its_line() {
+        let text = "# my config\nsave_format = \"jpg\" # comment\nskip_version = \"0.1.0\"\nunknown = 1\n\n[shortcuts]\nsave = \"Ctrl+S\"\n";
+        let out = with_skip_version(text, "0.1.2");
+        assert_eq!(out, text.replace("\"0.1.0\"", "\"0.1.2\""));
+        let cfg = parse_config(&out).unwrap();
+        assert_eq!((cfg.skip_version.as_str(), cfg.save_format.as_str()), ("0.1.2", "jpg"));
+        assert_eq!(cfg.shortcuts.get("save").map(String::as_str), Some("Ctrl+S"));
+    }
+
+    #[test]
+    fn skip_version_inserted_when_missing() {
+        // Before the first table (a key after it would belong to the table).
+        let out = with_skip_version("theme = \"dark\"\n[shortcuts]\nundo = \"Z\"\n", "0.1.2");
+        assert_eq!(out, "theme = \"dark\"\nskip_version = \"0.1.2\"\n\n[shortcuts]\nundo = \"Z\"\n");
+        assert_eq!(parse_config(&out).unwrap().skip_version, "0.1.2");
+        // Appended; a missing final newline is supplied; CRLF kept.
+        assert_eq!(with_skip_version("theme = \"dark\"", "1.0.0"), "theme = \"dark\"\nskip_version = \"1.0.0\"\n");
+        assert_eq!(with_skip_version("a = 1\r\n", "1.0.0"), "a = 1\r\nskip_version = \"1.0.0\"\r\n");
+        assert_eq!(with_skip_version("", "1.0.0"), "skip_version = \"1.0.0\"\n");
+        // A `skip_version` inside a table is not the top-level key.
+        let t = "[other]\nskip_version = \"x\"\n";
+        assert_eq!(with_skip_version(t, "2.0.0"), format!("skip_version = \"2.0.0\"\n\n{t}"));
+        // Duplicates collapse to one line; a commented-out key is left alone.
+        let d = with_skip_version("# skip_version = \"0\"\nskip_version = \"a\"\nskip_version = \"b\"\n", "3.0.0");
+        assert_eq!(d, "# skip_version = \"0\"\nskip_version = \"3.0.0\"\n");
+    }
+
+    #[test]
+    fn write_atomic_replaces_the_file() {
+        let dir = std::env::temp_dir().join(format!("rustshot-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        std::fs::write(&p, "old").unwrap();
+        write_atomic(&p, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "new");
+        assert!(!dir.join("config.toml.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_colors() {

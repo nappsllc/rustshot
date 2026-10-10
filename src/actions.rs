@@ -1,7 +1,7 @@
 //! Tray actions shared by every backend.
 #![cfg_attr(not(windows), allow(dead_code))] // used by the macOS/Linux trays (later tasks)
 
-use crate::update::Release;
+use crate::update_ui::DialogState;
 use std::path::Path;
 
 pub fn open_config() {
@@ -48,8 +48,16 @@ pub fn open_path(path: &Path) {
     let _ = cmd.spawn();
 }
 
-pub fn check_updates() -> Result<Option<Release>, String> {
-    crate::update::check_now()
+/// Tray "Check for updates": check on a worker thread, then show the
+/// result in the update dialog (store installs: who updates them).
+pub fn check_updates() {
+    std::thread::spawn(|| {
+        let state = match crate::update::managed_install() {
+            Some(store) => DialogState::Managed(store),
+            None => DialogState::from_check(crate::update::check_now()),
+        };
+        crate::update_ui::show(state);
+    });
 }
 
 /// Flip "Start at login"; returns the new state.

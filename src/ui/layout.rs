@@ -88,6 +88,7 @@ impl Ui<'_> {
 
     /// One line filled from the right edge: the first control drawn is the
     /// rightmost (dialog buttons: primary first).
+    #[allow(dead_code)] // Settings window (Task 8)
     pub fn row_rtl<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         self.row_dir(true, f)
     }
@@ -123,6 +124,7 @@ impl Ui<'_> {
     }
 
     /// Width (logical px) of the next control.
+    #[allow(dead_code)] // Settings window (Task 8)
     pub fn width(&mut self, w: f32) -> &mut Self {
         self.lay.next_w = Some(w);
         self

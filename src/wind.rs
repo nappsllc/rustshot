@@ -62,20 +62,20 @@ pub enum Ev {
     /// `run_window` only: the close button (or Alt+F4 / WM_DELETE_WINDOW)
     /// was pressed. Nothing closes by itself: the driver calls
     /// `wind::close(hwnd)` to end the loop, or ignores it to stay open.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no decorated windows yet (main thread only)
     Close,
     /// `run_window` only: new client size in physical pixels. Also sent
     /// once right after `on_create`, so the driver always knows its size.
-    #[cfg_attr(not(test), allow(dead_code))] // read by the later dialog/Settings drivers
+    #[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no decorated windows yet (main thread only)
     Resize(u32, u32),
     /// `run_window` only: the window gained (true) or lost keyboard focus.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no decorated windows yet (main thread only)
     Focus(bool),
 }
 
 /// A normal decorated top-level window for `run_window`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // used by the update dialog / Settings (later tasks)
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no decorated windows yet (main thread only)
 pub struct WindowSpec {
     /// Title bar text (passed through as is).
     pub title: String,
@@ -89,14 +89,14 @@ pub struct WindowSpec {
 }
 
 /// Logical size → physical pixels at `scale` (never below 1 px).
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no decorated windows yet (main thread only)
 pub(crate) fn to_phys(v: u32, scale: f32) -> u32 {
     ((v as f32 * scale).round() as u32).max(1)
 }
 
 /// Top-left that centres a `w`×`h` outer rect inside `area` (x, y, w, h),
 /// clamped so the title bar never starts above/left of the area.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no decorated windows yet (main thread only)
 pub(crate) fn centre_in(area: (i32, i32, i32, i32), w: i32, h: i32) -> (i32, i32) {
     let (ax, ay, aw, ah) = area;
     (ax + ((aw - w) / 2).max(0), ay + ((ah - h) / 2).max(0))

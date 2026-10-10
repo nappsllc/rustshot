@@ -118,6 +118,7 @@ pub fn copy_text_to_clipboard(text: &str) -> Result<()> {
 }
 
 /// The clipboard's text (CF_UNICODETEXT), if any.
+#[allow(dead_code)] // Settings window (Task 8)
 pub fn clipboard_text() -> Option<String> {
     use windows::Win32::Foundation::HGLOBAL;
     use windows::Win32::System::DataExchange::{GetClipboardData, IsClipboardFormatAvailable};

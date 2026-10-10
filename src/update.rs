@@ -10,7 +10,7 @@ pub struct Release {
     pub version: String,
     pub url: String,
     /// Release notes (markdown body); see `notes_excerpt`.
-    #[allow(dead_code)] // shown by the update dialog (later task)
+    #[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no dialog yet (main-thread windows)
     pub notes: String,
     /// Downloadable files; only ones whose URL passes `is_safe_download_url`.
     pub assets: Vec<Asset>,
@@ -361,7 +361,7 @@ fn strip_inline(s: &str) -> String {
 /// The first `max_lines` lines of release notes as plain text: headings,
 /// bullets, quotes, links, emphasis, code fences and HTML comments stripped;
 /// runs of blank lines collapsed.
-#[allow(dead_code)] // used by the update dialog (later task)
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no dialog yet (main-thread windows)
 pub fn notes_excerpt(body: &str, max_lines: usize) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut in_comment = false;
@@ -562,7 +562,7 @@ fn dir_writable(dir: &Path) -> bool {
     }
 }
 
-#[allow(dead_code)] // used by the update dialog (later task)
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no dialog yet (main-thread windows)
 pub fn detect_install() -> InstallKind {
     let exe = std::env::current_exe().unwrap_or_default();
     detect_from(&exe, |k| std::env::var(k).ok(), &real_probes())
@@ -570,7 +570,7 @@ pub fn detect_install() -> InstallKind {
 
 /// The release asset that updates an install of `kind`, matched by exact
 /// name (`rustshot-<version>-...`) against the release's asset list.
-#[allow(dead_code)] // used by the update dialog (later task)
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no dialog yet (main-thread windows)
 pub fn pick_asset<'a>(kind: &InstallKind, rel: &'a Release) -> Option<&'a Asset> {
     let suffix = match kind {
         InstallKind::WinInstaller => ASSET_SUFFIXES[0],
@@ -639,7 +639,7 @@ const SUMS_MAX: u64 = 64 * 1024;
 /// or cancel (`progress` returning false; error `CANCELLED`) the downloaded
 /// files are deleted. `progress(got, total)` falls back to the asset's
 /// API-reported size for the total.
-#[allow(dead_code)] // used by the update dialog (later task)
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no dialog yet (main-thread windows)
 pub fn fetch_verified(
     rel: &Release,
     asset: &Asset,
@@ -708,7 +708,7 @@ pub fn fetch_verified(
 
 /// Re-hash `path` and compare with `expected` (the installer calls this right
 /// before executing the download).
-#[allow(dead_code)] // used by the installer (later task)
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no dialog yet (main-thread windows)
 pub fn verify_file(path: &Path, expected: [u8; 32]) -> Result<(), String> {
     let got = crate::sha256::file_digest(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     if got == expected {
@@ -838,14 +838,29 @@ pub fn spawn_checker(enabled: bool) -> Option<std::sync::mpsc::Receiver<Release>
 
 /// Ask GitHub for the latest release; `Some` only if newer than this build.
 pub fn check_now() -> Result<Option<Release>, String> {
+    let body = latest_json()?;
+    let release = parse_latest(&body);
+    Ok(release.filter(|r| is_newer(&r.version, env!("CARGO_PKG_VERSION"))))
+}
+
+/// Debug builds and tests only: a local JSON file used instead of the
+/// GitHub API (`RUSTSHOT_UPDATE_FEED=<path>`). Not compiled into release
+/// builds.
+#[cfg(debug_assertions)]
+pub const FEED_VAR: &str = "RUSTSHOT_UPDATE_FEED";
+
+/// The `releases/latest` API response.
+fn latest_json() -> Result<String, String> {
+    #[cfg(debug_assertions)]
+    if let Some(p) = std::env::var_os(FEED_VAR).filter(|v| !v.is_empty()) {
+        return std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", std::path::Path::new(&p).display()));
+    }
     let ua = format!("rustshot/{}", env!("CARGO_PKG_VERSION"));
-    let body = crate::export::http_get(
+    crate::export::http_get(
         RELEASES_HOST,
         RELEASES_PATH,
         &[("User-Agent", &ua), ("Accept", "application/vnd.github+json")],
-    )?;
-    let release = parse_latest(&body);
-    Ok(release.filter(|r| is_newer(&r.version, env!("CARGO_PKG_VERSION"))))
+    )
 }
 
 /// Open a URL in the default browser (best effort).

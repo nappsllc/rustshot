@@ -43,16 +43,6 @@ pub fn current_menu() -> Vec<MenuItem> {
     menu(auto)
 }
 
-/// Text for the result of an update check.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub fn update_message(r: &Result<Option<crate::update::Release>, String>) -> String {
-    match r {
-        Ok(Some(rel)) => format!("Rustshot {} is available. Opening the download page.", rel.version),
-        Ok(None) => "Rustshot is up to date.".to_string(),
-        Err(e) => format!("Update check failed: {e}"),
-    }
-}
-
 /// Start the tray for the running daemon. `tx` receives Capture/Quit.
 pub fn spawn(tx: Sender<HotEvent>) {
     #[cfg(windows)]
@@ -66,31 +56,33 @@ const GLYPH_PATH: &str = "M1.5 6V3.5a2 2 0 0 1 2-2H6 M10 1.5h2.5a2 2 0 0 1 2 2V6
 const GLYPH_STROKE: f32 = 1.6;
 const GLYPH_DOT_R: f32 = 2.4;
 
+/// Draw the app glyph (the tray icon's shape) in a `size`×`size` box at
+/// (x, y), physical px; also the update dialog's app icon.
+pub fn draw_glyph(fb: &mut crate::uifb::Fb, x: f32, y: f32, size: f32, c: crate::uifb::C4) {
+    use crate::raster::Blend;
+    let k = size / 16.0;
+    if let Some(lines) = crate::icon_path::parse_path(GLYPH_PATH) {
+        let mut surf = fb.surf();
+        for mut line in lines {
+            for p in &mut line {
+                p.x = x + p.x * k;
+                p.y = y + p.y * k;
+            }
+            surf.stroke_polyline(&line, GLYPH_STROKE * k, c, Blend::Normal);
+        }
+    }
+    fb.fill_circle(x + 8.0 * k, y + 8.0 * k, GLYPH_DOT_R * k, c);
+}
+
 /// Monochrome tray glyph as straight-alpha RGBA, `size`x`size`, in colour `rgb`.
 /// Coverage is rasterised white-on-black into an opaque scratch buffer (the
 /// rasterizer assumes an opaque destination) and its red channel becomes alpha.
 #[allow(dead_code)] // Windows today; the macOS/Linux trays reuse it later
 pub fn tray_glyph_rgba(size: u32, rgb: (u8, u8, u8)) -> Vec<u8> {
-    use crate::raster::Blend;
     use crate::uifb::{C4, Fb};
     let n = size as usize;
-    let k = size as f32 / 16.0;
     let mut scratch = [0u8, 0, 0, 255].repeat(n * n);
-    let white = C4::rgb(255, 255, 255);
-    {
-        let mut fb = Fb::new(&mut scratch, n);
-        if let Some(lines) = crate::icon_path::parse_path(GLYPH_PATH) {
-            let mut surf = fb.surf();
-            for mut line in lines {
-                for p in &mut line {
-                    p.x *= k;
-                    p.y *= k;
-                }
-                surf.stroke_polyline(&line, GLYPH_STROKE * k, white, Blend::Normal);
-            }
-        }
-        fb.fill_circle(8.0 * k, 8.0 * k, GLYPH_DOT_R * k, white);
-    }
+    draw_glyph(&mut Fb::new(&mut scratch, n), 0.0, 0.0, size as f32, C4::rgb(255, 255, 255));
     let mut out = Vec::with_capacity(n * n * 4);
     for px in scratch.as_chunks::<4>().0 {
         out.extend_from_slice(&[rgb.0, rgb.1, rgb.2, px[0]]);
@@ -126,14 +118,6 @@ mod tests {
         assert_eq!(MenuItem::CheckUpdates.label(), "Check for updates");
         assert_eq!(MenuItem::Autostart(false).label(), "Start at login");
         assert_eq!(MenuItem::Quit.label(), "Quit Rustshot");
-    }
-
-    #[test]
-    fn update_messages() {
-        assert!(update_message(&Ok(None)).contains("up to date"));
-        assert!(update_message(&Err("boom".into())).contains("boom"));
-        let r = crate::update::Release { version: "9.9.9".into(), ..Default::default() };
-        assert!(update_message(&Ok(Some(r))).contains("9.9.9"));
     }
 
     fn alpha(buf: &[u8], size: u32, x: u32, y: u32) -> u8 {

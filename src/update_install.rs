@@ -62,7 +62,7 @@ fn update_dir_from(env: impl Fn(&str) -> Option<OsString>) -> PathBuf {
 }
 
 /// Create `update_dir()` (mode 0700 on Unix) for `update::fetch_verified`.
-#[allow(dead_code)] // used by the update dialog (later task)
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no dialog yet (main-thread windows)
 pub fn ensure_update_dir() -> Result<PathBuf, String> {
     let d = update_dir();
     ensure_private_dir(&d)?;
@@ -343,7 +343,7 @@ fn extract_tarball(file: &Path, sha256: [u8; 32]) -> Result<PathBuf, String> {
 /// install of `kind`. The file is re-hashed right before it is run or
 /// swapped in. `RestartingNow`: the caller must exit at once.
 /// Kinds that cannot update in place open the release page.
-#[allow(dead_code)] // used by the update dialog (later task)
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no dialog yet (main-thread windows)
 pub fn apply(kind: &InstallKind, file: &Path, sha256: [u8; 32]) -> Result<Applied, String> {
     let file = &std::path::absolute(file).map_err(|e| format!("{}: {e}", file.display()))?;
     match kind {

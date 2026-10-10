@@ -27,6 +27,7 @@ mod ui;
 mod uifb;
 mod update;
 mod update_install;
+mod update_ui;
 mod wind;
 
 use anyhow::{anyhow, Result};

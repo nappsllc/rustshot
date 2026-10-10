@@ -21,7 +21,7 @@ use windows::core::{PCWSTR, w};
 const WM_TRAYICON: u32 = WM_APP + 1;
 /// Posted by [`spawn`]: add the icon (runs on the window thread).
 const WM_TRAY_INIT: u32 = WM_APP + 2;
-/// Posted by the update-check worker: show the stored message as a balloon.
+/// Posted when an action failed: show the stored message as a balloon.
 const WM_TRAY_BALLOON: u32 = WM_APP + 3;
 const ICON_ID: u32 = 1;
 
@@ -263,24 +263,7 @@ fn run(hwnd: HWND, item: MenuItem) {
                 }
             }
         }
-        MenuItem::CheckUpdates => {
-            let h = hwnd.0 as isize;
-            std::thread::spawn(move || {
-                let msg = if let Some(channel) = crate::update::managed_install() {
-                    format!("Rustshot is managed by {channel}; it updates there.")
-                } else {
-                    let r = crate::actions::check_updates();
-                    if let Ok(Some(rel)) = &r {
-                        crate::update::open_url(&rel.url);
-                    }
-                    tray::update_message(&r)
-                };
-                *BALLOON.lock().unwrap() = Some(msg);
-                unsafe {
-                    let _ = PostMessageW(Some(HWND(h as *mut _)), WM_TRAY_BALLOON, WPARAM(0), LPARAM(0));
-                }
-            });
-        }
+        MenuItem::CheckUpdates => crate::actions::check_updates(),
     }
 }
 

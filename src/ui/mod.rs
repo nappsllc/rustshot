@@ -13,7 +13,7 @@
 //!
 //! Coordinates: layout values are logical px; the frame buffer and mouse
 //! positions are physical px; `Ui::k` is physical px per logical px.
-#![allow(dead_code)] // API for the update dialog and Settings drivers (later tasks)
+
 
 pub mod controls;
 pub mod folder_dialog;
@@ -176,21 +176,25 @@ pub struct FocusState {
 }
 
 impl FocusState {
+    #[allow(dead_code)] // Settings window (Task 8)
     pub fn is_focused(&self, id: &str) -> bool {
         self.focused == Some(id_of(id))
     }
 
     /// Focus control `id` (with the focus ring, as if tabbed to).
+    #[allow(dead_code)] // Settings window (Task 8)
     pub fn focus(&mut self, id: &str) {
         self.set(Some(id_of(id)), true);
     }
 
+    #[allow(dead_code)] // Settings window (Task 8)
     pub fn clear(&mut self) {
         self.set(None, false);
     }
 
     /// Whether any dropdown list is open or a shortcut is being recorded
     /// (a dialog should then not treat Esc/Enter as its own).
+    #[allow(dead_code)] // Settings window (Task 8)
     pub fn busy(&self) -> bool {
         self.open.is_some() || self.recording.is_some()
     }
@@ -222,7 +226,9 @@ impl FocusState {
 
 /// Text get/set; tests inject a fake.
 pub trait Clipboard {
+    #[allow(dead_code)] // Settings window (Task 8)
     fn get(&mut self) -> Option<String>;
+    #[allow(dead_code)] // Settings window (Task 8)
     fn set(&mut self, text: &str);
 }
 
@@ -332,6 +338,7 @@ pub struct Ui<'a> {
     pub focus: &'a mut FocusState,
     /// Physical px per logical px.
     pub k: f32,
+    #[allow(dead_code)] // Settings window (Task 8)
     pub clip: &'a mut dyn Clipboard,
     /// Controls drawn while false are dimmed, inert and skipped by Tab.
     pub enabled: bool,
@@ -486,6 +493,7 @@ impl<'a> Ui<'a> {
         self.used[i] = true;
     }
 
+    #[allow(dead_code)] // Settings window (Task 8)
     fn is_used(&self, i: usize) -> bool {
         self.used[i]
     }

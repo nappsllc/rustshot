@@ -534,7 +534,6 @@ struct WinSlot {
     win: c_ulong,
     quit: bool,
     present: bool,
-    #[cfg_attr(not(test), allow(dead_code))]
     scale: f32,
 }
 
@@ -557,13 +556,10 @@ fn with_slot(hwnd: Hwnd, f: impl FnOnce(&mut WinSlot)) -> bool {
     })
 }
 
-#[cfg_attr(not(test), allow(unused_imports))]
 pub use window::{run_window, scale};
 
-/// The decorated window proper (no caller outside tests until the update
-/// dialog / Settings land, hence the dead-code allowance).
+/// The decorated window proper (`run_window`: update dialog, Settings).
 mod window {
-    #![cfg_attr(not(test), allow(dead_code))]
     use super::*;
 
     #[allow(clashing_extern_declarations)]

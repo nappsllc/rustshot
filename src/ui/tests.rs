@@ -933,3 +933,74 @@ fn system_clipboard_roundtrip() {
     }
     assert_eq!(got.as_deref(), Some("rustshot ui clipboard ✓"));
 }
+
+// ---- wrapped text ----
+
+#[test]
+fn wrap_breaks_at_spaces_and_inside_long_words() {
+    let m = |s: &str| s.chars().count() as f32;
+    assert_eq!(controls::wrap("the quick brown fox", 9.0, m), ["the quick", "brown fox"]);
+    assert_eq!(controls::wrap("a\n\nb c", 9.0, m), ["a", "", "b c"]);
+    assert_eq!(controls::wrap("abcdefghijk xy", 4.0, m), ["abcd", "efgh", "ijk", "xy"]);
+    assert_eq!(controls::wrap("", 4.0, m), [""]);
+    // Even a too-narrow box keeps one character per line.
+    assert_eq!(controls::wrap("ab", 0.5, m), ["a", "b"]);
+    assert_eq!(controls::wrap("x  y\r\n", 9.0, m), ["x y", ""]);
+}
+
+fn notes_text() -> String {
+    (1..=12).map(|i| format!("- release note line {i}")).collect::<Vec<_>>().join("\n")
+}
+
+#[test]
+fn text_view_scrolls_by_wheel_and_keys_and_clamps() {
+    let mut h = Harness::new();
+    let text = notes_text();
+    let mut scroll = 0.0;
+    let tv = |h: &mut Harness, s: &mut f32| {
+        h.frame(|ui| ui.place(r(20.0, 20.0, 300.0, 100.0)).text_view("notes", &text, s));
+    };
+    tv(&mut h, &mut scroll);
+    h.ev(Ev::Wheel { delta: -120, x: 100, y: 60 });
+    tv(&mut h, &mut scroll);
+    assert_eq!(scroll, 60.0, "one notch = 3 lines");
+    // Wheel outside the box does nothing.
+    h.ev(Ev::Wheel { delta: -120, x: 400, y: 300 });
+    tv(&mut h, &mut scroll);
+    assert_eq!(scroll, 60.0);
+    // 12 lines x 20 px in an 84 px viewport: at most 156.
+    h.click(100, 60);
+    tv(&mut h, &mut scroll);
+    h.key(key::END, NONE);
+    tv(&mut h, &mut scroll);
+    assert_eq!(scroll, 156.0);
+    h.key(key::UP, NONE);
+    tv(&mut h, &mut scroll);
+    assert_eq!(scroll, 136.0);
+    h.key(key::HOME, NONE);
+    tv(&mut h, &mut scroll);
+    assert_eq!(scroll, 0.0);
+    h.ev(Ev::Wheel { delta: 600, x: 100, y: 60 });
+    tv(&mut h, &mut scroll);
+    assert_eq!(scroll, 0.0, "clamped at the top");
+}
+
+#[test]
+fn paragraph_wraps_to_the_width_and_height() {
+    let mut h = Harness::new();
+    let (y, _) = h.frame(|ui| {
+        ui.area(r(0.0, 0.0, 120.0, 400.0), |ui| {
+            ui.paragraph("one two three four five six seven eight nine ten", false);
+            ui.cursor_y()
+        })
+    });
+    assert!(y > 2.0 * 20.0, "wrapped onto several lines: {y}");
+    // Nothing drawn outside the given height.
+    let mut h = Harness::new();
+    h.frame(|ui| {
+        ui.place(r(0.0, 0.0, 120.0, 20.0)).paragraph("one two three four five six seven eight nine ten", false);
+    });
+    let w = h.img.width() as usize;
+    let below = h.img.as_raw()[25 * w * 4..60 * w * 4].iter().any(|&b| b != 0);
+    assert!(!below, "lines past the height are not drawn");
+}
