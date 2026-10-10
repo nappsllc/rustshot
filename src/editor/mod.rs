@@ -381,6 +381,7 @@ impl App {
             scene: None,
             painted: None,
             gdi,
+            draft_buf: Default::default(),
             caret_drawn: None,
             toast_drawn: None,
             area_drawn: None,
@@ -1246,6 +1247,9 @@ struct Edit {
     /// GDI renderer (Windows, `renderer = "gdi"`): the capture as GDI
     /// bitmaps; `base` then stays empty and `composed` unused.
     gdi: Option<gdi::GdiScreen>,
+    /// Scratch for a pixelate draft rendered over whole cells
+    /// (`compose_rect`); about one band, released when the draft ends.
+    draft_buf: std::cell::RefCell<Vec<u8>>,
     /// Caret blink phase in the last frame (None: no text draft).
     caret_drawn: Option<bool>,
     /// `at` of the toast drawn in the last frame (None: no toast).
@@ -1307,8 +1311,11 @@ impl Edit {
     }
 
     fn rebuild(&mut self) {
-        if self.gdi.is_some() {
-            // Objects are rendered from the bitmaps where they are needed.
+        #[cfg(windows)]
+        if let Some(scr) = self.gdi.as_mut() {
+            // The annotation layer: objects baked over the plain capture,
+            // only where they are.
+            scr.set_objects(&self.objects, self.font.as_ref());
             self.dirty = false;
             return;
         }
@@ -1714,6 +1721,26 @@ impl Dimmer {
         ((rb | (ga << 8)) & !ALPHA) | (v & ALPHA)
     }
 
+    /// `buf` blended in place, `times` over.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn apply(&self, buf: &mut [u8], times: i32) {
+        let (b8, bt) = buf.as_chunks_mut::<8>();
+        for o in b8 {
+            let mut v = u64::from_le_bytes(*o);
+            for _ in 0..times {
+                v = self.pair(v);
+            }
+            *o = v.to_le_bytes();
+        }
+        if let Some(o) = bt.first_chunk_mut::<4>() {
+            let mut v = u32::from_le_bytes(*o) as u64;
+            for _ in 0..times {
+                v = self.pair(v);
+            }
+            *o = (v as u32).to_le_bytes();
+        }
+    }
+
     /// `dst = src` blended `times` over (overlapping dim rects blend once
     /// per rect; only fractional selections overlap).
     fn run(&self, src: &[u8], dst: &mut [u8], times: i32) {
@@ -1882,6 +1909,7 @@ mod tests {
             scene: None,
             painted: None,
             gdi: None,
+            draft_buf: Default::default(),
             caret_drawn: None,
             toast_drawn: None,
             area_drawn: None,
@@ -2552,6 +2580,36 @@ mod tests {
         }
         let area: i64 = rects.iter().map(|r| r.w() as i64 * r.h() as i64).sum();
         area as f64 / (w as f64 * h as f64)
+    }
+
+    /// A pixelate drag repaints only the cells along the moving edges, and
+    /// still covers every changed pixel (grow, shrink, fractional edges,
+    /// past the image edge, the anchor moving, cell size changing).
+    #[test]
+    fn dirty_rects_cover_pixelate_drag() {
+        let big = FRect { x: 240.0, y: 140.0, w: 960.0, h: 540.0 };
+        let mut app = annotated(theme::DARK, big);
+        settled(&mut app);
+        let set = |app: &mut App, r: FRect, cell: f32| {
+            let e = edit_of(app);
+            e.interact = Interact::Drawing { start: Pt::new(r.x, r.y) };
+            e.draft = Some(Obj::Pixelate { r, cell });
+        };
+        let r0 = FRect { x: 180.0, y: 100.0, w: 700.0, h: 500.0 };
+        assert_dirty_covers(&mut app, "start", |a| set(a, r0, 12.0));
+        let f = assert_dirty_covers(&mut app, "grow", |a| set(a, FRect { w: 706.0, h: 503.0, ..r0 }, 12.0));
+        assert!(f < 0.1, "grow repaints the edges only: {f}");
+        let f = assert_dirty_covers(&mut app, "shrink", |a| set(a, FRect { w: 650.5, h: 470.25, ..r0 }, 12.0));
+        assert!(f < 0.1, "shrink repaints the edges only: {f}");
+        assert_dirty_covers(&mut app, "fractional", |a| set(a, FRect { x: 180.4, y: 100.6, w: 651.0, h: 471.0 }, 12.0));
+        assert_dirty_covers(&mut app, "past the edge", |a| set(a, FRect { x: 180.0, y: 100.0, w: 1400.0, h: 900.0 }, 12.0));
+        assert_dirty_covers(&mut app, "back", |a| set(a, FRect { w: 1300.0, h: 820.0, ..r0 }, 12.0));
+        assert_dirty_covers(&mut app, "anchor moves", |a| set(a, FRect { x: 150.0, y: 90.0, w: 730.0, h: 510.0 }, 12.0));
+        assert_dirty_covers(&mut app, "cell changes", |a| set(a, FRect { x: 150.0, y: 90.0, w: 730.0, h: 510.0 }, 13.0));
+        let mut neg = annotated(theme::DARK, big);
+        settled(&mut neg);
+        assert_dirty_covers(&mut neg, "offscreen start", |a| set(a, FRect { x: -30.5, y: -20.0, w: 300.0, h: 200.0 }, 9.0));
+        assert_dirty_covers(&mut neg, "offscreen grow", |a| set(a, FRect { x: -30.5, y: -20.0, w: 340.0, h: 230.0 }, 9.0));
     }
 
     #[test]

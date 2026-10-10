@@ -9,7 +9,7 @@ use super::chrome::{self, BarState, ToastKind, Ui};
 use super::toolbar::{self, Act, Toolbar};
 use super::{caret_on, palette_colors, pick_area, text_box_rect, Dimmer, Edit, Interact, Toast};
 use crate::anim;
-use crate::objects::{FRect, Obj, Pt};
+use crate::objects::{CellGrid, FRect, Obj, Pt};
 use crate::pixbuf::PixBuf;
 use crate::raster::{Order, Surf};
 use crate::theme::Theme;
@@ -72,19 +72,35 @@ impl PxRect {
 
     /// `self` minus `o` as up to four disjoint rects.
     pub fn minus(&self, o: &PxRect) -> Vec<PxRect> {
+        self.minus_iter(o).collect()
+    }
+
+    /// [`PxRect::minus`] without allocating.
+    pub fn minus_iter(&self, o: &PxRect) -> impl Iterator<Item = PxRect> + use<> {
         let i = self.intersect(o);
-        if i.is_empty() {
-            return if self.is_empty() { Vec::new() } else { vec![*self] };
+        let parts = if i.is_empty() {
+            [*self, PxRect::default(), PxRect::default(), PxRect::default()]
+        } else {
+            [
+                PxRect::new(self.x0, self.y0, self.x1, i.y0),
+                PxRect::new(self.x0, i.y1, self.x1, self.y1),
+                PxRect::new(self.x0, i.y0, i.x0, i.y1),
+                PxRect::new(i.x1, i.y0, self.x1, i.y1),
+            ]
+        };
+        parts.into_iter().filter(|r| !r.is_empty())
+    }
+
+    /// Smallest rect containing both (an empty one contributes nothing).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn union(&self, o: &PxRect) -> PxRect {
+        if self.is_empty() {
+            return *o;
         }
-        [
-            PxRect::new(self.x0, self.y0, self.x1, i.y0),
-            PxRect::new(self.x0, i.y1, self.x1, self.y1),
-            PxRect::new(self.x0, i.y0, i.x0, i.y1),
-            PxRect::new(i.x1, i.y0, self.x1, i.y1),
-        ]
-        .into_iter()
-        .filter(|r| !r.is_empty())
-        .collect()
+        if o.is_empty() {
+            return *self;
+        }
+        PxRect::new(self.x0.min(o.x0), self.y0.min(o.y0), self.x1.max(o.x1), self.y1.max(o.y1))
     }
 }
 
@@ -252,37 +268,56 @@ impl Scene {
 
     /// Every chrome (and draft) bound, clipped to the image.
     pub fn chrome_rects(&self) -> Vec<PxRect> {
+        let mut v = Vec::new();
+        self.chrome_rects_into(&mut v);
+        v
+    }
+
+    /// [`Scene::chrome_rects`] appended to `out`.
+    pub fn chrome_rects_into(&self, out: &mut Vec<PxRect>) {
         let img = PxRect::image(self.size);
-        self.bounds.iter().flatten().map(|r| r.intersect(&img)).filter(|r| !r.is_empty()).collect()
+        out.extend(self.bounds.iter().flatten().map(|r| r.intersect(&img)).filter(|r| !r.is_empty()));
+    }
+
+    /// The pixelate draft's cell grid, if the draft is a pixelate.
+    pub fn draft_grid(&self) -> Option<CellGrid> {
+        self.draft.as_ref().and_then(Obj::pixel_grid)
     }
 }
 
 /// Dim spans around the selection, snapped outward exactly like the
 /// former whole-image pass (fractional edges overlap and dim twice).
-fn dim_spans(sel: Option<FRect>, size: (u32, u32)) -> Vec<PxRect> {
+/// Up to four; the count is returned with them.
+fn dim_spans(sel: Option<FRect>, size: (u32, u32)) -> ([PxRect; 4], usize) {
     let (ww, wh) = (size.0 as f32, size.1 as f32);
     let (bw, bh) = (size.0 as i32, size.1 as i32);
-    let rects: Vec<(f32, f32, f32, f32)> = match sel {
-        None => vec![(0.0, 0.0, ww, wh)],
-        Some(sr) => vec![
+    let none = (0.0, 0.0, 0.0, 0.0);
+    let rects: [(f32, f32, f32, f32); 4] = match sel {
+        None => [(0.0, 0.0, ww, wh), none, none, none],
+        Some(sr) => [
             (0.0, 0.0, ww, sr.y),
             (0.0, sr.y1(), ww, wh - sr.y1()),
             (0.0, sr.y, sr.x, sr.h),
             (sr.x1(), sr.y, ww - sr.x1(), sr.h),
         ],
     };
-    rects
-        .into_iter()
-        .filter(|&(_, _, w, h)| w > 0.0 && h > 0.0)
-        .map(|(x, y, w, h)| {
-            let x0 = x.floor().max(0.0) as i32;
-            let y0 = y.floor().max(0.0) as i32;
-            let x1 = ((x + w).ceil().min(bw as f32) as i32).min(bw);
-            let y1 = ((y + h).ceil().min(bh as f32) as i32).min(bh);
-            PxRect::new(x0, y0, x1, y1)
-        })
-        .filter(|r| !r.is_empty())
-        .collect()
+    let mut out = [PxRect::default(); 4];
+    let mut n = 0;
+    for (x, y, w, h) in rects {
+        if !(w > 0.0 && h > 0.0) {
+            continue;
+        }
+        let x0 = x.floor().max(0.0) as i32;
+        let y0 = y.floor().max(0.0) as i32;
+        let x1 = ((x + w).ceil().min(bw as f32) as i32).min(bw);
+        let y1 = ((y + h).ceil().min(bh as f32) as i32).min(bh);
+        let r = PxRect::new(x0, y0, x1, y1);
+        if !r.is_empty() {
+            out[n] = r;
+            n += 1;
+        }
+    }
+    (out, n)
 }
 
 /// Backdrop of `r` into `out` (stride `r.w()`): plain inside the
@@ -303,7 +338,9 @@ pub(super) fn backdrop_rect(
     order: Order,
 ) {
     let stride = r.w() as usize;
-    for (q, src) in backdrop_runs(sel, size, alpha, r) {
+    let mut runs = Vec::new();
+    backdrop_runs_into(sel, size, alpha, r, &mut runs);
+    for (q, src) in runs {
         let off = ((q.y0 - r.y0) as usize * stride + (q.x0 - r.x0) as usize) * 4;
         bd.fill(q, src, &mut out[off..], stride, order);
     }
@@ -311,34 +348,66 @@ pub(super) fn backdrop_rect(
 
 /// Rect `r` split into disjoint runs that each show one [`Source`]: bands
 /// of rows crossed by the same dim spans, cut where the dim depth changes.
-/// A handful of runs per rect (the GDI overlay blits each one).
-pub(super) fn backdrop_runs(sel: Option<FRect>, size: (u32, u32), alpha: u8, r: PxRect) -> Vec<(PxRect, Source)> {
+/// A handful of runs per rect (the GDI overlay blits each one), appended
+/// to `runs` (no other allocation).
+pub(super) fn backdrop_runs_into(
+    sel: Option<FRect>,
+    size: (u32, u32),
+    alpha: u8,
+    r: PxRect,
+    runs: &mut Vec<(PxRect, Source)>,
+) {
     if r.is_empty() {
-        return Vec::new();
+        return;
     }
-    let spans = if alpha == 0 { Vec::new() } else { dim_spans(sel, size) };
-    let spans: Vec<PxRect> = spans.into_iter().filter(|s| s.intersects(&r)).collect();
+    let (all, n) = if alpha == 0 { ([PxRect::default(); 4], 0) } else { dim_spans(sel, size) };
+    let mut spans = [PxRect::default(); 4];
+    let mut ns = 0;
+    for s in all[..n].iter().filter(|s| s.intersects(&r)) {
+        spans[ns] = *s;
+        ns += 1;
+    }
+    let spans = &spans[..ns];
     if spans.is_empty() {
-        return vec![(r, Source::Plain)];
+        runs.push((r, Source::Plain));
+        return;
     }
-    let mut runs = Vec::new();
-    let mut ys = vec![r.y0, r.y1];
-    for s in &spans {
-        ys.extend([s.y0, s.y1].into_iter().filter(|&y| y > r.y0 && y < r.y1));
-    }
-    ys.sort_unstable();
-    ys.dedup();
-    for band in ys.windows(2) {
-        let (ya, yb) = (band[0], band[1]);
-        let mut edges: Vec<(i32, i32)> = Vec::with_capacity(9);
-        for s in spans.iter().filter(|s| s.y0 <= ya && ya < s.y1) {
-            edges.push((s.x0.clamp(r.x0, r.x1), 1));
-            edges.push((s.x1.clamp(r.x0, r.x1), -1));
+    let mut ys = [0i32; 10];
+    ys[0] = r.y0;
+    ys[1] = r.y1;
+    let mut ny = 2;
+    for s in spans {
+        for y in [s.y0, s.y1] {
+            if y > r.y0 && y < r.y1 {
+                ys[ny] = y;
+                ny += 1;
+            }
         }
-        edges.push((r.x1, 0));
+    }
+    let ys = &mut ys[..ny];
+    ys.sort_unstable();
+    let mut nu = 0;
+    for i in 0..ys.len() {
+        if i == 0 || ys[i] != ys[nu - 1] {
+            ys[nu] = ys[i];
+            nu += 1;
+        }
+    }
+    for band in ys[..nu].windows(2) {
+        let (ya, yb) = (band[0], band[1]);
+        let mut edges = [(0i32, 0i32); 9];
+        let mut ne = 0;
+        for s in spans.iter().filter(|s| s.y0 <= ya && ya < s.y1) {
+            edges[ne] = (s.x0.clamp(r.x0, r.x1), 1);
+            edges[ne + 1] = (s.x1.clamp(r.x0, r.x1), -1);
+            ne += 2;
+        }
+        edges[ne] = (r.x1, 0);
+        ne += 1;
+        let edges = &mut edges[..ne];
         edges.sort_unstable();
         let (mut x, mut depth) = (r.x0, 0i32);
-        for (ex, de) in edges {
+        for &(ex, de) in edges.iter() {
             if ex > x {
                 let src = if depth == 0 {
                     Source::Plain
@@ -351,7 +420,6 @@ pub(super) fn backdrop_runs(sel: Option<FRect>, size: (u32, u32), alpha: u8, r: 
             depth += de;
         }
     }
-    runs
 }
 
 /// Coalesce rects: two merge when their bounding box is no larger than
@@ -385,6 +453,12 @@ pub fn merge_rects(mut v: Vec<PxRect>) -> Vec<PxRect> {
 
 fn px_bounds(r: FRect) -> PxRect {
     PxRect::outer(r)
+}
+
+/// `r` grown to whole cells of `g` where it cuts the pixelated area.
+fn cell_align(r: PxRect, g: &CellGrid, size: (u32, u32)) -> PxRect {
+    let (x0, y0, x1, y1) = g.align((r.x0, r.y0, r.x1, r.y1), size.0 as i32, size.1 as i32);
+    PxRect::new(x0, y0, x1, y1)
 }
 
 impl Edit {
@@ -501,6 +575,10 @@ impl Edit {
             bounds: Default::default(),
         };
         sc.bounds = ELS.map(|e| self.el_bounds(&sc, e));
+        if !matches!(sc.draft, Some(Obj::Pixelate { .. })) && self.draft_buf.borrow().capacity() > 0 {
+            // The drag ended: release the pixelate scratch.
+            *self.draft_buf.borrow_mut() = Vec::new();
+        }
         self.caret_drawn = self.text.as_ref().map(caret_on);
         self.toast_drawn = self.notice.as_ref().or(app_notice).map(|t| t.at);
         self.scene = Some(sc);
@@ -561,28 +639,32 @@ impl Edit {
         }
         let (w, h) = (r.w() as usize, r.h() as usize);
         let out = &mut out[..w * h * 4];
-        compose_bg(sc, r, bd, out, order);
         let hits = |e: El| sc.rects(e).iter().any(|b| b.intersects(&r));
-
-        if let Some(d) = &sc.draft
-            && hits(El::Draft)
-        {
-            let b = sc.rects(El::Draft)[0].intersect(&img);
-            if matches!(d, Obj::Pixelate { .. }) && !r.contains(&b) {
-                // Pixelate averages whole cells: render it over its whole
-                // rect, then copy the part inside `r`.
-                let (bw, bh) = (b.w() as usize, b.h() as usize);
-                let mut tmp = vec![0u8; bw * bh * 4];
-                compose_bg(sc, b, bd, &mut tmp, order);
-                d.render_into(&mut Surf::with_origin(&mut tmp, bw as u32, bh as u32, b.x0, b.y0, order), self.font.as_ref());
-                let o = r.intersect(&b);
-                let n = o.w() as usize * 4;
-                for y in o.y0..o.y1 {
-                    let si = ((y - b.y0) as usize * bw + (o.x0 - b.x0) as usize) * 4;
-                    let di = ((y - r.y0) as usize * w + (o.x0 - r.x0) as usize) * 4;
-                    out[di..di + n].copy_from_slice(&tmp[si..si + n]);
-                }
-            } else {
+        // Pixelate averages whole cells: where `r` cuts through cells,
+        // render over `r` grown to whole cells (a reused scratch buffer,
+        // about the size of `r`), then copy `r` out.
+        let grown = match &sc.draft {
+            Some(d) if hits(El::Draft) => d.pixel_grid().map(|g| cell_align(r, &g, sc.size)).filter(|e| *e != r),
+            _ => None,
+        };
+        if let (Some(e), Some(d)) = (grown, &sc.draft) {
+            let (ew, eh) = (e.w() as usize, e.h() as usize);
+            let mut tmp = self.draft_buf.borrow_mut();
+            // Every byte is written by `compose_bg`: no clearing.
+            tmp.resize(ew * eh * 4, 0);
+            let tmp = &mut tmp[..ew * eh * 4];
+            compose_bg(sc, e, bd, tmp, order);
+            d.render_into(&mut Surf::with_origin(tmp, ew as u32, eh as u32, e.x0, e.y0, order), self.font.as_ref());
+            let n = w * 4;
+            for y in r.y0..r.y1 {
+                let si = ((y - e.y0) as usize * ew + (r.x0 - e.x0) as usize) * 4;
+                out[(y - r.y0) as usize * n..][..n].copy_from_slice(&tmp[si..si + n]);
+            }
+        } else {
+            compose_bg(sc, r, bd, out, order);
+            if let Some(d) = &sc.draft
+                && hits(El::Draft)
+            {
                 d.render_into(&mut Surf::with_origin(out, w as u32, h as u32, r.x0, r.y0, order), self.font.as_ref());
             }
         }
@@ -663,6 +745,19 @@ impl Edit {
     }
 }
 
+/// Pixels two pixelate drafts render identically: the whole cells inside
+/// both, when the grid origin and cell size, the selection and the
+/// objects (so the backdrop under them) are unchanged. A drag that moves
+/// one corner repaints only the cells along the moving edges.
+fn stable_draft(prev: &Scene, now: &Scene) -> Option<PxRect> {
+    let (a, b) = (prev.draft_grid()?, now.draft_grid()?);
+    if prev.sel != now.sel || !Arc::ptr_eq(&prev.objects, &now.objects) {
+        return None;
+    }
+    let (x0, y0, x1, y1) = a.stable_with(&b, now.size.0 as i32, now.size.1 as i32)?;
+    Some(PxRect::new(x0, y0, x1, y1)).filter(|r| !r.is_empty())
+}
+
 /// Rects (clipped to the image, possibly overlapping) covering every pixel
 /// that may differ between scenes `prev` and `now`: old and new bounds of
 /// each changed element, the symmetric difference of the selections, and
@@ -690,10 +785,17 @@ pub fn dirty_rects(prev: Option<&Scene>, now: &Scene, font: Option<&ab_glyph::Fo
         out.extend(b.minus(&a));
     }
     for e in ELS {
-        if !prev.same(now, e) {
-            out.extend_from_slice(prev.rects(e));
-            out.extend_from_slice(now.rects(e));
+        if prev.same(now, e) {
+            continue;
         }
+        if e == El::Draft
+            && let Some(keep) = stable_draft(prev, now)
+        {
+            out.extend(prev.rects(e).iter().chain(now.rects(e)).flat_map(|r| r.minus_iter(&keep)));
+            continue;
+        }
+        out.extend_from_slice(prev.rects(e));
+        out.extend_from_slice(now.rects(e));
     }
     if !Arc::ptr_eq(&prev.objects, &now.objects) {
         let (p, n) = (&*prev.objects, &*now.objects);

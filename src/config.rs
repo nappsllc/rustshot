@@ -153,7 +153,18 @@ pub fn check() -> Result<()> {
     println!("save_path = {:?}", cfg.save_path);
     println!("filename_pattern = {:?}", cfg.filename_pattern);
     println!("capture_hotkey = {:?}", cfg.capture_hotkey);
+    if let Some(w) = renderer_warning(&cfg.renderer) {
+        println!("warning: {w}");
+    }
     Ok(())
+}
+
+/// A warning for a `renderer` value other than "gdi" / "software" (the
+/// overlay then uses gdi on Windows).
+pub fn renderer_warning(v: &str) -> Option<String> {
+    let t = v.trim();
+    (!t.eq_ignore_ascii_case("gdi") && !t.eq_ignore_ascii_case("software"))
+        .then(|| format!("unknown renderer {v:?} (expected \"gdi\" or \"software\"); using \"gdi\" on Windows"))
 }
 
 /// Hand-rolled parser for the flat `key = value` subset of TOML this config
@@ -436,6 +447,10 @@ mod tests {
         assert_eq!(back.use_gdi(), cfg!(windows));
         let odd = Config { renderer: "vulkan".into(), ..Config::default() };
         assert_eq!(odd.use_gdi(), cfg!(windows), "unknown values fall back to gdi");
+        assert!(renderer_warning("vulkan").is_some_and(|w| w.contains("\"vulkan\"")));
+        for ok in ["gdi", "software", " Software "] {
+            assert_eq!(renderer_warning(ok), None, "{ok}");
+        }
     }
 
     #[test]

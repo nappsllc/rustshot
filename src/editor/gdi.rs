@@ -1,10 +1,12 @@
 //! Windows GDI overlay backend (`renderer = "gdi"`). The capture lives in
 //! two device-dependent bitmaps owned by the kernel, not in rustshot's
 //! memory: `plain` (the screen as captured) and `dimmed` (the capture with
-//! the theme dim applied, built band by band). A paint blits them straight
-//! to the window and renders only the chrome (and objects) through the
-//! software compositor, in small buffers whose background is read back
-//! from the bitmaps ([`GdiBackdrop`]).
+//! the theme dim applied, built band by band). Committed objects live in
+//! an annotation layer ([`AnnotLayer`]) covering only their bounds. A
+//! paint blits the bitmaps (and the layer) straight to the window and
+//! renders only the chrome and the draft through the software compositor,
+//! in band-sized buffers whose background is read back from the bitmaps
+//! or the layer ([`GdiBackdrop`]).
 //!
 //! Bitmaps stay selected into their own memory DCs for the whole capture;
 //! pixels are read by blitting into a band-sized DIB section (never
@@ -101,7 +103,13 @@ impl Dib {
             let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
             match CreateDIBSection(Some(dc), &bmi(w, h), DIB_RGB_COLORS, &mut bits, None, 0) {
                 Ok(bmp) if !bits.is_null() => Ok(Dib { m: MemBmp::select(dc, bmp), bits: bits as *mut u8, w, h }),
-                _ => {
+                r => {
+                    // A bitmap without bits: free it too.
+                    if let Ok(bmp) = r
+                        && !bmp.is_invalid()
+                    {
+                        let _ = DeleteObject(HGDIOBJ(bmp.0));
+                    }
                     let _ = DeleteDC(dc);
                     Err(anyhow!("CreateDIBSection {w}x{h} failed"))
                 }
@@ -130,6 +138,33 @@ pub struct GdiScreen {
     swatch: Dib,
     /// Compose buffer reused across paints (one band of a rect).
     buf: RefCell<Vec<u8>>,
+    /// Rect lists `paint_gdi` reuses across paints.
+    lists: RefCell<PaintLists>,
+    /// The committed objects baked over `plain`; `None` while there are
+    /// none.
+    layer: Option<AnnotLayer>,
+}
+
+#[derive(Default)]
+struct PaintLists {
+    over: Vec<PxRect>,
+    ov: Vec<PxRect>,
+    bg: Vec<PxRect>,
+    tmp: Vec<PxRect>,
+    runs: Vec<(PxRect, Source)>,
+    slow: Vec<PxRect>,
+}
+
+/// The annotation layer: `plain` with every committed object rendered on
+/// top, over the union of the objects' bounds (AA margins included, so it
+/// holds every pixel they touch). Updated when the objects change; the
+/// backdrop of every paint and of the export inside `rect`.
+pub struct AnnotLayer {
+    rect: PxRect,
+    /// BGRA, opaque, `rect.w()` x `rect.h()`, top-down.
+    px: Vec<u8>,
+    /// The objects baked in, in order (appending one renders just it).
+    baked: Vec<Obj>,
 }
 
 /// `c` with R and B exchanged: a [`Dimmer`] for BGRA bytes.
@@ -137,9 +172,15 @@ fn bgra(c: C4) -> C4 {
     C4 { r: c.b, g: c.g, b: c.r, a: c.a }
 }
 
-fn force_opaque(px: &mut [u8]) {
-    for p in px.as_chunks_mut::<4>().0 {
-        p[3] = 255;
+/// `d = s` with every alpha byte set to 255 (DDB read-backs leave it 0).
+fn copy_opaque(d: &mut [u8], s: &[u8]) {
+    let (d8, dt) = d.as_chunks_mut::<8>();
+    let (s8, st) = s.as_chunks::<8>();
+    for (o, i) in d8.iter_mut().zip(s8) {
+        *o = (u64::from_le_bytes(*i) | 0xFF00_0000_FF00_0000).to_le_bytes();
+    }
+    if let (Some(o), Some(i)) = (dt.first_chunk_mut::<4>(), st.first_chunk::<4>()) {
+        *o = (u32::from_le_bytes(*i) | 0xFF00_0000).to_le_bytes();
     }
 }
 
@@ -201,6 +242,8 @@ impl GdiScreen {
             scratch: RefCell::new(scratch),
             swatch,
             buf: RefCell::new(Vec::new()),
+            lists: RefCell::new(PaintLists::default()),
+            layer: None,
         })
     }
 
@@ -212,7 +255,6 @@ impl GdiScreen {
         let (w, h) = (self.size.0 as i32, self.size.1 as i32);
         let dimmed = MemBmp::ddb(w, h)?;
         let dm = Dimmer::new(bgra(self.dim));
-        let mut tmp = vec![0u8; w as usize * 4];
         {
             let mut sc = self.scratch.borrow_mut();
             for y0 in (0..h).step_by(BAND as usize) {
@@ -223,9 +265,7 @@ impl GdiScreen {
                     let _ = GdiFlush();
                 }
                 for i in 0..bh {
-                    let row = sc.row(i, w as usize);
-                    tmp.copy_from_slice(row);
-                    dm.run(&tmp, row, 1);
+                    dm.apply(sc.row(i, w as usize), 1);
                 }
                 unsafe {
                     BitBlt(dimmed.dc, 0, y0, w, bh, Some(sc.m.dc), 0, 0, SRCCOPY)
@@ -237,9 +277,12 @@ impl GdiScreen {
         Ok(self)
     }
 
-    /// Copy rect `r` of the bitmap in `src` into `out` (BGRA, opaque; row
-    /// `i` at byte `i * stride * 4`).
-    fn read(&self, src: HDC, r: PxRect, out: &mut [u8], stride: usize) {
+    /// Copy rect `r` of the bitmap in `src` into `out` (BGRA; row `i` at
+    /// byte `i * stride * 4`). DDB read-backs carry no alpha: `opaque`
+    /// sets it to 255 (export, layer); painting skips that pass (nothing
+    /// a paint draws reads the destination alpha, and the window ignores
+    /// it).
+    fn read(&self, src: HDC, r: PxRect, out: &mut [u8], stride: usize, opaque: bool) {
         let mut sc = self.scratch.borrow_mut();
         let w = r.w() as usize;
         let mut y = r.y0;
@@ -251,8 +294,11 @@ impl GdiScreen {
             }
             for i in 0..bh {
                 let d = &mut out[((y - r.y0 + i) as usize * stride) * 4..][..w * 4];
-                d.copy_from_slice(sc.row(i, w));
-                force_opaque(d);
+                if opaque {
+                    copy_opaque(d, sc.row(i, w));
+                } else {
+                    d.copy_from_slice(sc.row(i, w));
+                }
             }
             y += bh;
         }
@@ -274,11 +320,73 @@ impl GdiScreen {
     fn dim_rows(&self, out: &mut [u8], r: PxRect, stride: usize, alpha: u8, times: u8) {
         let dm = Dimmer::new(bgra(self.dim.with_alpha(alpha)));
         let n = r.w() as usize * 4;
-        let mut tmp = vec![0u8; n];
         for i in 0..r.h() as usize {
-            let row = &mut out[i * stride * 4..][..n];
-            tmp.copy_from_slice(row);
-            dm.run(&tmp, row, times as i32);
+            dm.apply(&mut out[i * stride * 4..][..n], times as i32);
+        }
+    }
+
+    /// Bake `objects` (in order) over the plain capture into the layer:
+    /// appended objects are rendered into the existing layer (grown when
+    /// needed, keeping its pixels); anything else rebuilds it. No objects:
+    /// no layer.
+    pub fn set_objects(&mut self, objects: &[Obj], font: Option<&FontArc>) {
+        let img = PxRect::image(self.size);
+        let rect = objects
+            .iter()
+            .filter_map(|o| o.bounds(font))
+            .map(|b| PxRect::outer(b).intersect(&img))
+            .fold(PxRect::default(), |u, b| u.union(&b));
+        if rect.is_empty() {
+            self.layer = None;
+            return;
+        }
+        let keep = self.layer.take().filter(|l| rect.contains(&l.rect) && objects.starts_with(&l.baked));
+        let (w, h) = (rect.w() as usize, rect.h() as usize);
+        let (mut px, from) = match keep {
+            Some(l) if l.rect == rect => (l.px, l.baked.len()),
+            keep => {
+                let mut px = vec![0u8; w * h * 4];
+                let from = match &keep {
+                    // Grown: the old layer where it was, plain around it.
+                    Some(l) => {
+                        for p in rect.minus_iter(&l.rect) {
+                            self.read(self.plain.dc, p, &mut px[at(rect, p.x0, p.y0)..], w, true);
+                        }
+                        let n = l.rect.w() as usize * 4;
+                        for (i, y) in (l.rect.y0..l.rect.y1).enumerate() {
+                            px[at(rect, l.rect.x0, y)..][..n].copy_from_slice(&l.px[i * n..][..n]);
+                        }
+                        l.baked.len()
+                    }
+                    None => {
+                        self.read(self.plain.dc, rect, &mut px, w, true);
+                        0
+                    }
+                };
+                (px, from)
+            }
+        };
+        {
+            let mut sf = Surf::with_origin(&mut px, w as u32, h as u32, rect.x0, rect.y0, Order::Bgra);
+            for o in &objects[from..] {
+                o.render_into(&mut sf, font);
+            }
+        }
+        self.layer = Some(AnnotLayer { rect, px, baked: objects.to_vec() });
+    }
+
+    /// The layer rect (tests).
+    #[cfg(test)]
+    pub fn layer_rect(&self) -> Option<PxRect> {
+        self.layer.as_ref().map(|l| l.rect)
+    }
+
+    /// Fill `r` from the bitmaps (ignoring the layer).
+    fn fill_bitmap(&self, r: PxRect, src: Source, out: &mut [u8], stride: usize, opaque: bool) {
+        let (dc, extra) = self.source(src);
+        self.read(dc, r, out, stride, opaque);
+        if let Some((alpha, times)) = extra {
+            self.dim_rows(out, r, stride, alpha, times);
         }
     }
 
@@ -312,9 +420,21 @@ impl GdiScreen {
     }
 }
 
+/// Byte offset of image pixel (`x`, `y`) in a buffer covering `rect`.
+fn at(rect: PxRect, x: i32, y: i32) -> usize {
+    ((y - rect.y0) as usize * rect.w() as usize + (x - rect.x0) as usize) * 4
+}
+
 /// Write `buf` (BGRA, `r.w()` x `r.h()`, top-down) at `r` in `hdc`.
 fn put(hdc: HDC, r: PxRect, buf: &[u8]) {
-    let b = bmi(r.w(), r.h());
+    put_from(hdc, r, buf, r.w(), 0);
+}
+
+/// Write `r.h()` rows of `buf` (BGRA, `stride` pixels per row, top-down;
+/// row 0 lands at `r.y0`), from column `x_src`, at `r` in `hdc`.
+fn put_from(hdc: HDC, r: PxRect, buf: &[u8], stride: i32, x_src: i32) {
+    assert!(buf.len() >= r.h() as usize * stride as usize * 4 && x_src >= 0 && x_src + r.w() <= stride);
+    let b = bmi(stride, r.h());
     unsafe {
         SetDIBitsToDevice(
             hdc,
@@ -322,7 +442,7 @@ fn put(hdc: HDC, r: PxRect, buf: &[u8]) {
             r.y0,
             r.w() as u32,
             r.h() as u32,
-            0,
+            x_src,
             0,
             0,
             r.h() as u32,
@@ -333,39 +453,12 @@ fn put(hdc: HDC, r: PxRect, buf: &[u8]) {
     }
 }
 
-/// The GDI bitmaps plus the committed objects, as a compose [`Backdrop`].
-/// Objects are rendered into the rect read back from `plain` (until the
-/// annotation layer exists), over their whole rect for pixelate.
+/// The GDI bitmaps plus the annotation layer, as a compose [`Backdrop`].
 pub struct GdiBackdrop<'a> {
     pub scr: &'a GdiScreen,
-    pub objects: &'a [Obj],
-    pub font: Option<&'a FontArc>,
-}
-
-impl GdiBackdrop<'_> {
-    fn bounds(&self, o: &Obj) -> Option<PxRect> {
-        o.bounds(self.font).map(PxRect::outer).map(|b| b.intersect(&PxRect::image(self.scr.size)))
-    }
-
-    /// `r` grown until it holds every pixelate object it touches whole.
-    fn expand(&self, r: PxRect) -> PxRect {
-        let mut e = r;
-        loop {
-            let mut grown = false;
-            for o in self.objects.iter().filter(|o| matches!(o, Obj::Pixelate { .. })) {
-                if let Some(b) = self.bounds(o)
-                    && b.intersects(&e)
-                    && !e.contains(&b)
-                {
-                    e = PxRect::new(e.x0.min(b.x0), e.y0.min(b.y0), e.x1.max(b.x1), e.y1.max(b.y1));
-                    grown = true;
-                }
-            }
-            if !grown {
-                return e;
-            }
-        }
-    }
+    /// Alpha 255 everywhere (the export); painting leaves the alpha of
+    /// pixels read from the bitmaps undefined.
+    pub opaque: bool,
 }
 
 impl Backdrop for GdiBackdrop<'_> {
@@ -374,34 +467,22 @@ impl Backdrop for GdiBackdrop<'_> {
             return;
         }
         let scr = self.scr;
-        let touches = |q: &PxRect| self.objects.iter().any(|o| self.bounds(o).is_some_and(|b| b.intersects(q)));
-        if touches(&r) {
-            // The capture with the objects baked in, then dimmed.
-            let e = self.expand(r);
-            let (ew, eh) = (e.w() as usize, e.h() as usize);
-            let mut tmp = vec![0u8; ew * eh * 4];
-            scr.read(scr.plain.dc, e, &mut tmp, ew);
-            {
-                let mut sf = Surf::with_origin(&mut tmp, ew as u32, eh as u32, e.x0, e.y0, Order::Bgra);
-                for o in self.objects {
-                    if self.bounds(o).is_some_and(|b| b.intersects(&e)) {
-                        o.render_into(&mut sf, self.font);
-                    }
+        let off = |p: PxRect| ((p.y0 - r.y0) as usize * stride + (p.x0 - r.x0) as usize) * 4;
+        match scr.layer.as_ref().map(|l| (l, r.intersect(&l.rect))).filter(|(_, i)| !i.is_empty()) {
+            None => scr.fill_bitmap(r, src, out, stride, self.opaque),
+            Some((l, i)) => {
+                for p in r.minus_iter(&i) {
+                    scr.fill_bitmap(p, src, &mut out[off(p)..], stride, self.opaque);
                 }
-            }
-            let n = r.w() as usize * 4;
-            for (i, y) in (r.y0..r.y1).enumerate() {
-                let s = &tmp[((y - e.y0) as usize * ew + (r.x0 - e.x0) as usize) * 4..][..n];
-                out[i * stride * 4..][..n].copy_from_slice(s);
-            }
-            if let Source::Dimmed { alpha, times } = src {
-                scr.dim_rows(out, r, stride, alpha, times);
-            }
-        } else {
-            let (dc, extra) = scr.source(src);
-            scr.read(dc, r, out, stride);
-            if let Some((alpha, times)) = extra {
-                scr.dim_rows(out, r, stride, alpha, times);
+                // The layer, dimmed as the bitmaps would be.
+                let n = i.w() as usize * 4;
+                let d = &mut out[off(i)..];
+                for (k, y) in (i.y0..i.y1).enumerate() {
+                    d[k * stride * 4..][..n].copy_from_slice(&l.px[at(l.rect, i.x0, y)..][..n]);
+                }
+                if let Source::Dimmed { alpha, times } = src {
+                    scr.dim_rows(d, i, stride, alpha, times);
+                }
             }
         }
         if order == Order::Rgba {
@@ -414,36 +495,58 @@ impl Backdrop for GdiBackdrop<'_> {
 }
 
 impl Edit {
-    fn gdi_backdrop<'a>(&'a self, scr: &'a GdiScreen, objects: &'a [Obj]) -> GdiBackdrop<'a> {
-        GdiBackdrop { scr, objects, font: self.font.as_ref() }
-    }
-
     /// Paint `rects` (window == image coordinates) of the prepared scene
-    /// into `hdc`: the bitmaps blitted where only the capture shows, the
-    /// chrome and objects composed in band-sized buffers on top. Each pixel
-    /// is written once (no flicker under DWM).
+    /// into `hdc`: the bitmaps (or the annotation layer) blitted where only
+    /// the capture shows, the chrome composed in band-sized buffers on top.
+    /// Each pixel is written once (no flicker under DWM). Committed objects
+    /// are never rendered here: they are in the layer.
     pub(super) fn paint_gdi(&self, hdc: HDC, rects: &[PxRect]) {
         let (Some(sc), Some(scr)) = (self.scene.as_ref(), self.gdi.as_ref()) else { return };
         let img = PxRect::image(sc.size);
-        let bd = self.gdi_backdrop(scr, &sc.objects);
-        let mut over = sc.chrome_rects();
-        over.extend(sc.objects.iter().filter_map(|o| bd.bounds(o)).filter(|b| !b.is_empty()));
+        let bd = GdiBackdrop { scr, opaque: false };
+        let mut lists = scr.lists.borrow_mut();
+        let PaintLists { over, ov, bg, tmp, runs, slow } = &mut *lists;
+        over.clear();
+        sc.chrome_rects_into(over);
         for clip in rects.iter().map(|r| r.intersect(&img)).filter(|r| !r.is_empty()) {
-            let ov = compose::merge_rects(over.iter().map(|o| o.intersect(&clip)).collect());
-            let mut bg = vec![clip];
-            for o in &ov {
-                bg = bg.iter().flat_map(|p| p.minus(o)).collect();
+            ov.clear();
+            ov.extend(over.iter().map(|o| o.intersect(&clip)));
+            *ov = compose::merge_rects(std::mem::take(ov));
+            bg.clear();
+            bg.push(clip);
+            for o in ov.iter() {
+                tmp.clear();
+                tmp.extend(bg.iter().flat_map(|p| p.minus_iter(o)));
+                std::mem::swap(bg, tmp);
             }
-            let mut slow = Vec::new();
-            for p in bg {
-                for (q, src) in compose::backdrop_runs(sc.sel, sc.size, sc.dim_alpha, p) {
-                    if !scr.blit(hdc, q, src) {
-                        slow.push(q);
+            slow.clear();
+            for p in bg.iter() {
+                runs.clear();
+                compose::backdrop_runs_into(sc.sel, sc.size, sc.dim_alpha, *p, runs);
+                for &(q, src) in runs.iter() {
+                    let li = scr.layer.as_ref().map(|l| (l, q.intersect(&l.rect))).filter(|(_, i)| !i.is_empty());
+                    let Some((l, i)) = li else {
+                        if !scr.blit(hdc, q, src) {
+                            slow.push(q);
+                        }
+                        continue;
+                    };
+                    for part in q.minus_iter(&i) {
+                        if !scr.blit(hdc, part, src) {
+                            slow.push(part);
+                        }
+                    }
+                    if src == Source::Plain {
+                        let rows = &l.px[at(l.rect, l.rect.x0, i.y0)..];
+                        put_from(hdc, i, rows, l.rect.w(), i.x0 - l.rect.x0);
+                    } else {
+                        // Objects outside the selection: dimmed in compose.
+                        slow.push(i);
                     }
                 }
             }
-            for o in ov.into_iter().chain(slow) {
-                self.compose_put(hdc, o, &bd);
+            for o in ov.iter().chain(slow.iter()) {
+                self.compose_put(hdc, *o, &bd);
             }
         }
     }
@@ -453,9 +556,14 @@ impl Edit {
     fn compose_put(&self, hdc: HDC, r: PxRect, bd: &GdiBackdrop) {
         let Some(scr) = self.gdi.as_ref() else { return };
         let mut buf = scr.buf.borrow_mut();
+        // Bands end on pixelate cell edges, so a pixelate draft renders
+        // each cell once per paint (not once per band it straddles).
+        let grid = self.scene.as_ref().and_then(|sc| sc.draft_grid());
+        let h = self.shot.size.1 as i32;
         let mut y = r.y0;
         while y < r.y1 {
-            let band = PxRect::new(r.x0, y, r.x1, (y + BAND).min(r.y1));
+            let end = grid.map_or(y + BAND, |g| g.row_edge(y + BAND, h));
+            let band = PxRect::new(r.x0, y, r.x1, end.min(r.y1));
             let n = band.w() as usize * band.h() as usize * 4;
             if buf.len() < n {
                 buf.resize(n, 0);
@@ -466,8 +574,9 @@ impl Edit {
         }
     }
 
-    /// The export crop (`crop_to_image` of the composed capture) read from
-    /// the bitmaps with the objects baked in: unpremultiplied RGBA.
+    /// The export crop (`crop_to_image` of the composed capture): the
+    /// annotation layer where it overlaps the selection, `plain` elsewhere,
+    /// in one selection-sized buffer; unpremultiplied RGBA.
     pub(super) fn export_gdi(&self, r: crate::objects::FRect) -> crate::pixbuf::PixBuf {
         let scr = self.gdi.as_ref().expect("gdi export without bitmaps");
         let (pw, ph) = (self.shot.size.0 as i32, self.shot.size.1 as i32);
@@ -480,7 +589,7 @@ impl Edit {
         let cx0 = x0.min(pw - 1);
         let cy0 = y0.min(ph - 1);
         let src = PxRect::new(cx0, cy0, (x0 + w).min(pw).max(cx0 + 1), (y0 + h).min(ph).max(cy0 + 1));
-        let bd = self.gdi_backdrop(scr, &self.objects);
+        let bd = GdiBackdrop { scr, opaque: true };
         let sw = src.w() as usize;
         let mut px = vec![0u8; sw * src.h() as usize * 4];
         let mut y = src.y0;

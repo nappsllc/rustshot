@@ -454,8 +454,7 @@ pub fn memlog(phase: &str) {
         return;
     }
     let line = format!(
-        "pid={} phase={phase} private={} peak_private={} peak_working_set={}
-",
+        "pid={} phase={phase} private={} peak_private={} peak_working_set={}\n",
         std::process::id(),
         c.PrivateUsage,
         c.PeakPagefileUsage,

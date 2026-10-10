@@ -51,6 +51,61 @@ impl FRect {
     }
 }
 
+/// A pixelate object's cell grid (see [`Obj::pixel_grid`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellGrid {
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
+    pub c: i32,
+}
+
+impl CellGrid {
+    /// `v` moved down to a cell edge where it falls inside `[a0, a1)`.
+    fn floor(v: i32, a0: i32, a1: i32, c: i32) -> i32 {
+        if v > a0 && v < a1 { a0 + (v - a0) / c * c } else { v }
+    }
+
+    /// `v` moved up to a cell edge (or `a1`) where it falls inside.
+    fn ceil(v: i32, a0: i32, a1: i32, c: i32) -> i32 {
+        if v > a0 && v < a1 { (a0 + (v - a0 + c - 1) / c * c).min(a1) } else { v }
+    }
+
+    /// Window `(x0, y0, x1, y1)` grown to whole cells where it cuts the
+    /// pixelated area, with the grid clipped to `w` x `h`.
+    pub fn align(&self, r: (i32, i32, i32, i32), w: i32, h: i32) -> (i32, i32, i32, i32) {
+        let (gx1, gy1, c) = (self.x1.min(w), self.y1.min(h), self.c);
+        (
+            Self::floor(r.0, self.x0, gx1, c),
+            Self::floor(r.1, self.y0, gy1, c),
+            Self::ceil(r.2, self.x0, gx1, c),
+            Self::ceil(r.3, self.y0, gy1, c),
+        )
+    }
+
+    /// Next row at or after `y` that is a cell edge (or the area's
+    /// bottom), for `y` inside the area; `y` itself otherwise.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn row_edge(&self, y: i32, h: i32) -> i32 {
+        Self::ceil(y, self.y0, self.y1.min(h), self.c)
+    }
+
+    /// The cells two grids with this origin and cell size both render
+    /// identically (whole cells inside both areas), as `(x0, y0, x1, y1)`
+    /// clipped to `w` x `h`; `None` when they differ in origin or cell.
+    pub fn stable_with(&self, o: &CellGrid, w: i32, h: i32) -> Option<(i32, i32, i32, i32)> {
+        if (self.x0, self.y0, self.c) != (o.x0, o.y0, o.c) {
+            return None;
+        }
+        let c = self.c;
+        let whole = |a0: i32, a1: i32| a0 + (a1 - a0).max(0) / c * c;
+        let x1 = whole(self.x0, self.x1.min(o.x1).min(w));
+        let y1 = whole(self.y0, self.y1.min(o.y1).min(h));
+        Some((self.x0, self.y0, x1, y1))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Obj {
     Line {
@@ -183,42 +238,69 @@ fn pixelate(sf: &mut Surf, r: FRect, cell: f32) {
         }
     };
     let Surf { data, .. } = sf;
-    // Skip whole cells left of / above the window.
-    let mut cy = y0 + ((by0 - y0).max(0) / c) * c;
-    while cy < y1 {
-        let mut cx = x0 + ((bx0 - x0).max(0) / c) * c;
-        while cx < x1 {
-            let ex = (cx + c).min(x1);
-            let ey = (cy + c).min(y1);
-            let (mut sr, mut sg, mut sb, mut sa, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    // Average of the in-window samples of the cell at (`cx`, `cy`); `None`
+    // when the window clips them all (only when it does not contain the
+    // rect): that cell keeps its pixels.
+    let avg = |data: &[u8], cx: i32, cy: i32| {
+        let ex = (cx + c).min(x1);
+        let ey = (cy + c).min(y1);
+        let (mut sr, mut sg, mut sb, mut sa, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+        let sx = align(cx, bx0);
+        if sx < ex {
             let mut sy = align(cy, by0);
             while sy < ey {
-                let mut sx = align(cx, bx0);
-                while sx < ex {
-                    let i = idx(sx, sy);
-                    sr += data[i] as u32;
-                    sg += data[i + 1] as u32;
-                    sb += data[i + 2] as u32;
-                    sa += data[i + 3] as u32;
+                let row = &data[idx(sx, sy)..idx(ex, sy)];
+                for p in row.as_chunks::<4>().0.iter().step_by(step as usize) {
+                    sr += p[0] as u32;
+                    sg += p[1] as u32;
+                    sb += p[2] as u32;
+                    sa += p[3] as u32;
                     n += 1;
-                    sx += step;
                 }
                 sy += step;
             }
-            if n == 0 {
-                n = 1;
-            }
-            let (ar, ag, ab, aa) = (sr / n, sg / n, sb / n, sa / n);
-            for sy in cy.max(by0)..ey {
-                for sx in cx.max(bx0)..ex {
-                    let i = idx(sx, sy);
-                    data[i] = ar as u8;
-                    data[i + 1] = ag as u8;
-                    data[i + 2] = ab as u8;
-                    data[i + 3] = aa as u8;
+        }
+        (n > 0).then(|| [(sr / n) as u8, (sg / n) as u8, (sb / n) as u8, (sa / n) as u8])
+    };
+    // Skip whole cells left of / above the window.
+    let cx_first = x0 + ((bx0 - x0).max(0) / c) * c;
+    let mut cy = y0 + ((by0 - y0).max(0) / c) * c;
+    while cy < y1 {
+        let ey = (cy + c).min(y1);
+        let top = cy.max(by0);
+        // One row of the band of cells, then copied down (all its samples
+        // are read by then; cells never sample each other).
+        let mut whole = true;
+        let mut cx = cx_first;
+        while cx < x1 {
+            match avg(data, cx, cy) {
+                Some(v) => {
+                    let ex = (cx + c).min(x1);
+                    for p in data[idx(cx.max(bx0), top)..idx(ex, top)].as_chunks_mut::<4>().0 {
+                        *p = v;
+                    }
                 }
+                None => whole = false,
             }
             cx += c;
+        }
+        let (a, b) = (idx(cx_first.max(bx0), top), idx(x1, top));
+        if whole {
+            for sy in top + 1..ey {
+                data.copy_within(a..b, idx(cx_first.max(bx0), sy));
+            }
+        } else {
+            // Rare (clipped window): cell by cell, skipping empty ones.
+            let mut cx = cx_first;
+            while cx < x1 {
+                if avg(data, cx, cy).is_some() {
+                    let (xa, ex) = (idx(cx.max(bx0), top), idx((cx + c).min(x1), top));
+                    for sy in top + 1..ey {
+                        data.copy_within(xa..ex, idx(cx.max(bx0), sy));
+                    }
+                }
+                cx += c;
+            }
         }
         cy += c;
     }
@@ -279,6 +361,22 @@ impl Obj {
                 Some(FRect { x: pos.x - m, y: pos.y - m, w: w + 2.0 * m, h: lh * n as f32 + 2.0 * m })
             }
         }
+    }
+
+    /// Pixelate only: the mosaic grid as rendered into a window covering
+    /// the whole image: the pixelated area `[x0, x1) x [y0, y1)` (`x1`/`y1`
+    /// not yet clipped to the image) and the cell size, cells anchored at
+    /// (`x0`, `y0`). A window whose edges inside that area fall on cell
+    /// edges renders those pixels exactly as the whole image does.
+    pub fn pixel_grid(&self) -> Option<CellGrid> {
+        let Obj::Pixelate { r, cell } = self else { return None };
+        Some(CellGrid {
+            x0: r.x.max(0.0).floor() as i32,
+            y0: r.y.max(0.0).floor() as i32,
+            x1: r.x1().ceil() as i32,
+            y1: r.y1().ceil() as i32,
+            c: cell.max(2.0).round() as i32,
+        })
     }
 
     /// Bake this object into the image.
@@ -436,12 +534,40 @@ mod tests {
         if let Some(font) = crate::fonts::load_system_font() {
             let t = Obj::Text {
                 pos: Pt::new(22.0, 16.0),
-                text: "Hello
-World wy".into(),
+                text: "Hello\nWorld wy".into(),
                 color: c,
                 size: 16.0,
             };
             check("text", |s| t.render_into(s, Some(&font)));
+        }
+    }
+
+    /// A window that clips the rect mid-cell (the overlay's band edges):
+    /// no panic, and cells left without samples keep their pixels instead
+    /// of turning transparent black.
+    #[test]
+    fn pixelate_straddling_window_skips_empty_cells() {
+        let (w, h) = (64u32, 64u32);
+        let mut full = PixBuf::new(w, h);
+        for (i, p) in full.as_raw_mut().as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *p = [(i * 7) as u8, (i * 3) as u8, 200, 255];
+        }
+        let o = Obj::Pixelate { r: FRect { x: 3.0, y: 5.0, w: 50.0, h: 47.0 }, cell: 12.0 };
+        // Windows starting just before a cell boundary leave the clipped
+        // cell's samples outside.
+        for (wx, wy) in [(14, 16), (13, 15), (0, 0), (26, 28), (40, 2)] {
+            let (ww, wh) = (20u32, 21u32);
+            let mut win = vec![0u8; (ww * wh * 4) as usize];
+            for y in 0..wh {
+                for x in 0..ww {
+                    let s = full.get_pixel((wx + x).min(w - 1), (wy + y).min(h - 1));
+                    win[((y * ww + x) * 4) as usize..][..4].copy_from_slice(&s);
+                }
+            }
+            o.render_into(&mut Surf::with_origin(&mut win, ww, wh, wx as i32, wy as i32, crate::raster::Order::Rgba), None);
+            for (i, p) in win.as_chunks::<4>().0.iter().enumerate() {
+                assert_ne!(*p, [0, 0, 0, 0], "window ({wx}, {wy}): pixel {i} cleared");
+            }
         }
     }
 

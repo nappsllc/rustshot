@@ -85,16 +85,49 @@ fn wait_exit(child: &mut Child, ms: u64) -> Option<i32> {
     }
 }
 
+/// A temp APPDATA root, removed on drop.
+struct TempRoot(PathBuf);
+
+impl std::ops::Deref for TempRoot {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+const ROOT_PREFIX: &str = "rustshot-e2e-";
+
+/// Remove `rustshot-e2e-<pid>-*` dirs earlier runs left in %TEMP% (only
+/// that prefix, and not this process' own).
+fn sweep_old_roots() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let own = format!("{ROOT_PREFIX}{}-", std::process::id());
+        let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else { return };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with(ROOT_PREFIX) && !name.starts_with(&own) && e.path().is_dir() {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    });
+}
+
 /// A fresh APPDATA root whose `rustshot/config.toml` selects `renderer`.
-fn config_root(tag: &str, renderer: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("rustshot-e2e-{}-{tag}", std::process::id()));
+fn config_root(tag: &str, renderer: &str) -> TempRoot {
+    sweep_old_roots();
+    let root = std::env::temp_dir().join(format!("{ROOT_PREFIX}{}-{tag}", std::process::id()));
     let dir = root.join("rustshot");
     std::fs::create_dir_all(&dir).expect("config dir");
-    std::fs::write(dir.join("config.toml"), format!("renderer = \"{renderer}\"
-check_updates = false
-"))
+    std::fs::write(dir.join("config.toml"), format!("renderer = \"{renderer}\"\ncheck_updates = false\n"))
         .expect("config");
-    root
+    TempRoot(root)
 }
 
 fn renderer() -> String {
@@ -107,8 +140,9 @@ fn rustshot(appdata: &Path) -> Command {
     c
 }
 
-fn launch_editor() -> (Child, HWND) {
-    let root = config_root("editor", &renderer());
+/// The editor on an 800x600 region; keep the root until the child exits.
+fn launch_editor(tag: &str) -> (Child, HWND, TempRoot) {
+    let root = config_root(tag, &renderer());
     let child = rustshot(&root)
         .args(["gui", "--region", "800x600+20+20", "--clip"])
         .stdout(Stdio::null())
@@ -116,7 +150,7 @@ fn launch_editor() -> (Child, HWND) {
         .spawn()
         .expect("spawn rustshot");
     let hwnd = wait_window(&child, 8000).expect("editor window");
-    (child, hwnd)
+    (child, hwnd, root)
 }
 
 fn post(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) {
@@ -153,7 +187,7 @@ fn char_msg(hwnd: HWND, c: char) {
 #[test]
 #[ignore = "live display access"]
 fn escape_cancels_with_code_2() {
-    let (mut child, hwnd) = launch_editor();
+    let (mut child, hwnd, _root) = launch_editor("escape");
     key(hwnd, 0x1B); // VK_ESCAPE
     assert_eq!(wait_exit(&mut child, 5000), Some(2), "esc should cancel");
 }
@@ -161,7 +195,7 @@ fn escape_cancels_with_code_2() {
 #[test]
 #[ignore = "live display access"]
 fn rect_draw_then_enter_exports_zero() {
-    let (mut child, hwnd) = launch_editor();
+    let (mut child, hwnd, _root) = launch_editor("rect");
     key(hwnd, 'R' as u32);
     mouse_move(hwnd, 400, 300);
     mouse_down(hwnd, 400, 300);
@@ -179,7 +213,7 @@ fn rect_draw_then_enter_exports_zero() {
 #[test]
 #[ignore = "live display access"]
 fn text_tool_types_and_accepts() {
-    let (mut child, hwnd) = launch_editor();
+    let (mut child, hwnd, _root) = launch_editor("text");
     key(hwnd, 'T' as u32);
     mouse_down(hwnd, 300, 300);
     mouse_up(hwnd, 300, 300);
@@ -198,6 +232,11 @@ fn text_tool_types_and_accepts() {
 #[test]
 #[ignore = "live display access"]
 fn daemon_stays_alive() {
+    if daemon_running() {
+        // A second daemon would signal it (open a capture) and exit.
+        println!("skipped: another rustshot daemon is running in this session");
+        return;
+    }
     let root = config_root("daemon", &renderer());
     let mut child = rustshot(&root)
         .arg("daemon")
@@ -215,6 +254,21 @@ fn daemon_stays_alive() {
     }
 }
 
+/// Whether a rustshot daemon holds the single-instance mutex (opened,
+/// never created, so nothing is signalled).
+fn daemon_running() -> bool {
+    use windows::core::w;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, w!("Local\\rustshot-daemon")) } {
+        Ok(h) => {
+            let _ = unsafe { CloseHandle(h) };
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Peak private bytes of a one-shot full-desktop capture saved as PNG,
 /// per renderer (and with one rectangle drawn), from `RUSTSHOT_MEMLOG`.
 ///
@@ -222,8 +276,17 @@ fn daemon_stays_alive() {
 #[test]
 #[ignore = "live display access; measurement"]
 fn memory_one_shot() {
-    for (label, renderer, draw) in [("software", "software", false), ("gdi", "gdi", false), ("gdi + rect", "gdi", true)] {
-        let root = config_root(&format!("mem-{renderer}-{draw}"), renderer);
+    // (label, renderer, tool key + drag from/to)
+    type Draw = Option<(char, (i32, i32), (i32, i32))>;
+    let cases: [(&str, &str, Draw); 5] = [
+        ("software", "software", None),
+        ("software + 2000x900 pixelate", "software", Some(('B', (400, 300), (2400, 1200)))),
+        ("gdi", "gdi", None),
+        ("gdi + rect", "gdi", Some(('R', (400, 300), (900, 600)))),
+        ("gdi + 2000x900 pixelate", "gdi", Some(('B', (400, 300), (2400, 1200)))),
+    ];
+    for (i, (label, renderer, draw)) in cases.into_iter().enumerate() {
+        let root = config_root(&format!("mem-{i}"), renderer);
         let out = root.join("out");
         std::fs::create_dir_all(&out).unwrap();
         let log = root.join("mem.log");
@@ -238,14 +301,14 @@ fn memory_one_shot() {
             .expect("spawn rustshot");
         let hwnd = wait_window(&child, 8000).expect("editor window");
         std::thread::sleep(Duration::from_millis(500));
-        if draw {
-            key(hwnd, 'R' as u32);
-            mouse_move(hwnd, 400, 300);
-            mouse_down(hwnd, 400, 300);
-            mouse_move(hwnd, 700, 500);
-            mouse_move(hwnd, 900, 600);
-            mouse_up(hwnd, 900, 600);
-            std::thread::sleep(Duration::from_millis(300));
+        if let Some((tool, (x0, y0), (x1, y1))) = draw {
+            key(hwnd, tool as u32);
+            mouse_move(hwnd, x0, y0);
+            mouse_down(hwnd, x0, y0);
+            mouse_move(hwnd, (x0 + x1) / 2, (y0 + y1) / 2);
+            mouse_move(hwnd, x1, y1);
+            mouse_up(hwnd, x1, y1);
+            std::thread::sleep(Duration::from_millis(500));
         }
         key(hwnd, 0x0D);
         assert_eq!(wait_exit(&mut child, 15000), Some(0), "{label}: save should succeed");
@@ -267,7 +330,6 @@ fn memory_one_shot() {
             mb(field(&ex, "peak_private")),
             mb(field(&ex, "peak_working_set"))
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
@@ -327,7 +389,6 @@ fn renderers_show_the_same_overlay() {
         shots.push(screen_pixels(x, y, w, h));
         key(hwnd, 0x1B);
         assert_eq!(wait_exit(&mut child, 5000), Some(2));
-        let _ = std::fs::remove_dir_all(&root);
         std::thread::sleep(Duration::from_millis(300));
     }
     if let Some(dir) = std::env::var_os("RUSTSHOT_E2E_OUT") {
