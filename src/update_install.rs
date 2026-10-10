@@ -278,7 +278,7 @@ fn relaunch(exe: &Path, wait_pid: u32) -> Result<(), String> {
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 fn apply_portable(exe: &Path, file: &Path, sha256: [u8; 32], wait_pid: u32) -> Result<Applied, String> {
     replace_exe(exe, file, sha256)?;
-    relaunch(exe, wait_pid).map_err(|e| format!("the update is installed but rustshot could not restart: {e}"))?;
+    relaunch(exe, wait_pid).map_err(|e| format!("the update is installed but Rustshot could not restart: {e}"))?;
     Ok(Applied::RestartingNow)
 }
 

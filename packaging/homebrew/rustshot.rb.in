@@ -3,7 +3,7 @@ cask "rustshot" do
   sha256 "@SHA256@"
 
   url "https://github.com/nappsllc/rustshot/releases/download/v#{version}/rustshot-#{version}-macos-universal.dmg"
-  name "rustshot"
+  name "Rustshot"
   desc "Screenshot capture with annotation, upload and global hotkeys"
   homepage "https://github.com/nappsllc/rustshot"
 

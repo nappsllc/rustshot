@@ -1,4 +1,4 @@
-; rustshot NSIS installer (per-user, no admin required).
+; Rustshot NSIS installer (per-user, no admin required).
 ; Build: makensis packaging\installer.nsi   (optionally /DPRODUCT_VERSION=x.y.z)
 ; Output: dist\rustshot-<version>-setup.exe
 ; In-app updates run it as "setup.exe /S /RELAUNCH" (see .onInit and
@@ -7,6 +7,7 @@
   !define PRODUCT_VERSION "0.1.1"
 !endif
 !define PRODUCT_NAME "rustshot"
+!define PRODUCT_DISPLAY "Rustshot"
 !define PRODUCT_EXE "rustshot.exe"
 
 Unicode true
@@ -17,10 +18,10 @@ SetCompressor /SOLID lzma
 !include "FileFunc.nsh"
 !include "Sections.nsh"
 
-Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
+Name "${PRODUCT_DISPLAY} ${PRODUCT_VERSION}"
 Icon "icons\rustshot.ico"
 UninstallIcon "icons\rustshot.ico"
-BrandingText "${PRODUCT_NAME} ${PRODUCT_VERSION}"
+BrandingText "${PRODUCT_DISPLAY} ${PRODUCT_VERSION}"
 OutFile "..\dist\${PRODUCT_NAME}-${PRODUCT_VERSION}-setup.exe"
 InstallDir "$LOCALAPPDATA\${PRODUCT_NAME}"
 InstallDirRegKey HKCU "Software\${PRODUCT_NAME}" "InstallDir"
@@ -32,7 +33,7 @@ Page instfiles
 UninstPage uninstConfirm
 UninstPage instfiles
 
-Section "${PRODUCT_NAME} (required)" SecMain
+Section "${PRODUCT_DISPLAY} (required)" SecMain
   SectionIn RO
   SetOutPath "$INSTDIR"
   ${If} ${Silent}
@@ -50,15 +51,15 @@ Section "${PRODUCT_NAME} (required)" SecMain
   File "..\THIRD_PARTY_NOTICES.md"
   WriteUninstaller "$INSTDIR\uninstall.exe"
   WriteRegStr HKCU "Software\${PRODUCT_NAME}" "InstallDir" "$INSTDIR"
-  CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
-  CreateShortcut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}"
-  CreateShortcut "$SMPROGRAMS\${PRODUCT_NAME}\Uninstall.lnk" "$INSTDIR\uninstall.exe"
+  CreateDirectory "$SMPROGRAMS\${PRODUCT_DISPLAY}"
+  CreateShortcut "$SMPROGRAMS\${PRODUCT_DISPLAY}\${PRODUCT_DISPLAY}.lnk" "$INSTDIR\${PRODUCT_EXE}"
+  CreateShortcut "$SMPROGRAMS\${PRODUCT_DISPLAY}\Uninstall.lnk" "$INSTDIR\uninstall.exe"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" \
-      "DisplayName" "${PRODUCT_NAME}"
+      "DisplayName" "${PRODUCT_DISPLAY}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" \
       "DisplayVersion" "${PRODUCT_VERSION}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" \
-      "Publisher" "${PRODUCT_NAME}"
+      "Publisher" "${PRODUCT_DISPLAY}"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" \
       "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}" \
@@ -66,7 +67,7 @@ Section "${PRODUCT_NAME} (required)" SecMain
 SectionEnd
 
 Section "Desktop shortcut" SecDesktop
-  CreateShortcut "$DESKTOP\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}"
+  CreateShortcut "$DESKTOP\${PRODUCT_DISPLAY}.lnk" "$INSTDIR\${PRODUCT_EXE}"
 SectionEnd
 
 Section "Start daemon with Windows" SecStartup
@@ -81,7 +82,7 @@ Function .onInit
     ; optional sections run again only if their shortcut / Run value exists.
     ReadRegStr $0 HKCU "Software\${PRODUCT_NAME}" "InstallDir"
     ${If} $0 != ""
-      ${IfNot} ${FileExists} "$DESKTOP\${PRODUCT_NAME}.lnk"
+      ${IfNot} ${FileExists} "$DESKTOP\${PRODUCT_DISPLAY}.lnk"
         !insertmacro UnselectSection ${SecDesktop}
       ${EndIf}
       ClearErrors
@@ -128,10 +129,10 @@ Section "Uninstall"
   Delete "$LOCALAPPDATA\${PRODUCT_NAME}\update\*"
   RMDir "$LOCALAPPDATA\${PRODUCT_NAME}\update"
   RMDir "$INSTDIR"
-  Delete "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk"
-  Delete "$SMPROGRAMS\${PRODUCT_NAME}\Uninstall.lnk"
-  RMDir "$SMPROGRAMS\${PRODUCT_NAME}"
-  Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
+  Delete "$SMPROGRAMS\${PRODUCT_DISPLAY}\${PRODUCT_DISPLAY}.lnk"
+  Delete "$SMPROGRAMS\${PRODUCT_DISPLAY}\Uninstall.lnk"
+  RMDir "$SMPROGRAMS\${PRODUCT_DISPLAY}"
+  Delete "$DESKTOP\${PRODUCT_DISPLAY}.lnk"
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCT_NAME}"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
   DeleteRegKey HKCU "Software\${PRODUCT_NAME}"

@@ -1,14 +1,14 @@
-# rustshot
+# Rustshot
 
 A fast, tiny screenshot and annotation tool for **Windows, macOS and Linux**,
 modelled on [Flameshot](https://flameshot.org) and written in Rust.
 
 Press a hotkey, drag a region, annotate it, and copy, save or upload it.
 The whole app is a single ~550 KB native binary with no runtime and no GUI
-toolkit: every pixel of the overlay is drawn by rustshot's own anti-aliased
+toolkit: every pixel of the overlay is drawn by Rustshot's own anti-aliased
 renderer.
 
-![rustshot overlay, dark theme](docs/screenshots/overlay-dark.png)
+![Rustshot overlay, dark theme](docs/screenshots/overlay-dark.png)
 
 | Light theme | Color palette | Text tool |
 |---|---|---|
@@ -65,7 +65,7 @@ Start the background daemon once (the installers can do this at login):
 rustshot          # or `rustshot daemon`
 ```
 
-Launching rustshot again while it is running triggers a capture in the running
+Launching Rustshot again while it is running triggers a capture in the running
 instance instead of starting a second one.
 
 Then press <kbd>Meta</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> (<kbd>Win</kbd> on
@@ -122,7 +122,7 @@ redo = "Ctrl+Shift+Z, Ctrl+Y"  # accept (Enter), cancel (Esc)
 
 ## Configuration
 
-rustshot reads an optional `config.toml`:
+Rustshot reads an optional `config.toml`:
 
 | OS | Path |
 |---|---|
@@ -198,7 +198,7 @@ See [PRIVACY.md](PRIVACY.md).
 
 ## License
 
-rustshot is free software under the **GNU General Public License v3.0 only**
+Rustshot is free software under the **GNU General Public License v3.0 only**
 ([LICENSE](LICENSE)). Its behaviour and UI are modelled on Flameshot (also
 GPL-3.0). It bundles the Inter font (SIL OFL 1.1) and Lucide icons (ISC); see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

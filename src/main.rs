@@ -92,7 +92,7 @@ enum Parsed {
 }
 
 const HELP: &str = "\
-rustshot: screenshot and annotation tool (Flameshot-style, written in Rust)
+Rustshot: screenshot and annotation tool (Flameshot-style, written in Rust)
 
 Usage: rustshot [COMMAND] [OPTIONS]
 
@@ -136,7 +136,7 @@ fn parse_from(args: &[String]) -> Result<Parsed, String> {
         && (v == "-V" || v == "--version")
     {
         return Ok(Parsed::Help(format!(
-            "rustshot {}\n",
+            "Rustshot {}\n",
             env!("CARGO_PKG_VERSION")
         )));
     }
@@ -505,17 +505,17 @@ fn run() -> Result<()> {
         }
         Cmd::Update => {
             if let Some(channel) = update::managed_install() {
-                println!("rustshot is managed by {channel}; update it there.");
+                println!("Rustshot is managed by {channel}; update it there.");
                 return Ok(());
             }
             match update::check_now() {
                 Ok(Some(r)) => {
-                    println!("rustshot {} is available: {}", r.version, r.url);
+                    println!("Rustshot {} is available: {}", r.version, r.url);
                     update::open_url(&r.url);
                     Ok(())
                 }
                 Ok(None) => {
-                    println!("rustshot {} is up to date", env!("CARGO_PKG_VERSION"));
+                    println!("Rustshot {} is up to date", env!("CARGO_PKG_VERSION"));
                     Ok(())
                 }
                 Err(e) => {
@@ -535,7 +535,7 @@ fn run() -> Result<()> {
                 update_install::Start::Run(i) => i,
                 update_install::Start::AcquireOrSignal => instance::acquire_or_signal(),
                 update_install::Start::GiveUp => {
-                    eprintln!("rustshot: the previous daemon is still running after the update; exiting");
+                    eprintln!("Rustshot: the previous daemon is still running after the update; exiting");
                     exit(0);
                 }
             };

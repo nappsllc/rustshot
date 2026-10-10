@@ -207,7 +207,7 @@ mod imp {
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-                eprintln!("error: another rustshot is starting but not responding");
+                eprintln!("error: another Rustshot is starting but not responding");
                 std::process::exit(1);
             }
             let Some((thread_id, thread)) = spawn_window() else {
@@ -399,7 +399,7 @@ mod imp {
 
     pub fn acquire_or_signal() -> Instance {
         acquire_at(&default_path()).unwrap_or_else(|| {
-            eprintln!("error: another rustshot is running but not responding");
+            eprintln!("error: another Rustshot is running but not responding");
             std::process::exit(1);
         })
     }

@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=rustshot
+Name=Rustshot
 GenericName=Screenshot Tool
 Comment=Screenshot capture with annotation, upload and global hotkeys
 Exec=rustshot daemon

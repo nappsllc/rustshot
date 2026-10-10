@@ -52,12 +52,12 @@ BEGIN
     BLOCK "040904B0"
     BEGIN
       VALUE "CompanyName", "nappsllc"
-      VALUE "FileDescription", "rustshot"
+      VALUE "FileDescription", "Rustshot"
       VALUE "FileVersion", "{ver}"
       VALUE "InternalName", "rustshot"
       VALUE "LegalCopyright", "GPL-3.0-only"
       VALUE "OriginalFilename", "rustshot.exe"
-      VALUE "ProductName", "rustshot"
+      VALUE "ProductName", "Rustshot"
       VALUE "ProductVersion", "{ver}"
     END
   END

@@ -193,9 +193,9 @@ fn add_icon(hwnd: HWND) {
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_TRAYICON;
         nid.hIcon = icon(hwnd);
-        copy_wide(&mut nid.szTip, "rustshot");
+        copy_wide(&mut nid.szTip, "Rustshot");
         if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
-            eprintln!("rustshot: could not add the notification-area icon");
+            eprintln!("Rustshot: could not add the notification-area icon");
         }
     }
 }
@@ -212,7 +212,7 @@ fn balloon(hwnd: HWND, text: &str) {
         let mut nid = base_data(hwnd);
         nid.uFlags = NIF_INFO;
         nid.dwInfoFlags = NIIF_INFO;
-        copy_wide(&mut nid.szInfoTitle, "rustshot");
+        copy_wide(&mut nid.szInfoTitle, "Rustshot");
         copy_wide(&mut nid.szInfo, text);
         let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
@@ -267,7 +267,7 @@ fn run(hwnd: HWND, item: MenuItem) {
             let h = hwnd.0 as isize;
             std::thread::spawn(move || {
                 let msg = if let Some(channel) = crate::update::managed_install() {
-                    format!("rustshot is managed by {channel}; it updates there.")
+                    format!("Rustshot is managed by {channel}; it updates there.")
                 } else {
                     let r = crate::actions::check_updates();
                     if let Ok(Some(rel)) = &r {
@@ -329,7 +329,7 @@ mod tests {
             let hwnd = FindWindowW(crate::instance::tray_class(), PCWSTR::null()).unwrap();
             let mut nid = base_data(hwnd);
             nid.uFlags = NIF_TIP;
-            copy_wide(&mut nid.szTip, "rustshot");
+            copy_wide(&mut nid.szTip, "Rustshot");
             // NIM_MODIFY only succeeds for an icon that exists.
             Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool()
         }

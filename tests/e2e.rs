@@ -234,7 +234,7 @@ fn text_tool_types_and_accepts() {
 fn daemon_stays_alive() {
     if daemon_running() {
         // A second daemon would signal it (open a capture) and exit.
-        println!("skipped: another rustshot daemon is running in this session");
+        println!("skipped: another Rustshot daemon is running in this session");
         return;
     }
     let root = config_root("daemon", &renderer());

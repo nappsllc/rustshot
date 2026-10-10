@@ -39,7 +39,7 @@ Maintainer: nappsllc <noreply@github.com>
 Depends: libx11-6, libxrandr2
 Installed-Size: $(du -sk "$stage/usr" | cut -f1)
 Description: screenshot tool with annotation and upload
- rustshot captures the screen or a region, lets you annotate the
+ Rustshot captures the screen or a region, lets you annotate the
  shot (arrows, text, shapes, marker, blur), then saves it, copies
  it to the clipboard or uploads it to imgur. Global hotkeys are
  provided by the background daemon.

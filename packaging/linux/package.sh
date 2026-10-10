@@ -23,7 +23,7 @@ cp packaging/icons/rustshot-256.png "$stage/io.github.nappsllc.rustshot.png"
 cp LICENSE "$stage/LICENSE"
 cp THIRD_PARTY_NOTICES.md "$stage/"
 cat > "$stage/INSTALL.txt" <<EOF
-rustshot $version (linux x86_64, X11)
+Rustshot $version (linux x86_64, X11)
 
 1. Move the binary onto your PATH:
        install -Dm755 rustshot ~/.local/bin/rustshot

@@ -3,19 +3,19 @@
   <id>io.github.nappsllc.rustshot</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-only</project_license>
-  <name>rustshot</name>
+  <name>Rustshot</name>
   <summary>Capture, annotate and share screenshots</summary>
   <developer id="io.github.nappsllc">
     <name>nappsllc</name>
   </developer>
   <description>
     <p>
-      rustshot captures the whole screen or a region and lets you annotate it
+      Rustshot captures the whole screen or a region and lets you annotate it
       with arrows, lines, shapes, text, a highlighter and pixelation before
       saving it, copying it to the clipboard or uploading it to imgur.
     </p>
     <p>
-      A small background daemon provides global hotkeys. rustshot currently
+      A small background daemon provides global hotkeys. Rustshot currently
       needs an X11 session (or XWayland).
     </p>
   </description>

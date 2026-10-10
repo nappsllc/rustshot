@@ -51,7 +51,7 @@ jobs:
         run: |
           ls -l artifacts/*/*
           gh release create "$GITHUB_REF_NAME" \
-            --title "rustshot $GITHUB_REF_NAME" \
+            --title "Rustshot $GITHUB_REF_NAME" \
             --generate-notes \
             artifacts/*/* SHA256SUMS
 

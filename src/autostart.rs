@@ -64,7 +64,7 @@ pub fn autostart_desktop(exe: &Path) -> String {
         p
     };
     format!(
-        "[Desktop Entry]\nType=Application\nName=rustshot\nComment=Screenshot and annotation tool\n\
+        "[Desktop Entry]\nType=Application\nName=Rustshot\nComment=Screenshot and annotation tool\n\
 Exec={exec} daemon\nIcon={LABEL}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
     )
 }

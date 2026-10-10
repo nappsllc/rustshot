@@ -422,7 +422,7 @@ impl App {
         if let Some(r) = self.update_pending.take() {
             edit.notice = Some(
                 Toast::new(
-                    format!("rustshot {} is available — run `rustshot update`", r.version),
+                    format!("Rustshot {} is available — run `rustshot update`", r.version),
                     ToastKind::Info,
                 )
                 .with_ttl(6000.0),

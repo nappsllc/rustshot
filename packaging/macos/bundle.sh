@@ -50,8 +50,8 @@ cat > "$app/Contents/Info.plist" <<EOF
 <dict>
   <key>CFBundleExecutable</key><string>rustshot</string>
   <key>CFBundleIdentifier</key><string>io.github.nappsllc.rustshot</string>
-  <key>CFBundleName</key><string>rustshot</string>
-  <key>CFBundleDisplayName</key><string>rustshot</string>
+  <key>CFBundleName</key><string>Rustshot</string>
+  <key>CFBundleDisplayName</key><string>Rustshot</string>
   <key>CFBundleIconFile</key><string>rustshot</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>

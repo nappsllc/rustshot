@@ -18,7 +18,7 @@ rm -rf "$staging"
 mkdir -p "$staging"
 cp -R "$app" "$staging/"
 ln -s /Applications "$staging/Applications"
-hdiutil create -volname "rustshot $version" -srcfolder "$staging" -ov -format UDZO \
+hdiutil create -volname "Rustshot $version" -srcfolder "$staging" -ov -format UDZO \
   "dist/rustshot-$version-macos-universal.dmg"
 rm -rf "$staging"
 

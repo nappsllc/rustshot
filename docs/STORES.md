@@ -1,4 +1,4 @@
-# Publishing rustshot
+# Publishing Rustshot
 
 Push a tag that matches `Cargo.toml` (`git tag v0.1.0 && git push origin v0.1.0`).
 `release.yml` builds everything and attaches it to a GitHub Release. Each store
@@ -14,7 +14,7 @@ manual first submission where noted.
 
 ## Microsoft Store (MSIX)
 1. Partner Center account (individual or company): https://partner.microsoft.com/dashboard
-2. Reserve the name "rustshot" › Product identity. Copy into repo **variables**:
+2. Reserve the name "Rustshot" › Product identity. Copy into repo **variables**:
    `MSIX_IDENTITY_NAME` (Package/Identity/Name), `MSIX_PUBLISHER` (CN=…),
    `MSIX_PUBLISHER_DISPLAY`, `MSSTORE_APP_ID` (Store ID), `MSSTORE_SELLER_ID`.
    Set the identity variables (`MSIX_IDENTITY_NAME`, `MSIX_PUBLISHER`) before

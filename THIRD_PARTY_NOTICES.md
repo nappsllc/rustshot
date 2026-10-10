@@ -1,6 +1,6 @@
 # Third-party notices
 
-rustshot is GPL-3.0-only (see LICENSE). It embeds the following works.
+Rustshot is GPL-3.0-only (see LICENSE). It embeds the following works.
 
 ## Lucide icons — ISC License
 

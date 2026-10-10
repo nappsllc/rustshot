@@ -21,7 +21,7 @@ impl MenuItem {
             MenuItem::OpenConfig => "Open config file",
             MenuItem::CheckUpdates => "Check for updates",
             MenuItem::Autostart(_) => "Start at login",
-            MenuItem::Quit => "Quit rustshot",
+            MenuItem::Quit => "Quit Rustshot",
         }
     }
 }
@@ -47,8 +47,8 @@ pub fn current_menu() -> Vec<MenuItem> {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn update_message(r: &Result<Option<crate::update::Release>, String>) -> String {
     match r {
-        Ok(Some(rel)) => format!("rustshot {} is available. Opening the download page.", rel.version),
-        Ok(None) => "rustshot is up to date.".to_string(),
+        Ok(Some(rel)) => format!("Rustshot {} is available. Opening the download page.", rel.version),
+        Ok(None) => "Rustshot is up to date.".to_string(),
         Err(e) => format!("Update check failed: {e}"),
     }
 }
@@ -125,7 +125,7 @@ mod tests {
         assert_eq!(MenuItem::OpenConfig.label(), "Open config file");
         assert_eq!(MenuItem::CheckUpdates.label(), "Check for updates");
         assert_eq!(MenuItem::Autostart(false).label(), "Start at login");
-        assert_eq!(MenuItem::Quit.label(), "Quit rustshot");
+        assert_eq!(MenuItem::Quit.label(), "Quit Rustshot");
     }
 
     #[test]
