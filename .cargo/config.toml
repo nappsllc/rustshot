@@ -1,2 +1,11 @@
+# Hybrid CRT for MSVC builds: the VC runtime (vcruntime) is linked statically,
+# so no VCRUNTIME140.dll / VC++ Redistributable is needed, while the Universal
+# CRT comes from Windows itself (ucrtbase.dll ships with Windows 10 and 11).
+# Keeps rustshot.exe a single file that runs on a clean system, without
+# carrying a static copy of the UCRT.
 [target.'cfg(all(windows, target_env = "msvc"))']
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=/NODEFAULTLIB:libucrt.lib",
+    "-C", "link-arg=/DEFAULTLIB:ucrt.lib",
+]
