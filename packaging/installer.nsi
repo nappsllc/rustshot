@@ -2,7 +2,7 @@
 ; Build: makensis packaging\installer.nsi   (optionally /DPRODUCT_VERSION=x.y.z)
 ; Output: dist\rustshot-<version>-setup.exe
 !ifndef PRODUCT_VERSION
-  !define PRODUCT_VERSION "0.1.0"
+  !define PRODUCT_VERSION "0.1.1"
 !endif
 !define PRODUCT_NAME "rustshot"
 !define PRODUCT_EXE "rustshot.exe"

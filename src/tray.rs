@@ -92,7 +92,7 @@ pub fn tray_glyph_rgba(size: u32, rgb: (u8, u8, u8)) -> Vec<u8> {
         fb.fill_circle(8.0 * k, 8.0 * k, GLYPH_DOT_R * k, white);
     }
     let mut out = Vec::with_capacity(n * n * 4);
-    for px in scratch.chunks_exact(4) {
+    for px in scratch.as_chunks::<4>().0 {
         out.extend_from_slice(&[rgb.0, rgb.1, rgb.2, px[0]]);
     }
     out

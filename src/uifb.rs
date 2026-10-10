@@ -554,7 +554,7 @@ pub(crate) mod tests {
 
         pub fn background() -> Vec<u8> {
             let mut d = vec![0u8; W * H * 4];
-            for (i, p) in d.chunks_exact_mut(4).enumerate() {
+            for (i, p) in d.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let (x, y) = (i % W, i / W);
                 p[0] = (x * 7 + y * 3) as u8;
                 p[1] = (x * 2 + y * 11 + 40) as u8;

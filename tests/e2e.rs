@@ -394,7 +394,7 @@ fn renderers_show_the_same_overlay() {
     if let Some(dir) = std::env::var_os("RUSTSHOT_E2E_OUT") {
         for (name, px) in ["software", "gdi"].iter().zip(&shots) {
             let mut rgba = px.clone();
-            for p in rgba.chunks_exact_mut(4) {
+            for p in rgba.as_chunks_mut::<4>().0 {
                 p.swap(0, 2);
                 p[3] = 255;
             }

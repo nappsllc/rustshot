@@ -125,8 +125,8 @@ fn build_glyph(hwnd: HWND) -> Option<HICON> {
             return None;
         }
         let dst = std::slice::from_raw_parts_mut(bits.cast::<u8>(), rgba.len());
-        for (d, s) in dst.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
-            d.copy_from_slice(&[s[2], s[1], s[0], s[3]]); // RGBA -> BGRA, straight alpha
+        for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(rgba.as_chunks::<4>().0) {
+            *d = [s[2], s[1], s[0], s[3]]; // RGBA -> BGRA, straight alpha
         }
         let mask_bytes = vec![0u8; (size as usize).div_ceil(16) * 2 * size as usize];
         let mask = CreateBitmap(size as i32, size as i32, 1, 1, Some(mask_bytes.as_ptr().cast()));
