@@ -4,10 +4,22 @@ use std::path::PathBuf;
 /// Settings, mirroring Flameshot's key names where they apply.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Directory to save captures into. Empty = user Pictures folder.
+    /// Directory to save captures into. Empty = `<Pictures>/rustshot`.
     pub save_path: String,
+    /// Put each capture in a subfolder of `save_path` named by
+    /// `subfolder_pattern` (one folder per day by default).
+    pub save_subfolder: bool,
+    /// Pattern for that subfolder (same tokens as `filename_pattern`;
+    /// `/` nests folders, `..` is dropped).
+    pub subfolder_pattern: String,
     /// strftime-like pattern, e.g. `%F_%H-%M`.
     pub filename_pattern: String,
+    /// Format for Ctrl+S / direct captures: "png", "jpg" or "bmp".
+    pub save_format: String,
+    /// JPEG quality, 1-100.
+    pub jpeg_quality: u8,
+    /// Ctrl+S always asks with a Save As dialog (the old behaviour).
+    pub save_dialog: bool,
     /// Accent override for the overlay UI (Flameshot `uiColor`); empty =
     /// the theme's own accent.
     pub ui_color: String,
@@ -46,7 +58,12 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             save_path: String::new(),
+            save_subfolder: true,
+            subfolder_pattern: "%F".into(),
             filename_pattern: "%F_%H-%M".into(),
+            save_format: "png".into(),
+            jpeg_quality: 90,
+            save_dialog: false,
             ui_color: String::new(),
             theme: "auto".into(),
             contrast_opacity: 148,
@@ -203,7 +220,27 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
                     .try_into()
                     .map_err(|_| bad("number", "out of range"))?
             }
-            "jpeg_quality" => {} // legacy key, ignored (PNG-only builds)
+            "save_subfolder" => {
+                cfg.save_subfolder = as_bool(val).map_err(|e| bad("boolean", &e))?
+            }
+            "subfolder_pattern" => {
+                cfg.subfolder_pattern = as_string(val).map_err(|e| bad("string", &e))?
+            }
+            "save_format" => {
+                let v = as_string(val).map_err(|e| bad("string", &e))?;
+                let v = v.trim().to_ascii_lowercase();
+                if !matches!(v.as_str(), "png" | "jpg" | "jpeg" | "bmp") {
+                    return Err(bad("value (expected \"png\", \"jpg\" or \"bmp\")", &v));
+                }
+                cfg.save_format = v;
+            }
+            "jpeg_quality" => {
+                cfg.jpeg_quality = as_u64(val)
+                    .ok()
+                    .filter(|q| (1..=100).contains(q))
+                    .ok_or_else(|| bad("number (1-100)", val))? as u8
+            }
+            "save_dialog" => cfg.save_dialog = as_bool(val).map_err(|e| bad("boolean", &e))?,
             "draw_thickness" => cfg.draw_thickness = as_f64(val)? as f32,
             "draw_marker_size" => cfg.draw_marker_size = as_f64(val)? as f32,
             "draw_pixelate_size" => cfg.draw_pixelate_size = as_f64(val)? as f32,
@@ -240,7 +277,12 @@ pub fn to_toml(c: &Config) -> String {
     let colors: Vec<String> = c.user_colors.iter().map(|s| q(s)).collect();
     format!(
         "save_path = {}\n\
+         save_subfolder = {}\n\
+         subfolder_pattern = {}\n\
          filename_pattern = {}\n\
+         save_format = {}\n\
+         jpeg_quality = {}\n\
+         save_dialog = {}\n\
          ui_color = {}\n\
          theme = {}\n\
          contrast_opacity = {}\n\
@@ -259,7 +301,12 @@ pub fn to_toml(c: &Config) -> String {
          check_updates = {}\n\
          renderer = {}\n",
         q(&c.save_path),
+        c.save_subfolder,
+        q(&c.subfolder_pattern),
         q(&c.filename_pattern),
+        q(&c.save_format),
+        c.jpeg_quality,
+        c.save_dialog,
         q(&c.ui_color),
         q(&c.theme),
         c.contrast_opacity,
@@ -474,5 +521,41 @@ mod tests {
         assert!(parse_config("copy_url_after_upload = 1").is_err());
         assert!(parse_config("contrast_opacity = 999").is_err());
         assert!(parse_config("not a assignment").is_err());
+        assert!(parse_config("save_format = \"gif\"").is_err());
+        assert!(parse_config("jpeg_quality = 0").is_err());
+        assert!(parse_config("jpeg_quality = 101").is_err());
+        assert!(parse_config("save_subfolder = 1").is_err());
+    }
+
+    #[test]
+    fn saving_keys_roundtrip() {
+        let d = Config::default();
+        assert!(d.save_subfolder);
+        assert_eq!(d.subfolder_pattern, "%F");
+        assert_eq!(d.save_format, "png");
+        assert_eq!(d.jpeg_quality, 90);
+        assert!(!d.save_dialog);
+        let back = parse_config(&to_toml(&d)).unwrap();
+        assert!(back.save_subfolder);
+        assert_eq!(back.subfolder_pattern, "%F");
+        assert_eq!(back.save_format, "png");
+        assert_eq!(back.jpeg_quality, 90);
+        assert!(!back.save_dialog);
+        let c = Config {
+            save_subfolder: false,
+            subfolder_pattern: "%Y/%m".into(),
+            save_format: "jpg".into(),
+            jpeg_quality: 1,
+            save_dialog: true,
+            ..Config::default()
+        };
+        let back = parse_config(&to_toml(&c)).unwrap();
+        assert!(!back.save_subfolder);
+        assert_eq!(back.subfolder_pattern, "%Y/%m");
+        assert_eq!(back.save_format, "jpg");
+        assert_eq!(back.jpeg_quality, 1);
+        assert!(back.save_dialog);
+        assert_eq!(parse_config("save_format = \" BMP \"").unwrap().save_format, "bmp");
+        assert_eq!(parse_config("jpeg_quality = 100").unwrap().jpeg_quality, 100);
     }
 }

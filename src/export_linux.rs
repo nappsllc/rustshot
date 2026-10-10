@@ -321,11 +321,8 @@ fn finish_dialog(out: std::process::Output) -> Option<PathBuf> {
     if text.is_empty() {
         return None;
     }
-    let mut p = PathBuf::from(text);
-    if p.extension().is_none() {
-        p.set_extension("png");
-    }
-    Some(p)
+    // A missing extension is filled in by the caller (export.rs).
+    Some(PathBuf::from(text))
 }
 
 /// Imgur upload via `curl` (the OS TLS stack, mirroring export_win's WinHTTP

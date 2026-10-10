@@ -1,7 +1,6 @@
 //! Minimal RGBA8 image buffer with PNG codec, replacing the `image` crate.
 
 use anyhow::{Context, Result};
-use std::path::Path;
 
 /// `Default` is the empty 0x0 buffer (a placeholder after `mem::take`).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -73,10 +72,6 @@ impl PixBuf {
             out.d[d..d + stride].copy_from_slice(&self.d[s..s + stride]);
         }
         out
-    }
-
-    pub fn save(&self, path: &Path) -> Result<()> {
-        std::fs::write(path, self.to_png()?).context("write png")
     }
 
     pub fn to_png(&self) -> Result<Vec<u8>> {

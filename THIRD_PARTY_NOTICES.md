@@ -57,7 +57,7 @@ Andersson (https://rsms.me/inter). The full license text follows at the end of t
 
 ## Rust crates (statically linked or build-time)
 
-All are GPL-3.0-compatible (Apache-2.0, MIT, Zlib, 0BSD, Unicode-3.0).
+All are GPL-3.0-compatible (Apache-2.0, MIT, Zlib, 0BSD, Unicode-3.0, IJG).
 Full texts: https://www.apache.org/licenses/LICENSE-2.0,
 https://opensource.org/license/mit, https://zlib.net/zlib_license.html.
 
@@ -72,6 +72,7 @@ https://opensource.org/license/mit, https://zlib.net/zlib_license.html.
 | crc32fast 1.5.2 | MIT OR Apache-2.0 |
 | fdeflate 0.3.7 | MIT OR Apache-2.0 |
 | flate2 1.1.10 | MIT OR Apache-2.0 |
+| jpeg-encoder 0.6.1 | (MIT OR Apache-2.0) AND IJG |
 | miniz_oxide 0.8.9 | MIT OR Zlib OR Apache-2.0 |
 | miniz_oxide 0.9.1 | MIT OR Zlib OR Apache-2.0 |
 | owned_ttf_parser 0.25.1 | Apache-2.0 |
@@ -94,6 +95,12 @@ https://opensource.org/license/mit, https://zlib.net/zlib_license.html.
 | windows-strings 0.5.1 | MIT OR Apache-2.0 |
 | windows-threading 0.2.1 | MIT OR Apache-2.0 |
 | zlib-rs 0.6.8 | Zlib |
+
+## Independent JPEG Group
+
+JPEG output uses the jpeg-encoder crate, whose forward DCT is ported from
+mozjpeg/libjpeg: this software is based in part on the work of the
+Independent JPEG Group.
 
 ## Inter — full license text
 

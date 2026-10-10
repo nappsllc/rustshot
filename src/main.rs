@@ -99,7 +99,7 @@ Commands:
   help      Print this help
 
 Options (gui/full/screen):
-  -p, --path <PATH>      Save to this file or directory
+  -p, --path <PATH>      Save to this file (.png, .jpg or .bmp) or directory
   -c, --clip             Copy the capture to the clipboard
       --raw              Write raw PNG bytes to stdout
       --geometry         Print the capture geometry as WxH+X+Y to stdout
@@ -302,7 +302,7 @@ fn parse_screen(args: &[String]) -> Result<(u32, CaptureArgs), String> {
 fn tasks_from(args: &CaptureArgs) -> Vec<Task> {
     let mut t = Vec::new();
     if let Some(p) = &args.path {
-        t.push(Task::Save { path: Some(p.clone()) });
+        t.push(Task::Save { path: Some(p.clone()), ask: false });
     }
     if args.clip {
         t.push(Task::Copy);
@@ -327,9 +327,7 @@ fn parse_region(spec: &str) -> Result<(i32, i32, u32, u32)> {
 fn run_direct(cfg: &Config, args: &CaptureArgs, shot: Shot, region: Option<(i32, i32, u32, u32)>) -> i32 {
     let mut tasks = tasks_from(args);
     if tasks.is_empty() {
-        tasks.push(Task::Save {
-            path: Some(export::default_save_dir(cfg)),
-        });
+        tasks.push(Task::Save { path: None, ask: false });
     }
     let (img, global) = match region {
         Some(r) => match capture::crop_global(&shot, r) {

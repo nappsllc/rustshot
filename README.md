@@ -96,6 +96,7 @@ rustshot --help
 | Stroke size | mouse wheel, or the − / + buttons |
 | Undo / Redo | <kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> (or <kbd>Ctrl</kbd>+<kbd>Y</kbd>) |
 | Copy / Save / Upload | <kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>U</kbd> |
+| Save As (always asks) | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> |
 | Accept (save, or run the `--clip`/`--path` tasks) | <kbd>Enter</kbd> |
 | Drop the current tool / cancel | <kbd>Esc</kbd> |
 | Move / resize the selection | arrow keys / <kbd>Shift</kbd>+arrows |
@@ -117,8 +118,13 @@ rustshot reads an optional `config.toml`:
 file. Every key is optional:
 
 ```toml
-save_path = ""                    # default save folder ("" = Pictures)
+save_path = ""                    # default save folder ("" = Pictures/rustshot)
+save_subfolder = true             # one subfolder per day inside save_path
+subfolder_pattern = "%F"          # its name (same tokens; "/" nests, e.g. "%Y/%m")
 filename_pattern = "%F_%H-%M"     # strftime-style
+save_format = "png"               # "png", "jpg" or "bmp" (clipboard and upload stay PNG)
+jpeg_quality = 90                 # 1-100
+save_dialog = false               # true = Ctrl+S always asks where to save
 theme = "auto"                    # "auto" (follow the OS), "dark" or "light"
 ui_color = ""                     # accent override, e.g. "#8b93ff" ("" = theme accent)
 contrast_opacity = 148            # dim strength outside the selection (0-255)

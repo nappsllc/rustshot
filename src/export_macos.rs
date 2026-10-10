@@ -151,11 +151,8 @@ pub fn save_dialog(dir: &Path, suggested: &str) -> Option<PathBuf> {
         if utf8.is_null() {
             return None;
         }
-        let mut p = PathBuf::from(CStr::from_ptr(utf8).to_string_lossy().into_owned());
-        if p.extension().is_none() {
-            p.set_extension("png");
-        }
-        Some(p)
+        // A missing extension is filled in by the caller (export.rs).
+        Some(PathBuf::from(CStr::from_ptr(utf8).to_string_lossy().into_owned()))
     }
 }
 

@@ -119,6 +119,19 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/jpeg-encoder/jpeg-encoder-0.6.1.crate",
+        "sha256": "b454d911ac55068f53495488d8ccd0646eaa540c033a28ee15b07838afafb01f",
+        "dest": "cargo/vendor/jpeg-encoder-0.6.1"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"b454d911ac55068f53495488d8ccd0646eaa540c033a28ee15b07838afafb01f\", \"files\": {}}",
+        "dest": "cargo/vendor/jpeg-encoder-0.6.1",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/miniz_oxide/miniz_oxide-0.8.9.crate",
         "sha256": "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316",
         "dest": "cargo/vendor/miniz_oxide-0.8.9"

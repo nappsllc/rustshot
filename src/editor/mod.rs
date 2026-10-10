@@ -613,7 +613,13 @@ impl App {
                 return;
             }
             if vk == 'S' as u32 {
-                self.apply_act(edit, Act::Save);
+                if mods.shift {
+                    // Save As: always ask, seeded with the auto-save path.
+                    edit.tasks = vec![Task::Save { path: None, ask: true }];
+                    edit.done = true;
+                } else {
+                    self.apply_act(edit, Act::Save);
+                }
                 return;
             }
             if vk == 'U' as u32 {
@@ -673,7 +679,7 @@ impl App {
                 }
             }
             if edit.tasks.is_empty() {
-                edit.tasks = vec![Task::Save { path: None }];
+                edit.tasks = vec![Task::Save { path: None, ask: edit.cfg.save_dialog }];
             }
             edit.done = true;
             edit.cancelled = false;
@@ -950,7 +956,7 @@ impl App {
                 edit.done = true;
             }
             Act::Save => {
-                edit.tasks = vec![Task::Save { path: None }];
+                edit.tasks = vec![Task::Save { path: None, ask: edit.cfg.save_dialog }];
                 edit.done = true;
             }
             Act::Upload => {

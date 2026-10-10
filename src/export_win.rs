@@ -134,12 +134,26 @@ pub fn save_dialog(dir: &Path, suggested: &str) -> Option<PathBuf> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
-    let filters: Vec<u16> = "PNG image\0*.png\0\0".encode_utf16().collect();
+    // Preselect the filter (and default extension) of the suggested name.
+    let ext = Path::new(suggested)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_else(|| "png".into());
+    let filter_index = match ext.as_str() {
+        "jpg" | "jpeg" => 2,
+        "bmp" => 3,
+        _ => 1,
+    };
+    let def_ext: Vec<u16> = ext.encode_utf16().chain(std::iter::once(0)).collect();
+    let filters: Vec<u16> = "PNG image\0*.png\0JPEG image\0*.jpg;*.jpeg\0BMP image\0*.bmp\0\0"
+        .encode_utf16()
+        .collect();
     unsafe {
         let mut ofn: OPENFILENAMEW = std::mem::zeroed();
         ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
         ofn.lpstrFilter = PCWSTR(filters.as_ptr());
-        ofn.nFilterIndex = 1;
+        ofn.nFilterIndex = filter_index;
+        ofn.lpstrDefExt = PCWSTR(def_ext.as_ptr());
         ofn.lpstrFile = PWSTR(file.as_mut_ptr());
         ofn.nMaxFile = file.len() as u32;
         ofn.lpstrInitialDir = PCWSTR(dir_w.as_ptr());
@@ -149,11 +163,8 @@ pub fn save_dialog(dir: &Path, suggested: &str) -> Option<PathBuf> {
         }
     }
     let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
-    let mut p = PathBuf::from(String::from_utf16_lossy(&file[..len]));
-    if p.extension().is_none() {
-        p.set_extension("png");
-    }
-    Some(p)
+    // A missing extension is filled in by the caller (export.rs).
+    Some(PathBuf::from(String::from_utf16_lossy(&file[..len])))
 }
 
 pub fn do_upload(png: &[u8], client_id: &str) -> Result<String, String> {

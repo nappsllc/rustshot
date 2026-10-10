@@ -9,6 +9,7 @@ description = "Screenshot and annotation tool (Flameshot-style, written in Rust)
 [dependencies]
 ab_glyph = "0.2"
 anyhow = "1"
+jpeg-encoder = { version = "0.6", default-features = false, features = ["std"] }
 png = "0.17"
 
 [target.'cfg(windows)'.dependencies]
