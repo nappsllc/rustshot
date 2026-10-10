@@ -65,7 +65,7 @@ pub enum Kind {
     Dot(C4),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Item {
     pub kind: Kind,
     pub r: FRect,
@@ -85,6 +85,7 @@ pub struct Input<'a> {
     pub palette: Option<&'a [C4]>,
 }
 
+#[derive(Clone, PartialEq)]
 pub struct Toolbar {
     pub bar: FRect,
     pub pop: Option<FRect>,

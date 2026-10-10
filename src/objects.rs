@@ -51,7 +51,7 @@ impl FRect {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Obj {
     Line {
         a: Pt,
@@ -243,6 +243,44 @@ fn invert(sf: &mut Surf, r: FRect) {
 }
 
 impl Obj {
+    /// Conservative bounds of every pixel `render` may touch (half the
+    /// stroke width, arrowhead, AA and glyph overhang included); `None`
+    /// when it draws nothing.
+    pub fn bounds(&self, font: Option<&FontArc>) -> Option<FRect> {
+        fn bbox(pts: &[Pt], m: f32) -> Option<FRect> {
+            let first = pts.first()?;
+            let (mut x0, mut y0, mut x1, mut y1) = (first.x, first.y, first.x, first.y);
+            for p in pts {
+                (x0, y0, x1, y1) = (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y));
+            }
+            Some(FRect { x: x0 - m, y: y0 - m, w: x1 - x0 + 2.0 * m, h: y1 - y0 + 2.0 * m })
+        }
+        let m = |w: f32| w.max(0.5) / 2.0 + 2.0;
+        let grow = |r: &FRect, m: f32| FRect { x: r.x - m, y: r.y - m, w: r.w + 2.0 * m, h: r.h + 2.0 * m };
+        match self {
+            Obj::Line { a, b, width, .. } | Obj::Marker { a, b, width, .. } => bbox(&[*a, *b], m(*width)),
+            Obj::Arrow { a, b, width, .. } => match arrow_geometry(*a, *b, *width) {
+                Some((_, head)) => bbox(&[*a, *b, head[1], head[2]], m(*width)),
+                None => bbox(&[*a, *b], m(*width)),
+            },
+            Obj::Path { pts, width, .. } => (pts.len() >= 2).then(|| bbox(pts, m(*width))).flatten(),
+            Obj::Rect { r, width, .. } | Obj::Ellipse { r, width, .. } => Some(grow(r, m(*width))),
+            Obj::Pixelate { r, .. } | Obj::Invert { r } => Some(grow(r, 1.0)),
+            Obj::Text { pos, text, size, .. } => {
+                let font = font?;
+                let sfont = font.as_scaled(PxScale::from(*size));
+                let lh = (sfont.ascent() - sfont.descent() + sfont.line_gap()).max(size * 1.1);
+                let (mut w, mut n) = (0.0f32, 0);
+                for line in text.split('\n') {
+                    w = w.max(line.chars().map(|c| sfont.h_advance(font.glyph_id(c))).sum());
+                    n += 1;
+                }
+                let m = size + 2.0;
+                Some(FRect { x: pos.x - m, y: pos.y - m, w: w + 2.0 * m, h: lh * n as f32 + 2.0 * m })
+            }
+        }
+    }
+
     /// Bake this object into the image.
     pub fn render(&self, buf: &mut PixBuf, font: Option<&FontArc>) {
         self.render_into(&mut Surf::from_buf(buf), font);

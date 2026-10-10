@@ -227,16 +227,28 @@ pub fn selection(f: &mut Fb, ui: &Ui, sr: FRect, hot: Option<usize>, k: f32) {
     }
 }
 
-/// "W × H" (and "x, y" when not dragging) above the selection.
-pub fn size_label(f: &mut Fb, ui: &Ui, sr: FRect, show_pos: bool, area: FRect, avoid: Option<FRect>, k: f32) {
+fn label_texts(sr: FRect) -> (String, String) {
     let size = format!("{} × {}", sr.w.round() as i32, sr.h.round() as i32);
     let pos = format!("{}, {}", sr.x.round() as i32, sr.y.round() as i32);
+    (size, pos)
+}
+
+/// Where `size_label` puts its panel.
+fn size_label_rect(ui: &Ui, sr: FRect, show_pos: bool, area: FRect, avoid: Option<FRect>) -> FRect {
+    let (size, pos) = label_texts(sr);
     let pad = ui.px(8.0);
     let mut w = 2.0 * pad + tw(ui, 12.0, &size);
     if show_pos {
         w += pad + tw(ui, 11.0, &pos);
     }
-    let r = label_rect(sr, w, ui.s, area, avoid);
+    label_rect(sr, w, ui.s, area, avoid)
+}
+
+/// "W × H" (and "x, y" when not dragging) above the selection.
+pub fn size_label(f: &mut Fb, ui: &Ui, sr: FRect, show_pos: bool, area: FRect, avoid: Option<FRect>, k: f32) {
+    let (size, pos) = label_texts(sr);
+    let pad = ui.px(8.0);
+    let r = size_label_rect(ui, sr, show_pos, area, avoid);
     surface(f, ui, r, 6.0, &SMALL_LAYERS, k);
     let cy = r.y + r.h / 2.0;
     let x = r.x + pad + text(f, ui, 12.0, &size, r.x + pad, cy, ui.th.text.fade(k));
@@ -252,6 +264,14 @@ pub enum ToastKind {
     Error,
 }
 
+/// The toast panel at opacity `k` (it rises 4 px while fading in).
+fn toast_rect(ui: &Ui, msg: &str, area: FRect, k: f32) -> FRect {
+    let (h, isz, gap, lpad) = (ui.px(36.0), ui.px(16.0), ui.px(8.0), ui.px(10.0));
+    let w = (lpad + isz + gap + tw(ui, 12.0, msg) + ui.px(14.0)).min(area.w - ui.px(24.0));
+    let rise = ui.px(4.0) * (1.0 - k);
+    FRect { x: area.x + (area.w - w) / 2.0, y: area.y1() - ui.px(28.0) - h + rise, w, h }
+}
+
 /// Bottom-centre notice; `k` drives both fade and the 4 px rise.
 pub fn toast(f: &mut Fb, ui: &Ui, msg: &str, kind: ToastKind, area: FRect, k: f32) {
     let th = ui.th;
@@ -261,9 +281,7 @@ pub fn toast(f: &mut Fb, ui: &Ui, msg: &str, kind: ToastKind, area: FRect, k: f3
         ToastKind::Error => ("alert", th.error),
     };
     let (h, isz, gap, lpad) = (ui.px(36.0), ui.px(16.0), ui.px(8.0), ui.px(10.0));
-    let w = (lpad + isz + gap + tw(ui, 12.0, msg) + ui.px(14.0)).min(area.w - ui.px(24.0));
-    let rise = ui.px(4.0) * (1.0 - k);
-    let r = FRect { x: area.x + (area.w - w) / 2.0, y: area.y1() - ui.px(28.0) - h + rise, w, h };
+    let r = toast_rect(ui, msg, area, k);
     surface(f, ui, r, 12.0, &ALL_LAYERS, k);
     let cy = r.y + h / 2.0;
     draw_icon(f, icon, r.x + lpad, cy - isz / 2.0, isz, color.fade(k));
@@ -316,17 +334,7 @@ pub fn act_tip(a: Act) -> (&'static str, &'static [&'static str]) {
 pub fn tooltip(f: &mut Fb, ui: &Ui, anchor: FRect, label: &str, keys: &[&str], area: FRect, k: f32) {
     let th = ui.th;
     let (h, gap, kgap) = (ui.px(26.0), ui.px(8.0), ui.px(4.0));
-    let keys_w: f32 = keys.iter().map(|s| key_w(ui, s)).sum::<f32>() + kgap * keys.len().saturating_sub(1) as f32;
-    let mut w = ui.px(9.0) + tw(ui, 12.0, label) + ui.px(if keys.is_empty() { 9.0 } else { 6.0 });
-    if !keys.is_empty() {
-        w += gap + keys_w;
-    }
-    let x = (anchor.x + anchor.w / 2.0 - w / 2.0).clamp(area.x, (area.x1() - w).max(area.x));
-    let mut y = anchor.y - ui.px(8.0) - h;
-    if y < area.y {
-        y = anchor.y1() + ui.px(8.0);
-    }
-    let r = FRect { x, y, w, h };
+    let r = tooltip_rect(ui, anchor, label, keys, area);
     panel(f, ui, r, 7.0, &SMALL_LAYERS, th.tooltip_bg, rgba(0xFFFFFF, 80), k);
     let cy = r.y + h / 2.0;
     let mut cx = r.x + ui.px(9.0);
@@ -341,39 +349,130 @@ pub fn tooltip(f: &mut Fb, ui: &Ui, anchor: FRect, label: &str, keys: &[&str], a
     }
 }
 
+/// Where `tooltip` puts its panel.
+fn tooltip_rect(ui: &Ui, anchor: FRect, label: &str, keys: &[&str], area: FRect) -> FRect {
+    let (h, gap, kgap) = (ui.px(26.0), ui.px(8.0), ui.px(4.0));
+    let keys_w: f32 = keys.iter().map(|s| key_w(ui, s)).sum::<f32>() + kgap * keys.len().saturating_sub(1) as f32;
+    let mut w = ui.px(9.0) + tw(ui, 12.0, label) + ui.px(if keys.is_empty() { 9.0 } else { 6.0 });
+    if !keys.is_empty() {
+        w += gap + keys_w;
+    }
+    let x = (anchor.x + anchor.w / 2.0 - w / 2.0).clamp(area.x, (area.x1() - w).max(area.x));
+    let mut y = anchor.y - ui.px(8.0) - h;
+    if y < area.y {
+        y = anchor.y1() + ui.px(8.0);
+    }
+    FRect { x, y, w, h }
+}
+
+enum HintPart {
+    T(&'static str),
+    K(&'static str),
+}
+
+const HINT: [HintPart; 7] = [
+    HintPart::T("Drag to select"),
+    HintPart::T("·"),
+    HintPart::K("Enter"),
+    HintPart::T("to save"),
+    HintPart::T("·"),
+    HintPart::K("Esc"),
+    HintPart::T("to cancel"),
+];
+
+fn hint_part_w(ui: &Ui, p: &HintPart) -> f32 {
+    match p {
+        HintPart::T(s) => tw(ui, 13.0, s),
+        HintPart::K(s) => key_w(ui, s),
+    }
+}
+
+/// Total width of the hint line (texts, key caps and 6 px gaps).
+fn hint_width(ui: &Ui) -> f32 {
+    HINT.iter().map(|p| hint_part_w(ui, p)).sum::<f32>() + ui.px(6.0) * (HINT.len() - 1) as f32
+}
+
 /// "Drag to select · Enter to save · Esc to cancel", centred in the active monitor.
 pub fn hint(f: &mut Fb, ui: &Ui, area: FRect, k: f32) {
-    enum P {
-        T(&'static str),
-        K(&'static str),
-    }
-    let parts = [
-        P::T("Drag to select"),
-        P::T("·"),
-        P::K("Enter"),
-        P::T("to save"),
-        P::T("·"),
-        P::K("Esc"),
-        P::T("to cancel"),
-    ];
     let sp = ui.px(6.0);
-    let width = |p: &P| match p {
-        P::T(s) => tw(ui, 13.0, s),
-        P::K(s) => key_w(ui, s),
-    };
-    let total = parts.iter().map(width).sum::<f32>() + sp * (parts.len() - 1) as f32;
+    let total = hint_width(ui);
     let (mut x, cy) = (area.x + (area.w - total) / 2.0, area.y + area.h / 2.0);
     let c = C4::rgb(255, 255, 255).fade(0.7 * k);
-    for p in &parts {
-        let w = width(p);
+    for p in &HINT {
+        let w = hint_part_w(ui, p);
         match p {
-            P::T(s) => {
+            HintPart::T(s) => {
                 text(f, ui, 13.0, s, x, cy, c);
             }
-            P::K(s) => key_cap(f, ui, x, cy, w, s, k),
+            HintPart::K(s) => key_cap(f, ui, x, cy, w, s, k),
         }
         x += w + sp;
     }
+}
+
+// ---- conservative bounds (shadows, AA, glyph overhang) for rect composition ----
+
+/// Margin around anything anti-aliased.
+const AA: f32 = 2.0;
+
+fn grow4(r: FRect, l: f32, t: f32, rt: f32, b: f32) -> FRect {
+    FRect { x: r.x - l, y: r.y - t, w: r.w + l + rt, h: r.h + t + b }
+}
+
+fn union(a: FRect, b: FRect) -> FRect {
+    super::toolbar::union(a, b)
+}
+
+/// A panel at `r` with up to all four shadow layers: the widest spreads
+/// 9 px sideways and reaches 12 + 9 px below.
+fn surface_bounds(ui: &Ui, r: FRect) -> FRect {
+    let (sp, dy) = (ui.px(SHADOW[3].1), ui.px(SHADOW[3].0));
+    grow4(r, sp + 1.0 + AA, 1.0 + AA, sp + 1.0 + AA, dy + sp + 1.0 + AA)
+}
+
+/// Border strips (three 1 px lines) and the eight handles.
+pub fn selection_bounds(ui: &Ui, sr: FRect) -> Vec<FRect> {
+    let sr = round(sr);
+    let b = 2.0 * ui.line() + AA;
+    let mut v = vec![
+        FRect { x: sr.x - b, y: sr.y - b, w: sr.w + 2.0 * b, h: 2.0 * b },
+        FRect { x: sr.x - b, y: sr.y1() - b, w: sr.w + 2.0 * b, h: 2.0 * b },
+        FRect { x: sr.x - b, y: sr.y - b, w: 2.0 * b, h: sr.h + 2.0 * b },
+        FRect { x: sr.x1() - b, y: sr.y - b, w: 2.0 * b, h: sr.h + 2.0 * b },
+    ];
+    let hr = ui.px(3.0 + 3.0 + 1.0) + 1.0 + AA;
+    for (_, p) in super::handle_points(sr) {
+        v.push(FRect { x: p.x - hr, y: p.y - hr, w: 2.0 * hr, h: 2.0 * hr });
+    }
+    v
+}
+
+pub fn size_label_bounds(ui: &Ui, sr: FRect, show_pos: bool, area: FRect, avoid: Option<FRect>) -> FRect {
+    surface_bounds(ui, size_label_rect(ui, sr, show_pos, area, avoid))
+}
+
+/// The panel plus the message, which may run past a panel clamped to the area.
+pub fn toast_bounds(ui: &Ui, msg: &str, area: FRect, k: f32) -> FRect {
+    let r = toast_rect(ui, msg, area, k);
+    let x = r.x + ui.px(10.0 + 16.0 + 8.0);
+    let t = FRect { x, y: r.y, w: tw(ui, 12.0, msg) + ui.px(12.0), h: r.h };
+    union(surface_bounds(ui, r), grow4(t, AA, AA, AA, AA))
+}
+
+pub fn toolbar_bounds(ui: &Ui, tb: &Toolbar) -> FRect {
+    let b = surface_bounds(ui, tb.bar);
+    tb.pop.map_or(b, |p| union(b, surface_bounds(ui, p)))
+}
+
+pub fn tooltip_bounds(ui: &Ui, anchor: FRect, label: &str, keys: &[&str], area: FRect) -> FRect {
+    surface_bounds(ui, tooltip_rect(ui, anchor, label, keys, area))
+}
+
+pub fn hint_bounds(ui: &Ui, area: FRect) -> FRect {
+    let total = hint_width(ui);
+    let (x, cy) = (area.x + (area.w - total) / 2.0, area.y + area.h / 2.0);
+    let m = ui.px(13.0);
+    FRect { x: x - m - AA, y: cy - ui.px(14.0) - AA, w: total + 2.0 * (m + AA), h: ui.px(28.0) + 2.0 * AA }
 }
 
 #[cfg(test)]

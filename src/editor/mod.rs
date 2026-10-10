@@ -1,4 +1,4 @@
-use crate::anim::{self, Tween};
+use crate::anim::Tween;
 use crate::capture::{self, Shot};
 use crate::config::{self, Config};
 use crate::export::{self, Task};
@@ -7,10 +7,12 @@ use crate::hotkey::{HotEvent, Hotkeys};
 use crate::objects::{FRect, Obj, Pt};
 use crate::pixbuf::PixBuf;
 use crate::theme::{self, Theme};
-use crate::uifb::{text_width, C4, Fb};
+use crate::raster::Order;
+use crate::uifb::{text_width, C4};
+use compose::PixBufBackdrop;
 use crate::wind::{self, Cursor, Driver, Ev, Hwnd, Mods};
 use ab_glyph::FontArc;
-use chrome::{ToastKind, Ui};
+use chrome::ToastKind;
 use toolbar::{Act, Toolbar};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::Receiver;
@@ -19,6 +21,7 @@ use std::time::{Duration, Instant};
 
 mod toolbar;
 mod chrome;
+mod compose;
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -367,6 +370,7 @@ impl App {
             base,
             composed: None,
             frame: PixBuf::default(),
+            scene: None,
             caret_drawn: None,
             toast_drawn: None,
             area_drawn: None,
@@ -1004,138 +1008,17 @@ impl Driver for App {
     fn frame(&mut self) -> Option<&mut PixBuf> {
         let State::Edit(edit) = &mut self.st else { return None };
         let edit: &mut Edit = edit;
-        if edit.dirty {
-            edit.rebuild();
-        }
-        let (ww, wh) = (edit.shot.size.0 as f32, edit.shot.size.1 as f32);
-        let area = pick_area(&edit.shot.monitors, edit.sel, Pt::new(self.mouse.0 as f32, self.mouse.1 as f32));
-        edit.area_drawn = Some(area);
-        let s = edit.ui_scale();
-        let colors = palette_colors(&edit.cfg);
-        edit.toolbar = edit.sel.map(|sel| {
-            toolbar::layout(&toolbar::Input {
-                sel,
-                area,
-                s,
-                busy: !edit.tasks.is_empty(),
-                can_undo: edit.hi > 0,
-                can_redo: edit.hi + 1 < edit.hist.len(),
-                palette: edit.palette_open.then_some(colors.as_slice()),
-            })
-        });
-
         let now = Instant::now();
-        let interacting = !matches!(edit.interact, Interact::None);
-        if edit.toolbar.is_some() {
-            edit.mo.bar.set(1.0, 120, now);
-        } else {
-            edit.mo.bar.snap(0.0);
-        }
-        if edit.palette_open {
-            edit.mo.pop.set(1.0, 100, now);
-        } else {
-            edit.mo.pop.snap(0.0);
-        }
-        let hint_on = edit.sel.is_none() && !interacting;
-        edit.mo.hint.set(if hint_on { 1.0 } else { 0.0 }, if hint_on { 120 } else { 100 }, now);
-
-        // Compose: base + objects, themed dim outside the selection, draft,
-        // in one pass into the persistent display buffer (no per-frame copy).
-        let dim_a = edit.th.dim_alpha(edit.cfg.contrast_opacity) as f32 * edit.mo.dim.value(now);
-        let dim = edit.th.dim.with_alpha(dim_a.round() as u8);
-        let full = [(0.0, 0.0, ww, wh)];
-        let around;
-        let rects: &[(f32, f32, f32, f32)] = match edit.sel {
-            None => &full,
-            Some(sr) => {
-                around = [
-                    (0.0, 0.0, ww, sr.y),
-                    (0.0, sr.y1(), ww, wh - sr.y1()),
-                    (0.0, sr.y, sr.x, sr.h),
-                    (sr.x1(), sr.y, ww - sr.x1(), sr.h),
-                ];
-                &around
-            }
-        };
-        // Borrowed out of `edit` while drawing (chrome reads `edit`), put
-        // back below; allocated once per capture.
+        edit.prepare(self.notice.as_ref(), self.mouse, now);
+        // Borrowed out of `edit` while composing, put back below;
+        // allocated once per capture.
         let mut img = std::mem::take(&mut edit.frame);
         if img.dimensions() != edit.base.dimensions() {
             img = PixBuf::new(edit.base.width(), edit.base.height());
         }
-        compose_dimmed(&mut img, edit.composed(), rects, dim);
-        if let Some(d) = &edit.draft {
-            d.render(&mut img, edit.font.as_ref());
-        }
-
-        // Chrome, drawn into the display buffer.
-        let stride = img.width() as usize;
-        let mut f = Fb::new(img.as_raw_mut(), stride);
-        let ui = Ui { th: &edit.th, s, font: edit.ui_font.as_ref() };
-
-        if let Some(sr) = edit.sel {
-            chrome::selection(&mut f, &ui, sr, edit.hot_handle, 1.0);
-            let avoid = edit
-                .toolbar
-                .as_ref()
-                .filter(|t| t.above && t.bar.y1() <= sr.y)
-                .map(|t| t.pop.map_or(t.bar, |p| toolbar::union(t.bar, p)));
-            chrome::size_label(&mut f, &ui, sr, !interacting, area, avoid, 1.0);
-        }
-        if let Some(td) = &edit.text {
-            let r = text_box_rect(ww, td, edit.sizes.font, edit.font.as_ref(), s);
-            f.stroke_dashed_rect(r, 4.0 * s, 3.0 * s, s.round().max(1.0), edit.th.accent);
-            if let Some(font) = edit.font.as_ref() {
-                let px = edit.sizes.font;
-                f.draw_text(font, px, &td.text, td.pos.x, td.pos.y, edit.color);
-                if caret_on(td) {
-                    let before = td.text.get(..td.caret).unwrap_or("");
-                    let cx = td.pos.x + text_width(font, px, before);
-                    f.fill_rect(
-                        cx.round() as i32,
-                        td.pos.y.round() as i32,
-                        (2.0 * s).round() as i32,
-                        (px * 1.15).round() as i32,
-                        edit.color,
-                    );
-                }
-            }
-        }
-        if let Some(t) = edit.notice.as_ref().or(self.notice.as_ref()) {
-            chrome::toast(&mut f, &ui, &t.text, t.kind, area, t.opacity(now));
-        }
-        if let Some(tb) = &edit.toolbar {
-            let kb = edit.mo.bar.value(now);
-            let tbz = tb.scaled(0.96 + 0.04 * kb);
-            let (value, unit) = edit.size_label();
-            let st = chrome::BarState {
-                hover: edit.hover,
-                hover_k: edit.mo.hover.value(now),
-                pressed: edit.pressed,
-                tool: edit.tool,
-                color: edit.color,
-                value: &value,
-                unit,
-                pop_k: edit.mo.pop.value(now),
-            };
-            chrome::toolbar(&mut f, &ui, &tbz, &st, kb);
-            let shown_ms = now.saturating_duration_since(edit.hover_at).as_secs_f32() * 1000.0 - 400.0;
-            if !interacting
-                && shown_ms >= 0.0
-                && let Some(it) = edit.hover.and_then(|i| tb.items.get(i))
-                && let toolbar::Kind::Btn(act) = it.kind
-            {
-                let (label, keys) = chrome::act_tip(act);
-                let tk = anim::ease_out(shown_ms / 80.0);
-                chrome::tooltip(&mut f, &ui, it.r, label, keys, area, tk);
-            }
-        }
-        let kh = edit.mo.hint.value(now);
-        if kh > 0.01 {
-            chrome::hint(&mut f, &ui, area, kh);
-        }
-        edit.caret_drawn = edit.text.as_ref().map(caret_on);
-        edit.toast_drawn = edit.notice.as_ref().or(self.notice.as_ref()).map(|t| t.at);
+        // The whole image as one rect: same code path as partial repaints.
+        let bd = PixBufBackdrop { img: edit.composed(), dim: edit.th.dim };
+        edit.compose_rect(compose::PxRect::image(edit.shot.size), &bd, img.as_raw_mut(), Order::Rgba);
         wind::set_fast_timer(self.hwnd, animating(edit, self.notice.as_ref(), now));
         edit.frame = img;
         Some(&mut edit.frame)
@@ -1280,6 +1163,8 @@ struct Edit {
     /// Display buffer `frame()` composes into; reused across frames,
     /// allocated on the first frame of a capture.
     frame: PixBuf,
+    /// The last prepared frame state (`prepare`), drawn by `compose_rect`.
+    scene: Option<compose::Scene>,
     /// Caret blink phase in the last frame (None: no text draft).
     caret_drawn: Option<bool>,
     /// `at` of the toast drawn in the last frame (None: no toast).
@@ -1758,71 +1643,6 @@ impl Dimmer {
     }
 }
 
-/// `dst = src`, blended toward `c` by `c.a` inside each `(x, y, w, h)`
-/// rect (snapped outward to whole pixels, clamped). One pass over the
-/// buffer; spans outside every rect are plain row copies, so every pixel
-/// of `dst` is written and it can be reused frame to frame.
-fn compose_dimmed(dst: &mut PixBuf, src: &PixBuf, rects: &[(f32, f32, f32, f32)], c: C4) {
-    debug_assert_eq!(dst.dimensions(), src.dimensions());
-    debug_assert!(rects.len() <= 4);
-    let (bw, bh) = (src.width() as i32, src.height() as i32);
-    let mut spans = [(0i32, 0i32, 0i32, 0i32); 4];
-    let mut n = 0;
-    if c.a != 0 {
-        for &(x, y, w, h) in rects.iter().take(spans.len()) {
-            if w <= 0.0 || h <= 0.0 {
-                continue;
-            }
-            let x0 = x.floor().max(0.0) as i32;
-            let y0 = y.floor().max(0.0) as i32;
-            let (x1, y1) = (x1_clamp(x, w, bw).min(bw), y1_clamp(y, h, bh).min(bh));
-            if x0 < x1 && y0 < y1 {
-                spans[n] = (x0, y0, x1, y1);
-                n += 1;
-            }
-        }
-    }
-    let spans = &spans[..n];
-    let (s, d) = (src.as_raw(), dst.as_raw_mut());
-    if spans.is_empty() {
-        d.copy_from_slice(s);
-        return;
-    }
-    let dimmer = Dimmer::new(c);
-    let stride = bw as usize * 4;
-    for (y, (srow, drow)) in s.chunks_exact(stride).zip(d.chunks_exact_mut(stride)).enumerate() {
-        let y = y as i32;
-        // Column edges of the rects crossing this row: (x, depth delta).
-        let mut edges = [(0i32, 0i32); 9];
-        let mut m = 0;
-        for sp in spans.iter().filter(|sp| sp.1 <= y && y < sp.3) {
-            edges[m] = (sp.0, 1);
-            edges[m + 1] = (sp.2, -1);
-            m += 2;
-        }
-        if m == 0 {
-            drow.copy_from_slice(srow);
-            continue;
-        }
-        edges[m] = (bw, 0);
-        let edges = &mut edges[..m + 1];
-        edges.sort_unstable();
-        let (mut x, mut depth) = (0i32, 0i32);
-        for &(ex, de) in edges.iter() {
-            if ex > x {
-                let (a, b) = (x as usize * 4, ex as usize * 4);
-                if depth == 0 {
-                    drow[a..b].copy_from_slice(&srow[a..b]);
-                } else {
-                    dimmer.run(&srow[a..b], &mut drow[a..b], depth);
-                }
-                x = ex;
-            }
-            depth += de;
-        }
-    }
-}
-
 fn x1_clamp(x: f32, w: f32, bw: i32) -> i32 {
     (x + w).ceil().min(bw as f32) as i32
 }
@@ -1960,6 +1780,7 @@ mod tests {
             composed: None,
             base,
             frame: PixBuf::default(),
+            scene: None,
             caret_drawn: None,
             toast_drawn: None,
             area_drawn: None,
@@ -2407,10 +2228,14 @@ mod tests {
     }
 
     #[test]
-    fn compose_dimmed_matches_four_dim_rects() {
+    fn backdrop_matches_four_dim_rects() {
+        use compose::{backdrop_rect, PxRect};
         let src = synthetic_shot().image.crop(100, 80, 301, 211);
         let (ww, wh) = (src.width() as f32, src.height() as f32);
+        let size = src.dimensions();
         let c = C4::new(8, 10, 14, 141);
+        let bd = PixBufBackdrop { img: &src, dim: c };
+        let whole = PxRect::image(size);
         for sr in [
             FRect { x: 40.0, y: 30.0, w: 120.0, h: 90.0 },
             FRect { x: 40.4, y: 30.6, w: 120.3, h: 90.2 },
@@ -2428,12 +2253,346 @@ mod tests {
                 dim_rect_ref(&mut want, r.0, r.1, r.2, r.3, c);
             }
             let mut got = PixBuf::from_pixel(src.width(), src.height(), [1, 2, 3, 4]);
-            compose_dimmed(&mut got, &src, &rects, c);
+            backdrop_rect(Some(sr), size, c.a, whole, &bd, got.as_raw_mut(), Order::Rgba);
             assert!(got == want, "{sr:?}");
         }
         let mut got = PixBuf::new(src.width(), src.height());
-        compose_dimmed(&mut got, &src, &[(0.0, 0.0, ww, wh)], c.with_alpha(0));
+        backdrop_rect(None, size, 0, whole, &bd, got.as_raw_mut(), Order::Rgba);
         assert!(got == src, "alpha 0 copies");
+    }
+
+    // ---- rect composition: tilings and dirty rects ----
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    fn snap_all(app: &mut App) {
+        let e = edit_of(app);
+        for t in [&mut e.mo.dim, &mut e.mo.bar, &mut e.mo.pop, &mut e.mo.hint, &mut e.mo.hover] {
+            t.snap(t.target());
+        }
+    }
+
+    /// Settle every tween (some start in `frame()`), then paint.
+    fn settled(app: &mut App) -> PixBuf {
+        snap_all(app);
+        app.frame();
+        snap_all(app);
+        app.frame().expect("frame").clone()
+    }
+
+    /// A tween stuck at about a third of the way to `to`.
+    fn mid(to: f32) -> Tween {
+        let now = Instant::now();
+        let mut t = Tween::new(0.0, now);
+        t.set(to, 1_000_000, now - Duration::from_secs(60));
+        t
+    }
+
+    /// Compose the prepared scene through random tiles (both orders) and
+    /// compare with the whole-image frame `want`.
+    fn assert_tiles_match(app: &mut App, want: &PixBuf, name: &str, seed: u64) {
+        use compose::PxRect;
+        let e = edit_of(app);
+        let bd = PixBufBackdrop { img: e.composed(), dim: e.th.dim };
+        let (w, h) = (e.shot.size.0 as i32, e.shot.size.1 as i32);
+        let mut rng = Rng(seed | 1);
+        let mut n = 0;
+        let mut y = 0;
+        while y < h {
+            let cap = if rng.below(4) == 0 { 7 } else { 150 };
+            let th = 1 + rng.below(cap) as i32;
+            let mut x = 0;
+            while x < w {
+                let cap = if rng.below(4) == 0 { 9 } else { 260 };
+                let tw = 1 + rng.below(cap) as i32;
+                let r = PxRect::new(x, y, (x + tw).min(w), (y + th).min(h));
+                let order = if n % 2 == 0 { Order::Bgra } else { Order::Rgba };
+                n += 1;
+                let mut out = vec![7u8; (r.w() * r.h() * 4) as usize];
+                e.compose_rect(r, &bd, &mut out, order);
+                for ty in 0..r.h() {
+                    for tx in 0..r.w() {
+                        let i = ((ty * r.w() + tx) * 4) as usize;
+                        let mut got = [out[i], out[i + 1], out[i + 2], out[i + 3]];
+                        if order == Order::Bgra {
+                            got.swap(0, 2);
+                        }
+                        let exp = want.get_pixel((r.x0 + tx) as u32, (r.y0 + ty) as u32);
+                        assert_eq!(got, exp, "{name}: pixel ({}, {}) in tile {r:?} {order:?}", r.x0 + tx, r.y0 + ty);
+                    }
+                }
+                x += tw;
+            }
+            y += th;
+        }
+    }
+
+    fn tiling_states() -> Vec<(&'static str, App)> {
+        let big = FRect { x: 240.0, y: 140.0, w: 960.0, h: 540.0 };
+        let mut v = Vec::new();
+        v.push(("A hint", preview_app(theme::DARK, None)));
+        v.push(("B toolbar", annotated(theme::DARK, big)));
+        let mut app = annotated(theme::DARK, big);
+        edit_of(&mut app).interact = Interact::NewSel { anchor: Pt::new(big.x, big.y), moved: true };
+        v.push(("C dragging", app));
+        let mut app = annotated(theme::DARK, big);
+        edit_of(&mut app).palette_open = true;
+        v.push(("D palette", app));
+        let mut app = annotated(theme::LIGHT, big);
+        app.frame();
+        let e = edit_of(&mut app);
+        let copy = e.toolbar.as_ref().unwrap().items.iter().position(|i| i.kind == toolbar::Kind::Btn(Act::Copy));
+        e.hover = copy;
+        e.hover_at = Instant::now() - Duration::from_secs(2);
+        let mut toast = Toast::new("Size 4", ToastKind::Info);
+        toast.at = Instant::now() - Duration::from_millis(500);
+        e.notice = Some(toast);
+        v.push(("light tooltip toast", app));
+        let mut app = annotated(theme::DARK, big);
+        let e = edit_of(&mut app);
+        e.tool = Some(Tool::Text);
+        let text = "Check this".to_string();
+        e.text = Some(TextDraft { pos: Pt::new(400.0, 300.0), caret: 5, text, at: Instant::now() });
+        v.push(("text", app));
+        let sel = FRect { x: 100.0, y: 700.0, w: 800.0, h: 180.0 };
+        let mut app = preview_app_with(theme::DARK, Some(sel), two_monitor_shot());
+        let mut toast = Toast::new("Uploaded https://example.com/a-rather-long-url-that-runs-on", ToastKind::Success);
+        toast.at = Instant::now() - Duration::from_millis(500);
+        app.notice = Some(toast);
+        v.push(("two monitors", app));
+        v.push(("narrow", annotated(theme::DARK, FRect { x: 500.0, y: 300.0, w: 380.0, h: 200.0 })));
+        v.push(("fractional", annotated(theme::DARK, FRect { x: 240.4, y: 140.6, w: 960.3, h: 540.2 })));
+        // Drafts straddling the selection edge; pixelate needs its whole rect.
+        for (name, d) in [
+            ("draft pixelate", Obj::Pixelate { r: FRect { x: 180.0, y: 100.0, w: 300.5, h: 210.0 }, cell: 13.0 }),
+            ("draft invert", Obj::Invert { r: FRect { x: 1100.0, y: 600.0, w: 200.0, h: 150.0 } }),
+            ("draft arrow", Obj::Arrow { a: Pt::new(150.0, 120.0), b: Pt::new(700.0, 420.0), color: C4::rgb(20, 200, 90), width: 9.0 }),
+            ("draft marker", Obj::Marker { a: Pt::new(200.0, 600.0), b: Pt::new(900.0, 640.0), color: C4::rgb(250, 220, 0).with_alpha(90), width: 20.0 }),
+        ] {
+            let mut app = annotated(theme::DARK, big);
+            let e = edit_of(&mut app);
+            e.interact = Interact::Drawing { start: Pt::new(0.0, 0.0) };
+            e.draft = Some(d);
+            v.push((name, app));
+        }
+        let mut app = annotated(theme::DARK, big);
+        let e = edit_of(&mut app);
+        e.objects.push(Obj::Pixelate { r: FRect { x: 200.0, y: 400.0, w: 333.0, h: 120.0 }, cell: 11.0 });
+        e.hover = Some(3);
+        e.pressed = Some(4);
+        e.hot_handle = Some(2);
+        v.push(("objects hover pressed", app));
+        v
+    }
+
+    #[test]
+    fn random_tilings_match_whole_frame() {
+        for (i, (name, mut app)) in tiling_states().into_iter().enumerate() {
+            let want = settled(&mut app);
+            assert_tiles_match(&mut app, &want, name, 0x9E37_79B9 + i as u64);
+        }
+    }
+
+    /// Mid-animation: dim, toolbar scale/fade, palette, hint, hover and
+    /// toast at fractional opacities.
+    #[test]
+    fn random_tilings_match_mid_animation() {
+        let big = FRect { x: 240.0, y: 140.0, w: 960.0, h: 540.0 };
+        let mut app = annotated(theme::DARK, big);
+        app.frame();
+        let e = edit_of(&mut app);
+        e.palette_open = true;
+        e.hover = Some(1);
+        (e.mo.dim, e.mo.bar, e.mo.pop, e.mo.hover) = (mid(1.0), mid(1.0), mid(1.0), mid(1.0));
+        let mut toast = Toast::new("Halfway", ToastKind::Error);
+        toast.at = Instant::now() - Duration::from_millis(30);
+        e.notice = Some(toast);
+        let want = app.frame().expect("frame").clone();
+        assert_tiles_match(&mut app, &want, "mid toolbar", 77);
+
+        let mut app = preview_app(theme::LIGHT, None);
+        app.frame();
+        let e = edit_of(&mut app);
+        (e.mo.dim, e.mo.hint) = (mid(1.0), mid(1.0));
+        let want = app.frame().expect("frame").clone();
+        assert_tiles_match(&mut app, &want, "mid hint", 78);
+    }
+
+    /// Paint, apply `change`, paint again: every pixel that differs lies in
+    /// `dirty_rects(before, after)`. Returns the dirty area fraction.
+    fn assert_dirty_covers(app: &mut App, name: &str, change: impl FnOnce(&mut App)) -> f64 {
+        let before = app.frame().expect("frame").clone();
+        let prev = edit_of(app).scene.clone().expect("scene");
+        change(app);
+        let after = app.frame().expect("frame").clone();
+        let e = edit_of(app);
+        let rects = e.dirty_rects(Some(&prev));
+        let (w, h) = before.dimensions();
+        let (a, b) = (before.as_raw(), after.as_raw());
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                let i = (y as usize * w as usize + x as usize) * 4;
+                if a[i..i + 4] != b[i..i + 4] {
+                    assert!(
+                        rects.iter().any(|r| r.contains_px(x, y)),
+                        "{name}: pixel ({x}, {y}) changed outside {rects:?}"
+                    );
+                }
+            }
+        }
+        let area: i64 = rects.iter().map(|r| r.w() as i64 * r.h() as i64).sum();
+        area as f64 / (w as f64 * h as f64)
+    }
+
+    #[test]
+    fn dirty_rects_cover_every_changed_pixel() {
+        let big = FRect { x: 240.0, y: 140.0, w: 960.0, h: 540.0 };
+        let mut app = annotated(theme::DARK, big);
+        settled(&mut app);
+        let small = |f: f64, name: &str| assert!(f < 0.5, "{name}: dirty area {f}");
+
+        let f = assert_dirty_covers(&mut app, "drag", |app| {
+            let e = edit_of(app);
+            e.interact = Interact::MoveSel { start: Pt::new(0.0, 0.0), orig: big };
+            e.sel = Some(FRect { x: big.x + 13.0, y: big.y + 7.0, ..big });
+        });
+        small(f, "drag");
+        let f = assert_dirty_covers(&mut app, "resize", |app| {
+            let e = edit_of(app);
+            e.sel = Some(FRect { x: big.x + 13.0, y: big.y + 7.0, w: big.w + 20.0, h: big.h - 5.0 });
+        });
+        small(f, "resize");
+        assert_dirty_covers(&mut app, "drop", |app| {
+            let e = edit_of(app);
+            e.interact = Interact::None;
+            e.sel = Some(big);
+        });
+        snap_all(&mut app);
+        let f = assert_dirty_covers(&mut app, "hover", |app| {
+            let e = edit_of(app);
+            e.hover = Some(2);
+            e.hover_at = Instant::now();
+            e.mo.hover = mid(1.0);
+        });
+        small(f, "hover");
+        let f = assert_dirty_covers(&mut app, "hover settles", snap_all);
+        small(f, "hover settles");
+        let f = assert_dirty_covers(&mut app, "tooltip appears", |app| {
+            edit_of(app).hover_at = Instant::now() - Duration::from_secs(2);
+        });
+        small(f, "tooltip");
+        let f = assert_dirty_covers(&mut app, "hover moves", |app| edit_of(app).hover = Some(5));
+        small(f, "hover moves");
+        assert_dirty_covers(&mut app, "hover leaves", |app| edit_of(app).hover = None);
+        assert_dirty_covers(&mut app, "hot handle", |app| edit_of(app).hot_handle = Some(4));
+        assert_dirty_covers(&mut app, "pressed", |app| edit_of(app).pressed = Some(6));
+        let f = assert_dirty_covers(&mut app, "palette opens", |app| edit_of(app).palette_open = true);
+        small(f, "palette");
+        assert_dirty_covers(&mut app, "palette fades in", snap_all);
+        assert_dirty_covers(&mut app, "palette closes", |app| edit_of(app).palette_open = false);
+        let f = assert_dirty_covers(&mut app, "toast set", |app| {
+            edit_of(app).notice = Some(Toast::new("Size 5", ToastKind::Info));
+        });
+        small(f, "toast");
+        assert_dirty_covers(&mut app, "toast steady", |app| {
+            edit_of(app).notice.as_mut().unwrap().at = Instant::now() - Duration::from_millis(500);
+        });
+        assert_dirty_covers(&mut app, "toast fade frame", |app| {
+            edit_of(app).notice.as_mut().unwrap().at = Instant::now() - Duration::from_millis(1650);
+        });
+        assert_dirty_covers(&mut app, "toast cleared", |app| edit_of(app).notice = None);
+        assert_dirty_covers(&mut app, "app toast", |app| {
+            let mut t = Toast::new("Uploaded https://example.com/x", ToastKind::Success);
+            t.at = Instant::now() - Duration::from_millis(500);
+            app.notice = Some(t);
+        });
+        assert_dirty_covers(&mut app, "app toast cleared", |app| app.notice = None);
+        let f = assert_dirty_covers(&mut app, "tool switch", |app| edit_of(app).tool = Some(Tool::Rect));
+        small(f, "tool");
+        let f = assert_dirty_covers(&mut app, "draft", |app| {
+            let e = edit_of(app);
+            e.interact = Interact::Drawing { start: Pt::new(300.0, 200.0) };
+            e.draft = e.make_draft(Tool::Rect, Pt::new(300.0, 200.0), Pt::new(420.0, 260.0));
+        });
+        small(f, "draft");
+        assert_dirty_covers(&mut app, "draft grows", |app| {
+            let e = edit_of(app);
+            e.draft = e.make_draft(Tool::Rect, Pt::new(300.0, 200.0), Pt::new(520.0, 330.0));
+        });
+        let f = assert_dirty_covers(&mut app, "commit", |app| end_interaction(edit_of(app)));
+        small(f, "commit");
+        assert_dirty_covers(&mut app, "pixelate commit", |app| {
+            edit_of(app).commit_object(Obj::Pixelate { r: FRect { x: 150.0, y: 100.0, w: 260.0, h: 200.0 }, cell: 12.0 });
+        });
+        let f = assert_dirty_covers(&mut app, "undo", |app| edit_of(app).undo());
+        small(f, "undo");
+        assert_dirty_covers(&mut app, "undo again", |app| edit_of(app).undo());
+        assert_dirty_covers(&mut app, "redo", |app| edit_of(app).redo());
+        assert_dirty_covers(&mut app, "text draft", |app| {
+            let e = edit_of(app);
+            e.tool = Some(Tool::Text);
+            e.text = Some(TextDraft { pos: Pt::new(500.0, 400.0), text: "Hi".into(), caret: 2, at: Instant::now() });
+        });
+        let f = assert_dirty_covers(&mut app, "caret blink", |app| {
+            edit_of(app).text.as_mut().unwrap().at = Instant::now() - Duration::from_millis(600);
+        });
+        small(f, "caret");
+        assert_dirty_covers(&mut app, "typing", |app| {
+            let td = edit_of(app).text.as_mut().unwrap();
+            td.text.push_str(" there");
+            td.caret = td.text.len();
+            td.at = Instant::now();
+        });
+        assert_dirty_covers(&mut app, "fractional sel", |app| {
+            edit_of(app).sel = Some(FRect { x: 240.5, y: 140.0, w: 960.0, h: 540.0 });
+        });
+
+        // No selection yet: hint, then the first selection appears.
+        let mut app = preview_app(theme::DARK, None);
+        settled(&mut app);
+        assert_dirty_covers(&mut app, "first selection", |app| {
+            let e = edit_of(app);
+            e.interact = Interact::NewSel { anchor: Pt::new(100.0, 100.0), moved: true };
+            e.sel = Some(FRect { x: 100.0, y: 100.0, w: 50.0, h: 40.0 });
+        });
+        assert_dirty_covers(&mut app, "hint fades", snap_all);
+        let f = assert_dirty_covers(&mut app, "sel grows", |app| {
+            edit_of(app).sel = Some(FRect { x: 100.0, y: 100.0, w: 90.0, h: 70.0 });
+        });
+        small(f, "sel grows");
+        assert_dirty_covers(&mut app, "dim fade", |app| edit_of(app).mo.dim = mid(1.0));
+    }
+
+    /// Every pixel the chrome and draft change over the bare backdrop lies
+    /// inside `chrome_rects`.
+    #[test]
+    fn chrome_rects_bound_the_chrome() {
+        for (name, mut app) in tiling_states() {
+            let want = settled(&mut app);
+            let e = edit_of(&mut app);
+            let sc = e.scene.as_ref().unwrap();
+            let size = sc.size;
+            let mut bg = PixBuf::new(size.0, size.1);
+            let bd = PixBufBackdrop { img: e.composed(), dim: e.th.dim };
+            compose::backdrop_rect(sc.sel, size, sc.dim_alpha, compose::PxRect::image(size), &bd, bg.as_raw_mut(), Order::Rgba);
+            let rects = e.chrome_rects();
+            for y in 0..size.1 {
+                for x in 0..size.0 {
+                    if bg.get_pixel(x, y) != want.get_pixel(x, y) {
+                        assert!(rects.iter().any(|r| r.contains_px(x as i32, y as i32)), "{name}: ({x}, {y})");
+                    }
+                }
+            }
+        }
     }
 
     /// Release-mode frame cost at 5120x1440 (states A-D of the perf report).
