@@ -358,11 +358,16 @@ fn session_mixes_audio_continuously() {
     let mut run = setup("audio", RecFormat::Mp4, 30);
     let q = Arc::new(Mutex::new(Vec::new()));
     let s = run.start(vec![Box::new(FeedMic(q.clone()))], Opts { enc_audio: true, ..Opts::default() });
-    for k in 1..=5 {
-        q.lock().unwrap().extend(std::iter::repeat_n(0.1f32, 4800));
+    // 100 ms of input read at each 100 ms of clock, from 0 (each read is
+    // waited for, so the first plays from 0, where it was read).
+    for k in 0..=5 {
         run.time.set_ms(k * 100);
+        if k < 5 {
+            q.lock().unwrap().extend(std::iter::repeat_n(0.1f32, 4800));
+            wait_until("the input read", || q.lock().unwrap().is_empty());
+        }
         // Mixed up to 100 ms behind the clock.
-        let want = (k as usize - 1) * 4800;
+        let want = (k as usize).saturating_sub(1) * 4800;
         wait_until("audio behind the clock", || run.log.lock().unwrap().audio_frames() == want);
     }
     s.stop().unwrap();
@@ -390,6 +395,7 @@ fn session_pause_flushes_audio_and_skips_what_came_while_paused() {
     let s = run.start(vec![Box::new(FeedMic(q.clone()))], opts);
     let frames = |log: &Arc<Mutex<Log>>| log.lock().unwrap().audio_frames();
     q.lock().unwrap().extend(std::iter::repeat_n(0.1f32, 3 * 4800));
+    wait_until("the input read at 0", || q.lock().unwrap().is_empty());
     run.time.set_ms(300);
     wait_until("audio to 200 ms", || frames(&run.log) == 9600);
     // The encode thread takes a frame and is held inside push_video, while
@@ -401,9 +407,12 @@ fn session_pause_flushes_audio_and_skips_what_came_while_paused() {
     run.time.set_ms(2000);
     s.resume();
     drop(release_tx);
-    // The pause is seen: audio up to it, then what came while paused is dropped.
+    // The pause is seen: audio up to it, then what came while paused is
+    // dropped (before that audio is pushed, so nothing queued below is).
     wait_until("audio to the pause", || frames(&run.log) == 14_400);
+    // Read at the resume (clock 300 ms), it plays from there.
     q.lock().unwrap().extend(std::iter::repeat_n(0.2f32, 4800));
+    wait_until("the input read after the resume", || q.lock().unwrap().is_empty());
     run.time.set_ms(2100);
     s.stop().unwrap();
     let log = run.log.lock().unwrap();

@@ -120,8 +120,9 @@ pub trait FrameSource: Send {
 ///
 /// A source may have gaps: it can deliver nothing for a while (WASAPI
 /// loopback sends no packets while nothing plays). The mixer treats a gap
-/// as silence and plays what comes after it without delay; samples are
-/// assumed to arrive in step with the clock otherwise.
+/// as silence and plays what comes after it from the time it was read;
+/// samples are assumed to arrive in step with the clock otherwise (see
+/// [`mix`] for the timing).
 pub trait AudioSource: Send {
     fn rate(&self) -> u32;
     fn channels(&self) -> u16;
@@ -365,7 +366,6 @@ enum Ctl {
 /// Audio is mixed this far behind the clock so sources that deliver in
 /// bursts (every 10-20 ms) are not cut short; on pause and stop the mixer
 /// waits up to this long for the input to catch up before the final pull.
-/// It is also the most a source may owe the mixer after an underrun.
 const AUDIO_LAG: Duration = Duration::from_millis(100);
 /// How often the encode thread wakes without frames (to pull audio).
 const ENCODE_TICK: Duration = Duration::from_millis(10);
@@ -434,6 +434,8 @@ impl Session {
         let capture = match capture {
             Ok(h) => h,
             Err(e) => {
+                // The encoder holds `.part` open (Windows cannot remove an open file).
+                drop(encoder);
                 let _ = std::fs::remove_file(&part);
                 return Err(anyhow::Error::new(e).context("start the capture thread"));
             }
@@ -448,7 +450,8 @@ impl Session {
         let encode = match encode {
             Ok(h) => h,
             Err(e) => {
-                // Capture already runs: stop it before giving up.
+                // The failed spawn dropped its closure, and the encoder with
+                // it. Capture already runs: stop it before giving up.
                 let _ = ctl.send(Ctl::Stop);
                 queue.close();
                 let _ = capture.join();
@@ -555,6 +558,12 @@ fn capture_loop(
     queue: &FrameQueue,
     rx: &mpsc::Receiver<Ctl>,
 ) {
+    // Pacing (`tick`, the deadline given to the source) is real time,
+    // `Instant::now`; the session's `time` only stamps frames. The session
+    // tests depend on this: their stepped source does not keep to the
+    // deadlines (a frame comes when the test sends a step, and a step that
+    // misses one tick is taken on a later one), and every frame is stamped
+    // with the test's clock however long the real wait was.
     let mut paused = false;
     let mut tick = Instant::now();
     'run: while !queue.is_closed() {
@@ -621,17 +630,25 @@ fn encode_loop(
                 let c = *lock_clock(clock);
                 if c.pauses() != pauses {
                     // Paused since the last look (maybe resumed already):
-                    // everything up to the pause, then drop what came after.
+                    // everything up to the pause, then drop what came
+                    // after. The discard comes before the push, so input
+                    // read after the push is never dropped.
                     pauses = c.pauses();
-                    flush_mixed(enc.as_mut(), m, c.last_pause())?;
+                    let (ts, pcm) = flush(m, c.last_pause());
                     m.discard();
+                    push_pcm(enc.as_mut(), &pcm, ts)?;
                 }
+                let now = c.now_at(time());
                 if closed {
-                    flush_mixed(enc.as_mut(), m, c.now_at(time()))?;
+                    let (ts, pcm) = flush(m, now);
+                    push_pcm(enc.as_mut(), &pcm, ts)?;
                 } else if c.is_paused() {
                     m.discard(); // sound while paused is not recorded
                 } else {
-                    push_mixed(enc.as_mut(), m, c.now_at(time()).saturating_sub(AUDIO_LAG))?;
+                    m.feed(now);
+                    let ts = m.position();
+                    let pcm = m.pull(now.saturating_sub(AUDIO_LAG));
+                    push_pcm(enc.as_mut(), &pcm, ts)?;
                 }
             }
             if closed {
@@ -647,26 +664,31 @@ fn encode_loop(
     (err, enc.finish())
 }
 
-fn push_mixed(enc: &mut dyn VideoEncoder, m: &mut Mixer, until: Duration) -> Result<()> {
-    let ts = m.position();
-    let pcm = m.pull(until);
-    if pcm.is_empty() { Ok(()) } else { enc.push_audio(&pcm, ts) }
+fn push_pcm(enc: &mut dyn VideoEncoder, pcm: &[f32], ts: Duration) -> Result<()> {
+    if pcm.is_empty() { Ok(()) } else { enc.push_audio(pcm, ts) }
 }
 
-/// Everything up to `until` (a pause or the stop): up to `until - lag`
-/// at once, then wait at most one lag for the input to reach `until`, so
-/// the tail is not cut off by sources that deliver late.
-fn flush_mixed(enc: &mut dyn VideoEncoder, m: &mut Mixer, until: Duration) -> Result<()> {
-    push_mixed(enc, m, until.saturating_sub(AUDIO_LAG))?;
+/// The mixed audio up to `until` (a pause or the stop), as its start time
+/// and samples: up to `until - lag` at once, then, waiting at most one lag
+/// (real time) for the input to reach `until`, the rest, so the tail is not
+/// cut off by sources that deliver late.
+///
+/// Only sources still delivering are waited for. One that delivered nothing
+/// it had not already played by `until - lag` (it ran dry, e.g. a silent
+/// loopback) is in a gap, and [`Mixer::covered`] skips it: anything it sends
+/// now would start at its arrival, which is not before `until`. With only
+/// such sources there is no wait at all.
+fn flush(m: &mut Mixer, until: Duration) -> (Duration, Vec<f32>) {
+    let ts = m.position();
+    m.feed(until);
+    let mut pcm = m.pull(until.saturating_sub(AUDIO_LAG));
     let give_up = Instant::now() + AUDIO_LAG;
-    loop {
-        m.feed();
-        if m.covered(until) || Instant::now() >= give_up {
-            break;
-        }
+    while !m.covered(until) && Instant::now() < give_up {
         std::thread::sleep(Duration::from_millis(5));
+        m.feed(until);
     }
-    push_mixed(enc, m, until)
+    pcm.extend(m.pull(until));
+    (ts, pcm)
 }
 
 #[cfg(test)]
