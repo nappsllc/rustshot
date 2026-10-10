@@ -89,6 +89,14 @@
 - [ ] Manual/e2e check (Windows): a portable copy in a temp dir updated from a local fixture file (inject the file directly into `apply`, no network) ends running the new binary; kill only that PID.
 - [ ] Checks; commit.
 
+### Task 4b: Size — bake the font at build time
+Baseline (cargo bloat, 983ef2e): ttf_parser ~69.5 KB + ab_glyph ~4.4 KB + ab_glyph_rasterizer ~5.4 KB of .text. User decision: only this item; keep `anyhow` and float formatting as they are.
+**Files:** `build.rs`, `src/fonts.rs`, callers of `ab_glyph` (grep), `Cargo.toml` (move `ab_glyph`/`ttf-parser` to `[build-dependencies]` only), `THIRD_PARTY_NOTICES.md` (crate table: build-only).
+- [ ] build.rs parses the embedded Inter Medium subset and writes `$OUT_DIR/font_baked.rs`: per glyph (codepoint, advance, outline as quadratic/line segments in font units, i16), kerning pairs, ascender/descender/line gap, units-per-em. Compact: no per-glyph allocation at runtime, data in `static` arrays.
+- [ ] Runtime text rendering rasterises the baked outlines with the existing anti-aliased path code (the icon rasteriser in `raster.rs`/`icon_path.rs`, flattening quadratics) with the same metrics, hinting-free like today.
+- [ ] Tests: text measurement (advance widths, kerning) equals the previous ab_glyph values for the whole subset at sizes 11–20 px × scales 1, 1.25, 1.5, 2; rendered glyph coverage within ±8/255 per pixel of the previous output for a sample string (store reference renders generated with the old code before removing it); preview PNGs byte-identical or within that tolerance — view them.
+- [ ] Release exe size before/after (expect −70 KB or more); report.
+
 ### Task 5: Windowed mode in `wind`
 **Files:** `src/wind.rs`, `src/wind_win.rs`, `src/wind_linux.rs`, `src/wind_macos.rs`.
 
