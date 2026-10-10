@@ -35,6 +35,13 @@ impl C4 {
     }
 }
 
+/// `x / 255` for `x <= 255 * 255` without a divide (the size-optimised
+/// release profile keeps real `div` instructions for `/ 255`).
+#[inline(always)]
+fn div255(x: u32) -> u32 {
+    (x + 1 + (x >> 8)) >> 8
+}
+
 /// Borrowed drawing surface over an RGBA8 buffer.
 pub struct Fb<'a> {
     pub d: &'a mut [u8],
@@ -80,10 +87,10 @@ impl<'a> Fb<'a> {
             self.d[i + 2] as u32,
             self.d[i + 3] as u32,
         );
-        self.d[i] = ((c.r as u32 * a + d0 * ia) / 255) as u8;
-        self.d[i + 1] = ((c.g as u32 * a + d1 * ia) / 255) as u8;
-        self.d[i + 2] = ((c.b as u32 * a + d2 * ia) / 255) as u8;
-        self.d[i + 3] = (a + (d3 * ia) / 255).min(255) as u8;
+        self.d[i] = div255(c.r as u32 * a + d0 * ia) as u8;
+        self.d[i + 1] = div255(c.g as u32 * a + d1 * ia) as u8;
+        self.d[i + 2] = div255(c.b as u32 * a + d2 * ia) as u8;
+        self.d[i + 3] = (a + div255(d3 * ia)).min(255) as u8;
     }
 
     pub fn fill_rect(&mut self, x0: i32, y0: i32, w: i32, h: i32, c: C4) {
@@ -110,8 +117,20 @@ impl<'a> Fb<'a> {
         let ye = ((y1 + half + 1.0).ceil() as i32).min(fh);
         let xs = (x0 - half - 1.0).floor().max(0.0) as i32;
         let xe = ((x1 + half + 1.0).ceil() as i32).min(self.stride as i32);
+        // Coverage is zero farther than `half + 1` from the outline, so only
+        // the four border strips are visited, never the hollow interior:
+        // rows near the top/bottom edge span the full width; other rows
+        // visit just the columns near the left/right edges.
+        let band = |e: f32| ((e - half - 1.0).floor() as i32, (e + half + 1.0).ceil() as i32);
+        let (top, bottom, left, right) = (band(y0), band(y1), band(x0), band(x1));
+        let in_band = |v: i32, b: (i32, i32)| v >= b.0 && v < b.1;
         for y in ys..ye {
-            for x in xs..xe {
+            let cols = if in_band(y, top) || in_band(y, bottom) || left.1 >= right.0 {
+                [(xs, xe), (xe, xe)]
+            } else {
+                [(xs, left.1.min(xe)), (right.0.max(xs), xe)]
+            };
+            for x in cols.into_iter().flat_map(|(a, b)| a..b) {
                 let cx = x as f32 + 0.5;
                 let cy = y as f32 + 0.5;
                 // Signed distance to the rectangle (negative inside).
@@ -312,6 +331,13 @@ mod tests {
     }
 
     #[test]
+    fn div255_is_exact() {
+        for x in 0..=255 * 255 {
+            assert_eq!(div255(x), x / 255, "{x}");
+        }
+    }
+
+    #[test]
     fn blend_solid_and_alpha() {
         let mut fb = vec![100u8; 4 * 4];
         {
@@ -368,6 +394,53 @@ mod tests {
         assert_eq!(at(10, 4), at(10, 15), "top vs bottom outer half");
         assert!(at(4, 10) > 60, "outer half drawn: {}", at(4, 10));
         assert_eq!(at(10, 10), 0, "hollow");
+    }
+
+    #[test]
+    fn stroke_rect_leaves_large_interior_untouched() {
+        let (w, h) = (300usize, 200usize);
+        let mut d = vec![7u8; w * h * 4];
+        let mut f = Fb::new(&mut d, w);
+        f.stroke_rect(20.5, 10.25, 250.0, 170.0, 3.0, C4::new(255, 255, 255, 200));
+        let at = |x: usize, y: usize| d[(y * w + x) * 4];
+        for y in 0..h {
+            for x in 0..w {
+                // More than half + 1 px from the outline: never written.
+                let inside = (25..266).contains(&x) && (15..176).contains(&y);
+                let outside = !(17..275).contains(&x) || !(7..184).contains(&y);
+                if inside || outside {
+                    assert_eq!(at(x, y), 7, "touched at ({x}, {y})");
+                }
+            }
+        }
+        assert!(at(20, 100) > 100 && at(270, 100) > 100 && at(150, 10) > 100 && at(150, 180) > 100);
+    }
+
+    /// The strip walk paints exactly what a full bounding-box sweep paints.
+    #[test]
+    fn stroke_rect_matches_full_sweep() {
+        for &(x0, y0, rw, rh, t) in &[(5.0, 5.0, 10.0, 10.0, 1.0), (3.3, 4.7, 40.2, 2.0, 2.5), (10.5, 8.0, 60.0, 30.0, 4.0)] {
+            let (w, h) = (90usize, 50usize);
+            let mut a = vec![0u8; w * h * 4];
+            Fb::new(&mut a, w).stroke_rect(x0, y0, rw, rh, t, C4::new(200, 100, 50, 180));
+            let mut b = vec![0u8; w * h * 4];
+            let half = t / 2.0;
+            for y in 0..h {
+                for x in 0..w {
+                    let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
+                    let qx = (cx - x0 - rw / 2.0).abs() - rw / 2.0;
+                    let qy = (cy - y0 - rh / 2.0).abs() - rh / 2.0;
+                    let (dx, dy) = (qx.max(0.0), qy.max(0.0));
+                    let sdf = (dx * dx + dy * dy).sqrt() + qx.max(qy).min(0.0);
+                    let cov = (half + 0.5 - sdf.abs()).clamp(0.0, 1.0);
+                    if cov > 0.0 {
+                        let c = C4::new(200, 100, 50, ((180.0 * cov) as u32).min(255) as u8);
+                        Fb::new(&mut b, w).blend_px(x, y, c);
+                    }
+                }
+            }
+            assert_eq!(a, b, "rect {x0},{y0} {rw}x{rh} t{t}");
+        }
     }
 
     #[test]

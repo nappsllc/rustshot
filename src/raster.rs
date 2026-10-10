@@ -206,8 +206,19 @@ impl<'a> Surf<'a> {
             w,
             h,
         );
+        // Interior pixels well inside the outline (q < lim on both axes:
+        // d <= -band - 0.5, zero coverage) are skipped, so a large shape
+        // (a rect being dragged out) costs its border, not its area.
+        let lim = 0.0f32.min(rad - band) - 0.5;
         for y in y0..y1 {
-            for x in x0..x1 {
+            let qy_row = (y as f32 + 0.5 - cy).abs() - hy;
+            let (skip0, skip1) = if qy_row < lim {
+                // |x + 0.5 - cx| - hx < lim for every x in [skip0, skip1).
+                (((cx - hx - lim).ceil() as i32).max(x0), ((cx + hx + lim).floor() as i32).min(x1))
+            } else {
+                (x1, x1)
+            };
+            for x in (x0..skip0.min(x1)).chain(skip1.max(skip0).max(x0)..x1) {
                 let px = (x as f32 + 0.5 - cx).abs();
                 let py = (y as f32 + 0.5 - cy).abs();
                 let qx = px - hx;
@@ -362,6 +373,41 @@ mod tests {
         let ring = px(&d, 30, 15, 5);
         assert!(ring[2] > 150, "top of ring covered: {ring:?}");
         assert_eq!(px(&d, 30, 1, 1), [0, 0, 0, 0], "outside untouched");
+    }
+
+    /// Skipping the hollow interior paints exactly what a full sweep does.
+    #[test]
+    fn round_rect_stroke_matches_full_sweep() {
+        let c = C4::new(10, 200, 90, 220);
+        for &(r, rad, width) in &[
+            (FRect { x: 5.0, y: 5.0, w: 20.0, h: 20.0 }, 3.0, 2.0),
+            (FRect { x: 3.4, y: 6.6, w: 110.3, h: 70.1 }, 8.0, 3.0),
+            (FRect { x: 10.0, y: 10.0, w: 90.0, h: 4.0 }, 6.0, 5.0),
+            (FRect { x: 2.0, y: 2.0, w: 100.0, h: 60.0 }, 0.0, 1.0),
+        ] {
+            let (w, h) = (120u32, 90u32);
+            let mut a = vec![0u8; (w * h * 4) as usize];
+            Surf::new(&mut a, w, h).stroke_round_rect(r, rad, width, c, Blend::Normal);
+            let mut b = vec![0u8; (w * h * 4) as usize];
+            let mut s = Surf::new(&mut b, w, h);
+            let rad = rad.min(r.w / 2.0).min(r.h / 2.0).max(0.0);
+            let band = width.max(0.5) / 2.0 + 0.5;
+            let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+            let (hx, hy) = ((r.w / 2.0 - rad).max(0.0), (r.h / 2.0 - rad).max(0.0));
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let qx = (x as f32 + 0.5 - cx).abs() - hx;
+                    let qy = (y as f32 + 0.5 - cy).abs() - hy;
+                    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+                    let d = outside + qx.max(qy).min(0.0) - rad;
+                    let cov = (band - d.abs()).clamp(0.0, 1.0);
+                    if cov > 0.0 {
+                        s.blend_px(x, y, c, cov, Blend::Normal);
+                    }
+                }
+            }
+            assert!(a == b, "{r:?} rad {rad} width {width}");
+        }
     }
 
     #[test]
