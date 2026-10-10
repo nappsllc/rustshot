@@ -43,7 +43,7 @@ fn send(ev: HotEvent) {
 pub fn spawn(tx: Sender<HotEvent>) {
     *TX.lock().unwrap() = Some(tx);
     unsafe {
-        if let Ok(hwnd) = FindWindowW(w!("rustshot_tray"), PCWSTR::null()) {
+        if let Ok(hwnd) = FindWindowW(crate::instance::tray_class(), PCWSTR::null()) {
             let _ = PostMessageW(Some(hwnd), WM_TRAY_INIT, WPARAM(0), LPARAM(0));
         }
     }
@@ -326,7 +326,7 @@ mod tests {
 
     fn icon_exists() -> bool {
         unsafe {
-            let hwnd = FindWindowW(w!("rustshot_tray"), PCWSTR::null()).unwrap();
+            let hwnd = FindWindowW(crate::instance::tray_class(), PCWSTR::null()).unwrap();
             let mut nid = base_data(hwnd);
             nid.uFlags = NIF_TIP;
             copy_wide(&mut nid.szTip, "rustshot");
@@ -353,6 +353,6 @@ mod tests {
         assert!(icon_exists(), "icon should be present after spawn");
         drop(g);
         // The window is gone after the guard drops, which also removed the icon.
-        assert!(unsafe { FindWindowW(w!("rustshot_tray"), PCWSTR::null()) }.is_err());
+        assert!(unsafe { FindWindowW(crate::instance::tray_class(), PCWSTR::null()) }.is_err());
     }
 }

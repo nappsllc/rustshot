@@ -14,6 +14,8 @@ mod instance;
 mod keymap;
 mod objects;
 mod pixbuf;
+#[cfg(windows)]
+mod proc_win;
 mod raster;
 mod sha256;
 mod theme;
@@ -22,6 +24,7 @@ mod tray;
 mod tray_win;
 mod uifb;
 mod update;
+mod update_install;
 mod wind;
 
 use anyhow::{anyhow, Result};
@@ -520,6 +523,8 @@ fn run() -> Result<()> {
         Cmd::Daemon => {
             // `_solo` keeps a Solo daemon's lock file locked until the process ends.
             let mut _solo = None;
+            // After a portable update: let the old daemon exit first (bounded).
+            update_install::wait_for_previous();
             let guard = match instance::acquire_or_signal() {
                 instance::Instance::Signalled => exit(0),
                 instance::Instance::Primary(g) => Some(g),
@@ -528,6 +533,7 @@ fn run() -> Result<()> {
                     None
                 }
             };
+            update_install::cleanup_previous();
             let cfg = config::load();
             let exit_code = Arc::new(AtomicI32::new(0));
             let slot: UploadSlot = Arc::new(Mutex::new(None));

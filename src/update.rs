@@ -811,17 +811,19 @@ pub fn check_now() -> Result<Option<Release>, String> {
 
 /// Open a URL in the default browser (best effort).
 pub fn open_url(url: &str) {
+    #[cfg(not(windows))]
     use std::process::Command;
     if !is_safe_release_url(url) {
         eprintln!("refusing to open an unexpected URL");
         return;
     }
     #[cfg(windows)]
-    let mut cmd = {
-        let mut c = Command::new("rundll32");
-        c.args(["url.dll,FileProtocolHandler", url]);
-        c
-    };
+    {
+        use std::ffi::OsStr;
+        if let Some(exe) = crate::proc_win::system_exe("rundll32.exe") {
+            let _ = crate::proc_win::spawn_detached(&exe, &[OsStr::new("url.dll,FileProtocolHandler"), OsStr::new(url)]);
+        }
+    }
     #[cfg(target_os = "macos")]
     let mut cmd = {
         let mut c = Command::new("open");
@@ -834,6 +836,7 @@ pub fn open_url(url: &str) {
         c.arg(url);
         c
     };
+    #[cfg(not(windows))]
     let _ = cmd.spawn();
 }
 

@@ -13,6 +13,7 @@ pub fn open_config() {
 
 /// Open a local file with the OS default handler (never a URL).
 pub fn open_path(path: &Path) {
+    #[cfg(not(windows))]
     use std::process::Command;
     #[cfg(windows)]
     {
@@ -26,7 +27,9 @@ pub fn open_path(path: &Path) {
         };
         if r.0 as isize <= 32 {
             // No association (e.g. for .toml): fall back to Notepad.
-            let _ = Command::new("notepad.exe").arg(path).spawn();
+            if let Some(exe) = crate::proc_win::system_exe("notepad.exe") {
+                let _ = crate::proc_win::spawn_detached(&exe, &[path.as_os_str()]);
+            }
         }
     }
     #[cfg(target_os = "macos")]
