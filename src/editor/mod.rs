@@ -287,6 +287,26 @@ impl App {
         }
     }
 
+    /// Timer tick: poll, then report whether the screen needs a new frame
+    /// (an animation runs, the caret blinked, a toast came or went, the
+    /// state switched). Idle ticks cost no frame.
+    fn tick(&mut self) -> bool {
+        let sig = |a: &App| {
+            let edit_notice = matches!(&a.st, State::Edit(e) if e.notice.is_some());
+            (std::mem::discriminant(&a.st), edit_notice, a.notice.is_some())
+        };
+        let before = sig(self);
+        self.pump();
+        let changed = sig(self) != before;
+        let State::Edit(edit) = &self.st else { return changed };
+        let repaint = changed || stale(edit, self.notice.as_ref(), Instant::now());
+        if !repaint {
+            // No frame runs to re-evaluate the cadence: drop to idle.
+            wind::set_fast_timer(self.hwnd, false);
+        }
+        repaint
+    }
+
     /// Take the edit state out of `self`, hand it to `f`, then finish or
     /// put it back.
     fn edit_tx<F: FnOnce(&mut Self, &mut Edit)>(&mut self, f: F) {
@@ -338,7 +358,9 @@ impl App {
             r.clamp_to(shot.size.0 as f32, shot.size.1 as f32);
             r
         });
-        let base = shot.image.clone();
+        // The capture is held once, as `base`; `shot` keeps only geometry.
+        let mut shot = shot;
+        let base = std::mem::take(&mut shot.image);
         let composed = base.clone();
         let sel = initial_sel.filter(|r| !r.is_trivial());
         let accept_now = accept_on_select && sel.is_some();
@@ -348,6 +370,9 @@ impl App {
             shot,
             base,
             composed,
+            frame: PixBuf::default(),
+            caret_drawn: None,
+            area_drawn: None,
             objects: Vec::new(),
             hist: vec![Vec::new()],
             hi: 0,
@@ -933,7 +958,7 @@ impl Driver for App {
         self.pump();
     }
 
-    fn on_event(&mut self, ev: Ev) {
+    fn on_event(&mut self, ev: Ev) -> bool {
         match ev {
             Ev::Move { x, y } => {
                 self.mouse = (x, y);
@@ -942,10 +967,15 @@ impl Driver for App {
                 if dragging {
                     self.pointer_move(x, y);
                     wind::invalidate(self.hwnd);
-                } else if let State::Edit(e) = &mut self.st
-                    && e.track_hover(Pt::new(x as f32, y as f32))
-                {
-                    wind::invalidate(self.hwnd);
+                } else if let State::Edit(e) = &mut self.st {
+                    let p = Pt::new(x as f32, y as f32);
+                    // Chrome follows the monitor under the pointer when
+                    // nothing is selected (hint, toast placement).
+                    let area_moved =
+                        e.area_drawn.is_some_and(|a| a != pick_area(&e.shot.monitors, e.sel, p));
+                    if e.track_hover(p) || area_moved {
+                        wind::invalidate(self.hwnd);
+                    }
                 }
             }
             Ev::Down { x, y } => {
@@ -966,18 +996,22 @@ impl Driver for App {
                 }
             }
             Ev::Char(c) => self.char_input(c),
-            Ev::Timer => {}
+            Ev::Timer => return self.tick(),
         }
         self.pump();
+        // Moves call `invalidate` themselves, only when something changed.
+        !matches!(ev, Ev::Move { .. })
     }
 
-    fn frame(&mut self) -> Option<PixBuf> {
+    fn frame(&mut self) -> Option<&PixBuf> {
         let State::Edit(edit) = &mut self.st else { return None };
+        let edit: &mut Edit = edit;
         if edit.dirty {
             edit.rebuild();
         }
         let (ww, wh) = (edit.shot.size.0 as f32, edit.shot.size.1 as f32);
         let area = pick_area(&edit.shot.monitors, edit.sel, Pt::new(self.mouse.0 as f32, self.mouse.1 as f32));
+        edit.area_drawn = Some(area);
         let s = edit.ui_scale();
         let colors = palette_colors(&edit.cfg);
         edit.toolbar = edit.sel.map(|sel| {
@@ -1007,19 +1041,31 @@ impl Driver for App {
         let hint_on = edit.sel.is_none() && !interacting;
         edit.mo.hint.set(if hint_on { 1.0 } else { 0.0 }, if hint_on { 120 } else { 100 }, now);
 
-        // Compose: base + objects, themed dim outside the selection, draft.
-        let mut img = edit.composed.clone();
+        // Compose: base + objects, themed dim outside the selection, draft,
+        // in one pass into the persistent display buffer (no per-frame copy).
         let dim_a = edit.th.dim_alpha(edit.cfg.contrast_opacity) as f32 * edit.mo.dim.value(now);
         let dim = edit.th.dim.with_alpha(dim_a.round() as u8);
-        match edit.sel {
-            None => dim_rect(&mut img, 0.0, 0.0, ww, wh, dim),
+        let full = [(0.0, 0.0, ww, wh)];
+        let around;
+        let rects: &[(f32, f32, f32, f32)] = match edit.sel {
+            None => &full,
             Some(sr) => {
-                dim_rect(&mut img, 0.0, 0.0, ww, sr.y, dim);
-                dim_rect(&mut img, 0.0, sr.y1(), ww, wh - sr.y1(), dim);
-                dim_rect(&mut img, 0.0, sr.y, sr.x, sr.h, dim);
-                dim_rect(&mut img, sr.x1(), sr.y, ww - sr.x1(), sr.h, dim);
+                around = [
+                    (0.0, 0.0, ww, sr.y),
+                    (0.0, sr.y1(), ww, wh - sr.y1()),
+                    (0.0, sr.y, sr.x, sr.h),
+                    (sr.x1(), sr.y, ww - sr.x1(), sr.h),
+                ];
+                &around
             }
+        };
+        // Borrowed out of `edit` while drawing (chrome reads `edit`), put
+        // back below; allocated once per capture.
+        let mut img = std::mem::take(&mut edit.frame);
+        if img.dimensions() != edit.composed.dimensions() {
+            img = PixBuf::new(edit.composed.width(), edit.composed.height());
         }
+        compose_dimmed(&mut img, &edit.composed, rects, dim);
         if let Some(d) = &edit.draft {
             d.render(&mut img, edit.font.as_ref());
         }
@@ -1044,7 +1090,7 @@ impl Driver for App {
             if let Some(font) = edit.font.as_ref() {
                 let px = edit.sizes.font;
                 f.draw_text(font, px, &td.text, td.pos.x, td.pos.y, edit.color);
-                if (td.at.elapsed().as_millis() / 530).is_multiple_of(2) {
+                if caret_on(td) {
                     let before = td.text.get(..td.caret).unwrap_or("");
                     let cx = td.pos.x + text_width(font, px, before);
                     f.fill_rect(
@@ -1090,10 +1136,10 @@ impl Driver for App {
         if kh > 0.01 {
             chrome::hint(&mut f, &ui, area, kh);
         }
-        let tip_pending = edit.hover.is_some() && edit.hover_at.elapsed() < Duration::from_millis(500);
-        let toast_moving = edit.notice.as_ref().or(self.notice.as_ref()).is_some_and(|t| t.animating(now));
-        wind::set_fast_timer(self.hwnd, edit.mo.active(now) || tip_pending || toast_moving);
-        Some(img)
+        edit.caret_drawn = edit.text.as_ref().map(caret_on);
+        wind::set_fast_timer(self.hwnd, animating(edit, self.notice.as_ref(), now));
+        edit.frame = img;
+        Some(&edit.frame)
     }
 
     fn cursor(&self) -> Cursor {
@@ -1226,8 +1272,17 @@ struct TextDraft {
 struct Edit {
     mo: Motion,
     shot: Shot,
+    /// The capture (moved out of `shot.image`, which stays empty).
     base: PixBuf,
+    /// `base` with the committed objects baked in.
     composed: PixBuf,
+    /// Display buffer `frame()` composes into; reused across frames,
+    /// allocated on the first frame of a capture.
+    frame: PixBuf,
+    /// Caret blink phase in the last frame (None: no text draft).
+    caret_drawn: Option<bool>,
+    /// Monitor area chrome was placed in by the last frame.
+    area_drawn: Option<FRect>,
     objects: Vec<Obj>,
     hist: Vec<Vec<Obj>>,
     hi: usize,
@@ -1265,11 +1320,11 @@ const CLICK_PX: f32 = 2.5; // movement below this counts as a click
 
 impl Edit {
     fn rebuild(&mut self) {
-        let mut pm = self.base.clone();
+        // In place: no fourth full-size buffer while re-baking.
+        self.composed.as_raw_mut().copy_from_slice(self.base.as_raw());
         for o in &self.objects {
-            o.render(&mut pm, self.font.as_ref());
+            o.render(&mut self.composed, self.font.as_ref());
         }
-        self.composed = pm;
         self.dirty = false;
     }
 
@@ -1596,26 +1651,154 @@ fn next_boundary(s: &str, i: usize) -> usize {
     s[i..].char_indices().nth(1).map(|(k, _)| i + k).unwrap_or(s.len())
 }
 
-/// Blend a rect of the (opaque) image toward `c` by `c.a`.
-fn dim_rect(img: &mut PixBuf, x: f32, y: f32, w: f32, h: f32, c: C4) {
-    if w <= 0.0 || h <= 0.0 || c.a == 0 {
+/// Something on screen moves by itself: a tween, the pending tooltip,
+/// a toast fading in or out.
+fn animating(edit: &Edit, app_notice: Option<&Toast>, now: Instant) -> bool {
+    let tip_pending = edit.hover.is_some() && edit.hover_at.elapsed() < Duration::from_millis(500);
+    let toast_moving = edit.notice.as_ref().or(app_notice).is_some_and(|t| t.animating(now));
+    edit.mo.active(now) || tip_pending || toast_moving
+}
+
+/// The last frame no longer matches: something animates or the caret
+/// blink phase flipped since it was drawn.
+fn stale(edit: &Edit, app_notice: Option<&Toast>, now: Instant) -> bool {
+    animating(edit, app_notice, now) || edit.text.as_ref().map(caret_on) != edit.caret_drawn
+}
+
+/// Caret blink phase: shown 530 ms, hidden 530 ms.
+fn caret_on(td: &TextDraft) -> bool {
+    (td.at.elapsed().as_millis() / 530).is_multiple_of(2)
+}
+
+/// Blends toward a dim colour by alpha `a`, two RGBA pixels per `u64`
+/// (SWAR, 16-bit lanes): per channel `(v * (255 - a) + c * a + 127) / 255`.
+/// For integer inputs that is exactly the rounding of the former per-pixel
+/// float blend (`n / 255` is never within float error of a half), so the
+/// output is bit-identical. Alpha bytes pass through. Built per alpha (the
+/// fade-in changes it every frame), which costs nothing.
+#[derive(Clone, Copy)]
+struct Dimmer {
+    k: u64,
+    add_rb: u64,
+    add_ga: u64,
+}
+
+const LANES: u64 = 0x00FF_00FF_00FF_00FF;
+const ALPHA: u64 = 0xFF00_0000_FF00_0000;
+
+impl Dimmer {
+    fn new(c: C4) -> Self {
+        let a = c.a as u64;
+        let lane = |lo: u8, hi: u8| {
+            let pair = (lo as u64 * a + 127) | ((hi as u64 * a + 127) << 16);
+            pair | (pair << 32)
+        };
+        // Lanes (little-endian bytes R G B A): R|B and G|A of two pixels.
+        Dimmer { k: 255 - a, add_rb: lane(c.r, c.b), add_ga: lane(c.g, 0) }
+    }
+
+    /// Exact `x / 255` per 16-bit lane for lane values below 65535
+    /// (ours stay below 65153).
+    #[inline(always)]
+    fn div255(x: u64) -> u64 {
+        ((x + ((x >> 8) & LANES) + 0x0001_0001_0001_0001) >> 8) & LANES
+    }
+
+    #[inline(always)]
+    fn pair(&self, v: u64) -> u64 {
+        let rb = Self::div255((v & LANES) * self.k + self.add_rb);
+        let ga = Self::div255(((v >> 8) & LANES) * self.k + self.add_ga);
+        ((rb | (ga << 8)) & !ALPHA) | (v & ALPHA)
+    }
+
+    /// `dst = src` blended `times` over (overlapping dim rects blend once
+    /// per rect; only fractional selections overlap).
+    fn run(&self, src: &[u8], dst: &mut [u8], times: i32) {
+        let (d8, dt) = dst.as_chunks_mut::<8>();
+        let (s8, st) = src.as_chunks::<8>();
+        if times == 1 {
+            for (o, i) in d8.iter_mut().zip(s8) {
+                *o = self.pair(u64::from_le_bytes(*i)).to_le_bytes();
+            }
+        } else {
+            for (o, i) in d8.iter_mut().zip(s8) {
+                let mut v = u64::from_le_bytes(*i);
+                for _ in 0..times {
+                    v = self.pair(v);
+                }
+                *o = v.to_le_bytes();
+            }
+        }
+        if let (Some(o), Some(i)) = (dt.first_chunk_mut::<4>(), st.first_chunk::<4>()) {
+            let mut v = u32::from_le_bytes(*i) as u64;
+            for _ in 0..times {
+                v = self.pair(v);
+            }
+            *o = (v as u32).to_le_bytes();
+        }
+    }
+}
+
+/// `dst = src`, blended toward `c` by `c.a` inside each `(x, y, w, h)`
+/// rect (snapped outward to whole pixels, clamped). One pass over the
+/// buffer; spans outside every rect are plain row copies, so every pixel
+/// of `dst` is written and it can be reused frame to frame.
+fn compose_dimmed(dst: &mut PixBuf, src: &PixBuf, rects: &[(f32, f32, f32, f32)], c: C4) {
+    debug_assert_eq!(dst.dimensions(), src.dimensions());
+    let (bw, bh) = (src.width() as i32, src.height() as i32);
+    let mut spans = [(0i32, 0i32, 0i32, 0i32); 4];
+    let mut n = 0;
+    if c.a != 0 {
+        for &(x, y, w, h) in rects.iter().take(spans.len()) {
+            if w <= 0.0 || h <= 0.0 {
+                continue;
+            }
+            let x0 = x.floor().max(0.0) as i32;
+            let y0 = y.floor().max(0.0) as i32;
+            let (x1, y1) = (x1_clamp(x, w, bw).min(bw), y1_clamp(y, h, bh).min(bh));
+            if x0 < x1 && y0 < y1 {
+                spans[n] = (x0, y0, x1, y1);
+                n += 1;
+            }
+        }
+    }
+    let spans = &spans[..n];
+    let (s, d) = (src.as_raw(), dst.as_raw_mut());
+    if spans.is_empty() {
+        d.copy_from_slice(s);
         return;
     }
-    let (bw, bh) = (img.width() as i32, img.height() as i32);
-    let x0 = x.floor().max(0.0) as i32;
-    let y0 = y.floor().max(0.0) as i32;
-    let x1 = x1_clamp(x, w, bw);
-    let y1 = y1_clamp(y, h, bh);
-    let a = c.a as f32 / 255.0;
-    let k = 1.0 - a;
-    let src = [c.r, c.g, c.b];
-    let data = img.as_raw_mut();
-    for y in y0.max(0)..y1.min(bh) {
-        for x in x0.max(0)..x1.min(bw) {
-            let i = ((y * bw + x) as usize) * 4;
-            for (ch, sv) in src.iter().enumerate() {
-                data[i + ch] = (data[i + ch] as f32 * k + *sv as f32 * a).round() as u8;
+    let dimmer = Dimmer::new(c);
+    let stride = bw as usize * 4;
+    for (y, (srow, drow)) in s.chunks_exact(stride).zip(d.chunks_exact_mut(stride)).enumerate() {
+        let y = y as i32;
+        // Column edges of the rects crossing this row: (x, depth delta).
+        let mut edges = [(0i32, 0i32); 9];
+        let mut m = 0;
+        for sp in spans.iter().filter(|sp| sp.1 <= y && y < sp.3) {
+            edges[m] = (sp.0, 1);
+            edges[m + 1] = (sp.2, -1);
+            m += 2;
+        }
+        if m == 0 {
+            drow.copy_from_slice(srow);
+            continue;
+        }
+        edges[m] = (bw, 0);
+        let edges = &mut edges[..m + 1];
+        edges.sort_unstable();
+        let (mut x, mut depth) = (0i32, 0i32);
+        for &(ex, de) in edges.iter() {
+            if ex > x {
+                let (a, b) = (x as usize * 4, ex as usize * 4);
+                if depth == 0 {
+                    drow[a..b].copy_from_slice(&srow[a..b]);
+                } else {
+                    dimmer.run(&srow[a..b], &mut drow[a..b], depth);
+                }
+                x = ex;
             }
+            depth += de;
         }
     }
 }
@@ -1749,12 +1932,16 @@ mod tests {
         let cfg = Config { theme: theme_name.into(), ..Config::default() };
         let font = fonts::load_system_font();
         let ui_font = fonts::ui_font().or_else(|| font.clone());
-        let base = shot.image.clone();
+        let mut shot = shot;
+        let base = std::mem::take(&mut shot.image);
         let edit = Edit {
             mo: Motion::new(Instant::now()),
             shot,
             composed: base.clone(),
             base,
+            frame: PixBuf::default(),
+            caret_drawn: None,
+            area_drawn: None,
             objects: Vec::new(),
             hist: vec![Vec::new()],
             hi: 0,
@@ -2038,5 +2225,169 @@ mod tests {
         assert_eq!((r.w, r.h), (24.0, 28.0));
         let r = text_box_rect(110.0, &td, 16.0, None, 1.0);
         assert_eq!(r.x, 86.0, "kept on screen");
+    }
+
+    #[test]
+    fn settled_editor_is_not_stale() {
+        let now = Instant::now();
+        let mut app = preview_app(theme::DARK, Some(FRect { x: 10.0, y: 10.0, w: 200.0, h: 100.0 }));
+        let e = edit_of(&mut app);
+        for t in [&mut e.mo.dim, &mut e.mo.bar, &mut e.mo.pop, &mut e.mo.hint, &mut e.mo.hover] {
+            t.snap(t.target());
+        }
+        assert!(!stale(e, None, now), "idle tick: no frame");
+        e.hover = Some(0);
+        e.hover_at = now;
+        assert!(stale(e, None, now), "tooltip pending");
+        e.hover_at = now - Duration::from_secs(1);
+        assert!(!stale(e, None, now), "tooltip settled");
+        let mut toast = Toast::new("x", ToastKind::Info);
+        assert!(stale(e, Some(&toast), now), "toast fading in");
+        toast.at = now - Duration::from_millis(500);
+        assert!(!stale(e, Some(&toast), now), "toast steady");
+        e.text = Some(TextDraft { pos: Pt::new(0.0, 0.0), text: String::new(), caret: 0, at: now });
+        assert!(stale(e, None, now), "caret never drawn");
+        e.caret_drawn = Some(true);
+        assert!(!stale(e, None, now), "same blink phase");
+        e.text.as_mut().unwrap().at = now - Duration::from_millis(600);
+        assert!(stale(e, None, now), "blink phase flipped");
+    }
+
+    /// The former per-pixel float dim, kept as the reference.
+    fn dim_rect_ref(img: &mut PixBuf, x: f32, y: f32, w: f32, h: f32, c: C4) {
+        if w <= 0.0 || h <= 0.0 || c.a == 0 {
+            return;
+        }
+        let (bw, bh) = (img.width() as i32, img.height() as i32);
+        let x0 = x.floor().max(0.0) as i32;
+        let y0 = y.floor().max(0.0) as i32;
+        let (x1, y1) = (x1_clamp(x, w, bw), y1_clamp(y, h, bh));
+        let a = c.a as f32 / 255.0;
+        let k = 1.0 - a;
+        let data = img.as_raw_mut();
+        for y in y0.max(0)..y1.min(bh) {
+            for x in x0.max(0)..x1.min(bw) {
+                let i = ((y * bw + x) as usize) * 4;
+                for (ch, sv) in [c.r, c.g, c.b].iter().enumerate() {
+                    data[i + ch] = (data[i + ch] as f32 * k + *sv as f32 * a).round() as u8;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dimmer_matches_float_blend_exhaustively() {
+        for a in 0..=255u8 {
+            for cv in 0..=255u8 {
+                let c = C4::new(cv, 255 - cv, cv / 2, a);
+                let d = Dimmer::new(c);
+                let (af, k) = (a as f32 / 255.0, 1.0 - a as f32 / 255.0);
+                for v in 0..=255u8 {
+                    let px = [v, v, v, 200, 255 - v, v, 255 - v, 9];
+                    let mut out = [0u8; 8];
+                    d.run(&px, &mut out, 1);
+                    for (j, &sv) in [c.r, c.g, c.b, 0, c.r, c.g, c.b, 0].iter().enumerate() {
+                        let want = if j % 4 == 3 { px[j] } else { (px[j] as f32 * k + sv as f32 * af).round() as u8 };
+                        assert_eq!(out[j], want, "a {a} c {c:?} v {v} byte {j}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compose_dimmed_matches_four_dim_rects() {
+        let src = synthetic_shot().image.crop(100, 80, 301, 211);
+        let (ww, wh) = (src.width() as f32, src.height() as f32);
+        let c = C4::new(8, 10, 14, 141);
+        for sr in [
+            FRect { x: 40.0, y: 30.0, w: 120.0, h: 90.0 },
+            FRect { x: 40.4, y: 30.6, w: 120.3, h: 90.2 },
+            FRect { x: -5.0, y: 0.0, w: 400.0, h: 0.5 },
+            FRect { x: 300.5, y: 210.5, w: 3.0, h: 3.0 },
+        ] {
+            let rects = [
+                (0.0, 0.0, ww, sr.y),
+                (0.0, sr.y1(), ww, wh - sr.y1()),
+                (0.0, sr.y, sr.x, sr.h),
+                (sr.x1(), sr.y, ww - sr.x1(), sr.h),
+            ];
+            let mut want = src.clone();
+            for r in rects {
+                dim_rect_ref(&mut want, r.0, r.1, r.2, r.3, c);
+            }
+            let mut got = PixBuf::from_pixel(src.width(), src.height(), [1, 2, 3, 4]);
+            compose_dimmed(&mut got, &src, &rects, c);
+            assert!(got == want, "{sr:?}");
+        }
+        let mut got = PixBuf::new(src.width(), src.height());
+        compose_dimmed(&mut got, &src, &[(0.0, 0.0, ww, wh)], c.with_alpha(0));
+        assert!(got == src, "alpha 0 copies");
+    }
+
+    /// Release-mode frame cost at 5120x1440 (states A-D of the perf report).
+    /// `cargo test --release perf_frame_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark; run in release"]
+    fn perf_frame_bench() {
+        let (w, h) = (5120u32, 1440u32);
+        let src = synthetic_shot();
+        let mut img = PixBuf::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y as usize * w as usize + x as usize) * 4;
+                let j = ((y % src.size.1) as usize * src.size.0 as usize + (x % src.size.0) as usize) * 4;
+                img.as_raw_mut()[i..i + 4].copy_from_slice(&src.image.as_raw()[j..j + 4]);
+            }
+        }
+        let shot = Shot { origin: (0, 0), size: (w, h), scale: 1.0, image: img, monitors: vec![(0, 0, w, h)] };
+        let sel = FRect { x: 1000.0, y: 200.0, w: 2000.0, h: 900.0 };
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        for (name, s, drag, pal) in [
+            ("A no sel, hint", None, false, false),
+            ("B sel 2000x900 + toolbar", Some(sel), false, false),
+            ("C dragging NewSel", Some(sel), true, false),
+            ("D palette open", Some(sel), false, true),
+        ] {
+            let mut app = preview_app_with(theme::DARK, s, Shot { image: shot.image.clone(), monitors: shot.monitors.clone(), ..shot });
+            {
+                let e = edit_of(&mut app);
+                e.palette_open = pal;
+                if drag {
+                    e.interact = Interact::NewSel { anchor: Pt::new(sel.x, sel.y), moved: true };
+                }
+            }
+            for _ in 0..2 {
+                let _ = app.frame();
+                let e = edit_of(&mut app);
+                for t in [&mut e.mo.dim, &mut e.mo.bar, &mut e.mo.pop, &mut e.mo.hint, &mut e.mo.hover] {
+                    t.snap(t.target());
+                }
+            }
+            let (mut tf, mut tp) = (Vec::new(), Vec::new());
+            let mut scratch = Vec::new();
+            for _ in 0..30 {
+                let t0 = Instant::now();
+                let fb = app.frame().expect("frame");
+                let t1 = Instant::now();
+                bench_present_prep(fb, &mut scratch);
+                let t2 = Instant::now();
+                std::hint::black_box(&scratch);
+                tf.push((t1 - t0).as_secs_f64() * 1000.0);
+                tp.push((t2 - t1).as_secs_f64() * 1000.0);
+            }
+            let (f, p) = (median(tf), median(tp));
+            println!("BENCH {name}: frame {f:.2} ms, present prep {p:.2} ms, sum {:.2} ms", f + p);
+        }
+    }
+
+    /// What `wind_win::present` does before StretchDIBits.
+    fn bench_present_prep(fb: &PixBuf, scratch: &mut Vec<u8>) {
+        scratch.resize(fb.as_raw().len(), 0);
+        #[cfg(windows)]
+        crate::wind::rgba_to_bgra(fb.as_raw(), scratch);
     }
 }

@@ -3,7 +3,8 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-#[derive(Clone, Debug, PartialEq)]
+/// `Default` is the empty 0x0 buffer (a placeholder after `mem::take`).
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PixBuf {
     w: u32,
     h: u32,

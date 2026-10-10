@@ -354,6 +354,8 @@ pub fn hide(hwnd: Hwnd) {
             XFlush(dpy);
         }
     });
+    // An idle daemon keeps no frame-sized staging buffer around.
+    BGRX.with_borrow_mut(|b| *b = Vec::new());
 }
 
 pub fn close(_hwnd: Hwnd) {
@@ -433,8 +435,8 @@ pub fn run(driver: &mut dyn Driver) -> i32 {
             }
             if Instant::now() >= next_tick {
                 next_tick = Instant::now() + Duration::from_millis(tick_ms());
-                driver.on_event(Ev::Timer);
-                repaint = true; // wndproc invalidates after WM_TIMER
+                // Idle ticks (nothing animating) cost no frame.
+                repaint |= driver.on_event(Ev::Timer);
             }
             while XPending(dpy) > 0 && !QUIT.load(Ordering::SeqCst) {
                 let mut ev: XEvent = core::mem::zeroed();
@@ -445,7 +447,7 @@ pub fn run(driver: &mut dyn Driver) -> i32 {
             if repaint && !QUIT.load(Ordering::SeqCst)
                 && let Some(fb) = driver.frame()
             {
-                present(dpy, win, gc, &fb);
+                present(dpy, win, gc, fb);
             }
             let want = driver.cursor();
             if cursor != Some(want) {
@@ -662,6 +664,21 @@ fn char_of(ks: c_ulong) -> Option<u16> {
 
 // --- presentation ---------------------------------------------------------
 
+/// Leading fields of Xlib's `XImage` (only `data` is touched).
+#[repr(C)]
+struct XImageHead {
+    width: c_int,
+    height: c_int,
+    xoffset: c_int,
+    format: c_int,
+    data: *mut c_char,
+}
+
+std::thread_local! {
+    /// B,G,R,X staging buffer for `present`, reused across frames.
+    static BGRX: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Present an unpremultiplied RGBA framebuffer (converted to B,G,R,X for the
 /// server's little-endian 32 bpp ZPixmap format, like StretchDIBits does).
 fn present(dpy: *mut c_void, win: c_ulong, gc: *mut c_void, fb: &PixBuf) {
@@ -669,39 +686,37 @@ fn present(dpy: *mut c_void, win: c_ulong, gc: *mut c_void, fb: &PixBuf) {
     if w == 0 || h == 0 {
         return;
     }
-    let mut bgrx = fb.as_raw().clone();
-    for px in bgrx.as_chunks_mut::<4>().0 {
-        px.swap(0, 2);
-        px[3] = 255;
-    }
-    let (len, cap) = (bgrx.len(), bgrx.capacity());
-    let data = bgrx.as_mut_ptr();
-    std::mem::forget(bgrx);
-    unsafe {
-        let screen = XDefaultScreen(dpy);
-        // Standard Xorg TrueColor: depth 24 with 32 bpp pads.
-        let image = XCreateImage(
-            dpy,
-            XDefaultVisual(dpy, screen),
-            XDefaultDepth(dpy, screen) as c_uint,
-            Z_PIXMAP,
-            0,
-            data as *mut c_char,
-            w as c_uint,
-            h as c_uint,
-            32,
-            (w * 4) as c_int,
-        );
-        if image.is_null() {
-            drop(Vec::from_raw_parts(data, len, cap));
-            return;
+    BGRX.with_borrow_mut(|bgrx| {
+        bgrx.resize(fb.as_raw().len(), 0);
+        for (o, i) in bgrx.as_chunks_mut::<4>().0.iter_mut().zip(fb.as_raw().as_chunks::<4>().0) {
+            *o = [i[2], i[1], i[0], 255];
         }
-        XPutImage(dpy, win, gc, image, 0, 0, 0, 0, w as c_uint, h as c_uint);
-        // XPutImage copied the pixels synchronously; XDestroyImage frees the
-        // malloc'd buffer together with the XImage (Xlib and Rust's System
-        // allocator both use malloc/free here).
-        XDestroyImage(image);
-    }
+        unsafe {
+            let screen = XDefaultScreen(dpy);
+            // Standard Xorg TrueColor: depth 24 with 32 bpp pads.
+            let image = XCreateImage(
+                dpy,
+                XDefaultVisual(dpy, screen),
+                XDefaultDepth(dpy, screen) as c_uint,
+                Z_PIXMAP,
+                0,
+                bgrx.as_mut_ptr() as *mut c_char,
+                w as c_uint,
+                h as c_uint,
+                32,
+                (w * 4) as c_int,
+            );
+            if image.is_null() {
+                return;
+            }
+            XPutImage(dpy, win, gc, image, 0, 0, 0, 0, w as c_uint, h as c_uint);
+            // XPutImage copied the pixels synchronously. The buffer stays
+            // ours (reused next frame): detach it so XDestroyImage frees
+            // only the XImage header.
+            (*(image as *mut XImageHead)).data = core::ptr::null_mut();
+            XDestroyImage(image);
+        }
+    });
 }
 
 /// Map `Cursor` to an XC_* shape from cursorfont.h (cached per run).

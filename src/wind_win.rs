@@ -6,8 +6,8 @@ use super::*;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BITMAPINFO, BI_RGB, DIB_RGB_COLORS, EndPaint, InvalidateRect, PAINTSTRUCT,
-    ScreenToClient, SRCCOPY, StretchDIBits,
+    BeginPaint, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, EndPaint,
+    InvalidateRect, PAINTSTRUCT, ScreenToClient, SRCCOPY, StretchDIBits,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
@@ -154,15 +154,17 @@ unsafe extern "system" fn wndproc(
                 LRESULT(0)
             }
             WM_TIMER => {
-                drv.on_event(Ev::Timer);
-                invalidate(hwnd);
+                // Idle ticks (nothing animating) cost no frame.
+                if drv.on_event(Ev::Timer) {
+                    invalidate(hwnd);
+                }
                 LRESULT(0)
             }
             WM_PAINT => {
                 let mut ps: PAINTSTRUCT = std::mem::zeroed();
                 let hdc = BeginPaint(hwnd, &mut ps);
                 if let Some(fb) = drv.frame() {
-                    present(hdc, &fb);
+                    present(hdc, fb);
                 }
                 let _ = EndPaint(hwnd, &ps);
                 LRESULT(0)
@@ -184,41 +186,66 @@ unsafe extern "system" fn wndproc(
     }
 }
 
-/// Present an unpremultiplied RGBA framebuffer by converting to top-down BGRA.
+thread_local! {
+    /// BGRA staging buffer for `present`, reused across paints (resized
+    /// only when the overlay size changes).
+    static BGRA: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// RGBA bytes -> BGRA bytes (R/B swapped), one pass, no allocation.
+/// (`BI_BITFIELDS` masks would let GDI read RGBA directly, but its
+/// conversion path is ~40x slower than this swap plus a BI_RGB blit.)
+pub(crate) fn rgba_to_bgra(src: &[u8], dst: &mut [u8]) {
+    // Two pixels per step (the release profile is size-optimised, so no
+    // auto-vectorisation): keep G/A, exchange the R and B bytes.
+    let (d8, dt) = dst.as_chunks_mut::<8>();
+    let (s8, st) = src.as_chunks::<8>();
+    for (o, i) in d8.iter_mut().zip(s8) {
+        let v = u64::from_le_bytes(*i);
+        let ga = v & 0xFF00_FF00_FF00_FF00;
+        let r = v & 0x0000_00FF_0000_00FF;
+        let b = v & 0x00FF_0000_00FF_0000;
+        *o = (ga | (r << 16) | (b >> 16)).to_le_bytes();
+    }
+    for (o, i) in dt.as_chunks_mut::<4>().0.iter_mut().zip(st.as_chunks::<4>().0) {
+        *o = [i[2], i[1], i[0], i[3]];
+    }
+}
+
+/// Present an unpremultiplied RGBA framebuffer as top-down BGRA.
 fn present(hdc: windows::Win32::Graphics::Gdi::HDC, fb: &PixBuf) {
     let (w, h) = fb.dimensions();
     if w == 0 || h == 0 {
         return;
     }
-    let mut bgra = fb.as_raw().clone();
-    for c in bgra.as_chunks_mut::<4>().0 {
-        c.swap(0, 2);
-    }
     let mut bmi: BITMAPINFO = unsafe { std::mem::zeroed() };
-    bmi.bmiHeader.biSize = std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>()
-        as u32;
+    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
     bmi.bmiHeader.biWidth = w as i32;
     bmi.bmiHeader.biHeight = -(h as i32); // top-down
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB.0;
-    unsafe {
-        StretchDIBits(
-            hdc,
-            0,
-            0,
-            w as i32,
-            h as i32,
-            0,
-            0,
-            w as i32,
-            h as i32,
-            Some(bgra.as_ptr() as *const _),
-            &bmi,
-            DIB_RGB_COLORS,
-            SRCCOPY,
-        );
-    }
+    BGRA.with_borrow_mut(|bgra| {
+        bgra.resize(fb.as_raw().len(), 0);
+        rgba_to_bgra(fb.as_raw(), bgra);
+        unsafe {
+            StretchDIBits(
+                hdc,
+                0,
+                0,
+                w as i32,
+                h as i32,
+                0,
+                0,
+                w as i32,
+                h as i32,
+                Some(bgra.as_ptr() as *const _),
+                &bmi,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
+        }
+    });
 }
 
 /// Position + show the overlay at an exact physical rect and take focus.
@@ -234,6 +261,8 @@ pub fn hide(hwnd: HWND) {
     unsafe {
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
+    // An idle daemon keeps no frame-sized staging buffer around.
+    BGRA.with_borrow_mut(|b| *b = Vec::new());
 }
 
 pub fn close(hwnd: HWND) {
@@ -280,5 +309,55 @@ pub fn run(driver: &mut dyn Driver) -> i32 {
             }
         }
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush,
+        SelectObject,
+    };
+
+    /// `present` into a BGRA DIB section: every channel lands in place.
+    #[test]
+    #[ignore = "GDI rendering check (no window)"]
+    fn present_colors_round_trip() {
+        let px: [[u8; 4]; 8] = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 255, 255],
+            [12, 34, 56, 255],
+            [200, 100, 50, 255],
+            [1, 2, 3, 255],
+            [250, 128, 7, 255],
+        ];
+        let fb = PixBuf::from_raw(4, 2, px.concat()).unwrap();
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            assert!(!dc.is_invalid());
+            let mut bmi: BITMAPINFO = std::mem::zeroed();
+            bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            bmi.bmiHeader.biWidth = 4;
+            bmi.bmiHeader.biHeight = -2;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB.0;
+            let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
+            let bmp = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+            let old = SelectObject(dc, bmp.into());
+            present(dc, &fb);
+            let _ = GdiFlush();
+            let out = std::slice::from_raw_parts(bits as *const u8, 4 * 2 * 4).to_vec();
+            SelectObject(dc, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(dc);
+            for (i, p) in px.iter().enumerate() {
+                let q = &out[i * 4..i * 4 + 3];
+                assert_eq!([q[2], q[1], q[0]], [p[0], p[1], p[2]], "pixel {i}: BGRA {q:?}");
+            }
+        }
     }
 }

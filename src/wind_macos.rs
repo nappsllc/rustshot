@@ -408,14 +408,14 @@ fn pump_loop(driver: &mut dyn Driver) -> i32 {
             }
             if !QUIT.load(Ordering::SeqCst) && Instant::now() >= next_tick {
                 next_tick = Instant::now() + Duration::from_millis(tick_ms());
-                driver.on_event(Ev::Timer);
-                repaint = true;
+                // Idle ticks (nothing animating) cost no frame.
+                repaint |= driver.on_event(Ev::Timer);
             }
             repaint |= PRESENT.swap(false, Ordering::SeqCst);
             if repaint && !QUIT.load(Ordering::SeqCst)
                 && let Some(fb) = driver.frame()
             {
-                present(window, &fb);
+                present(window, fb);
             }
             let want = driver.cursor();
             if cursor != Some(want) {

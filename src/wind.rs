@@ -79,10 +79,14 @@ pub struct Hwnd(pub usize);
 pub trait Driver {
     /// Window created; stash the handle.
     fn on_create(&mut self, hwnd: Hwnd);
-    /// Input/timer event (client coordinates).
-    fn on_event(&mut self, ev: Ev);
-    /// Compose the current frame as unpremultiplied RGBA, top-down.
-    fn frame(&mut self) -> Option<PixBuf>;
+    /// Input/timer event (client coordinates). Returns whether the event
+    /// needs a repaint. Backends invalidate after every input event (as a
+    /// wndproc would) but after `Ev::Timer` only when this is true, so idle
+    /// ticks cost no frame; mouse moves invalidate via `invalidate` instead.
+    fn on_event(&mut self, ev: Ev) -> bool;
+    /// Compose the current frame as unpremultiplied RGBA, top-down, into a
+    /// buffer the driver keeps across frames (no per-frame allocation).
+    fn frame(&mut self) -> Option<&PixBuf>;
     /// Cursor for WM_SETCURSOR.
     fn cursor(&self) -> Cursor;
     /// Window is being destroyed (loop ends after this).
@@ -147,6 +151,7 @@ mod tests {
 
     struct QuitSoon {
         created: bool,
+        fb: PixBuf,
     }
 
     impl Driver for QuitSoon {
@@ -155,9 +160,11 @@ mod tests {
             show_at(hwnd, 0, 0, 320, 240);
             close(hwnd);
         }
-        fn on_event(&mut self, _ev: Ev) {}
-        fn frame(&mut self) -> Option<PixBuf> {
-            Some(PixBuf::new(320, 240))
+        fn on_event(&mut self, _ev: Ev) -> bool {
+            false
+        }
+        fn frame(&mut self) -> Option<&PixBuf> {
+            Some(&self.fb)
         }
         fn cursor(&self) -> Cursor {
             Cursor::Arrow
@@ -167,7 +174,7 @@ mod tests {
     #[test]
     #[ignore = "live display access"]
     fn live_window_lifecycle() {
-        let mut d = QuitSoon { created: false };
+        let mut d = QuitSoon { created: false, fb: PixBuf::new(320, 240) };
         let code = run(&mut d);
         assert!(d.created);
         assert_eq!(code, 0);
