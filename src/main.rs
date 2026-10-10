@@ -18,6 +18,7 @@ mod pixbuf;
 mod proc_win;
 mod raster;
 mod sha256;
+mod text;
 mod theme;
 mod tray;
 #[cfg(windows)]

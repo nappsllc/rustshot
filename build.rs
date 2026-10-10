@@ -1,6 +1,7 @@
-// Embeds the app icon (resource ID 1) and version info into rustshot.exe.
-// Windows MSVC targets only; never fails the build (a missing rc.exe just
-// means no icon).
+// Bakes the UI font (Inter subset) into static tables, and embeds the app
+// icon (resource ID 1) and version info into rustshot.exe. The icon is
+// Windows MSVC targets only and never fails the build (a missing rc.exe
+// just means no icon).
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
@@ -9,6 +10,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=packaging/icons/rustshot.ico");
     println!("cargo:rerun-if-env-changed=RC");
+    bake_font();
     // Check the *target*, not the host: cross-target checks run build.rs on the host.
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
         || env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc")
@@ -113,4 +115,130 @@ fn find_rc() -> Option<PathBuf> {
         }
     }
     best.map(|(_, p)| p)
+}
+
+/// Bake the embedded Inter subset into `$OUT_DIR/font_baked.rs`: metrics,
+/// cmap, advances, bounding boxes, kerning pairs and outlines (lines and
+/// quadratics in half font units, exactly the curves ab_glyph produces), so
+/// the UI font needs no font parser at run time. `OPS` packs 2-bit segment
+/// codes four per byte (0 move, 1 line, 2 quad); `PTS` holds the x, y
+/// pairs they consume (1, 1 and 2 points).
+fn bake_font() {
+    use ab_glyph::{Font, FontRef, GlyphId, OutlineCurve, Point};
+    use std::fmt::Write as _;
+    const SRC: &str = "assets/fonts/Inter-Medium.subset.ttf";
+    println!("cargo:rerun-if-changed={SRC}");
+    let bytes = fs::read(SRC).expect("read the Inter subset");
+    let font = FontRef::try_from_slice(&bytes).expect("parse the Inter subset");
+
+    let mut cmap: Vec<(char, GlyphId)> = font
+        .codepoint_ids()
+        .filter(|(g, _)| g.0 != 0)
+        .map(|(g, c)| (c, g))
+        .collect();
+    cmap.sort_by_key(|&(c, _)| c);
+    cmap.dedup_by_key(|&mut (c, _)| c);
+    // Slots: .notdef first (what unmapped characters draw), then each
+    // mapped glyph once.
+    let mut gids: Vec<GlyphId> = vec![GlyphId(0)];
+    for &(c, g) in &cmap {
+        assert_eq!(font.glyph_id(c), g, "cmap mismatch for {c:?}");
+        if !gids.contains(&g) {
+            gids.push(g);
+        }
+    }
+    assert!(gids.len() <= 256, "more than 256 glyphs: widen the slot type");
+    let slot = |g: GlyphId| gids.iter().position(|&x| x == g).unwrap();
+    let int = |v: f32| -> i16 {
+        assert!(v.fract() == 0.0 && v.abs() < 32767.0, "value {v} is not an i16");
+        v as i16
+    };
+    // Half units: implied on-curve points are midpoints of integer points.
+    let half = |p: Point, pts: &mut Vec<i16>| {
+        pts.push(int(p.x * 2.0));
+        pts.push(int(p.y * 2.0));
+    };
+
+    let mut glyphs = String::new();
+    let mut ops: Vec<u8> = Vec::new();
+    let mut pts: Vec<i16> = Vec::new();
+    for &g in &gids {
+        let adv = font.h_advance_unscaled(g);
+        assert!(adv.fract() == 0.0 && (0.0..65535.0).contains(&adv), "advance {adv}");
+        let (op0, pt0) = (ops.len(), pts.len());
+        let bbox = match font.outline(g) {
+            Some(o) => {
+                let mut cur: Option<Point> = None;
+                for c in &o.curves {
+                    let (p0, end) = match *c {
+                        OutlineCurve::Line(a, b) | OutlineCurve::Quad(a, _, b) => (a, b),
+                        OutlineCurve::Cubic(..) => panic!("cubic curve in a TrueType font"),
+                    };
+                    if cur != Some(p0) {
+                        ops.push(0);
+                        half(p0, &mut pts);
+                    }
+                    match *c {
+                        OutlineCurve::Line(_, b) => {
+                            ops.push(1);
+                            half(b, &mut pts);
+                        }
+                        OutlineCurve::Quad(_, ctl, b) => {
+                            ops.push(2);
+                            half(ctl, &mut pts);
+                            half(b, &mut pts);
+                        }
+                        OutlineCurve::Cubic(..) => unreachable!(),
+                    }
+                    cur = Some(end);
+                }
+                // ab_glyph's bounds are (x_min, y_max)..(x_max, y_min).
+                let b = o.bounds;
+                [int(b.min.x), int(b.min.y), int(b.max.x), int(b.max.y)]
+            }
+            None => [0; 4],
+        };
+        writeln!(
+            glyphs,
+            "    G {{ adv: {adv}, bbox: {bbox:?}, op: {op0}, n_ops: {}, pt: {} }},",
+            ops.len() - op0,
+            pt0 / 2
+        )
+        .unwrap();
+    }
+    assert!(ops.len() < 65536 && pts.len() / 2 < 65536);
+
+    let mut kern = Vec::new();
+    for (i, &a) in gids.iter().enumerate() {
+        for (j, &b) in gids.iter().enumerate() {
+            let k = font.kern_unscaled(a, b);
+            if k != 0.0 {
+                kern.push((i, j, int(k)));
+            }
+        }
+    }
+
+    let mut out = String::new();
+    let w = &mut out;
+    writeln!(w, "// @generated by build.rs from {SRC}; do not edit.").unwrap();
+    writeln!(w, "pub const UNITS_PER_EM: u16 = {};", font.units_per_em().unwrap() as u16).unwrap();
+    writeln!(w, "pub const ASCENT: i16 = {};", int(font.ascent_unscaled())).unwrap();
+    writeln!(w, "pub const DESCENT: i16 = {};", int(font.descent_unscaled())).unwrap();
+    writeln!(w, "pub const LINE_GAP: i16 = {};", int(font.line_gap_unscaled())).unwrap();
+    writeln!(w, "/// (codepoint, glyph slot), sorted by codepoint.").unwrap();
+    writeln!(w, "pub static CMAP: [(char, u8); {}] = [", cmap.len()).unwrap();
+    for &(c, g) in &cmap {
+        writeln!(w, "    ({c:?}, {}),", slot(g)).unwrap();
+    }
+    writeln!(w, "];\npub static GLYPHS: [G; {}] = [\n{glyphs}];", gids.len()).unwrap();
+    writeln!(w, "/// (left slot, right slot, adjustment), sorted.").unwrap();
+    writeln!(w, "pub static KERN: [(u8, u8, i16); {}] = {kern:?};", kern.len()).unwrap();
+    let packed: Vec<u8> = ops
+        .chunks(4)
+        .map(|c| c.iter().enumerate().fold(0u8, |acc, (i, &o)| acc | (o << (2 * i))))
+        .collect();
+    writeln!(w, "pub static OPS: [u8; {}] = {packed:?};", packed.len()).unwrap();
+    writeln!(w, "pub static PTS: [i16; {}] = {pts:?};", pts.len()).unwrap();
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    fs::write(out_dir.join("font_baked.rs"), out).expect("write font_baked.rs");
 }

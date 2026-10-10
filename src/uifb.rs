@@ -1,9 +1,9 @@
 //! Software framebuffer: alpha blending, rectangles, image blits, and
-//! ab_glyph text rendering. Draw into an unpremultiplied RGBA buffer via [`Fb`].
+//! baked UI-font text rendering. Draw into an unpremultiplied RGBA buffer via [`Fb`].
 
 use crate::objects::{FRect, Pt};
 use crate::raster::{Blend, Order, Surf};
-use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
+use crate::fonts::UiFont;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct C4 {
@@ -227,42 +227,22 @@ impl<'a> Fb<'a> {
     /// Draw `s` with the top-left corner at (x, y). Returns the advance width.
     pub fn draw_text(
         &mut self,
-        font: &FontArc,
+        font: &UiFont,
         px: f32,
         s: &str,
         x: f32,
         y: f32,
         c: C4,
     ) -> f32 {
-        let f = font.as_scaled(PxScale { x: px, y: px });
-        let baseline = y + f.ascent();
-        let mut pen = x;
         let (bx0, by0, bx1, by1) = self.bounds();
-        for ch in s.chars() {
-            let glyph = ab_glyph::Glyph {
-                id: font.glyph_id(ch),
-                scale: PxScale { x: px, y: px },
-                position: ab_glyph::point(pen, baseline),
-            };
-            if let Some(outline) = f.outline_glyph(glyph) {
-                let bounds = outline.px_bounds();
-                outline.draw(|gx, gy, cov| {
-                    if cov <= 0.0 {
-                        return;
-                    }
-                    let sx = bounds.min.x as i32 + gx as i32;
-                    let sy = bounds.min.y as i32 + gy as i32;
-                    if sx < bx0 || sy < by0 || sx >= bx1 || sy >= by1 {
-                        return;
-                    }
-                    let mut col = c;
-                    col.a = ((c.a as f32 * cov) as u32).min(255) as u8;
-                    self.blend_px(sx, sy, col);
-                });
+        font.draw(s, px, x, y, |sx, sy, cov| {
+            if cov <= 0.0 || sx < bx0 || sy < by0 || sx >= bx1 || sy >= by1 {
+                return;
             }
-            pen += f.h_advance(font.glyph_id(ch));
-        }
-        pen - x
+            let mut col = c;
+            col.a = ((c.a as f32 * cov) as u32).min(255) as u8;
+            self.blend_px(sx, sy, col);
+        })
     }
 
     /// Anti-aliased filled circle.
@@ -340,31 +320,20 @@ impl<'a> Fb<'a> {
     }
 }
 
-fn scaled(font: &FontArc, px: f32) -> ab_glyph::PxScaleFont<&FontArc> {
-    font.as_scaled(PxScale { x: px, y: px })
+pub fn text_width(font: &UiFont, px: f32, s: &str) -> f32 {
+    font.width(s, px)
 }
 
-pub fn text_width(font: &FontArc, px: f32, s: &str) -> f32 {
-    let f = scaled(font, px);
-    let mut w = 0.0f32;
-    for ch in s.chars() {
-        w += f.h_advance(font.glyph_id(ch));
-    }
-    w
-}
-
-pub fn text_height(font: &FontArc, px: f32) -> f32 {
-    let f = scaled(font, px);
-    f.ascent() - f.descent()
+pub fn text_height(font: &UiFont, px: f32) -> f32 {
+    font.height(px)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
-    /// A real font for glyph metrics (system font, else embedded Inter).
-    fn font() -> Option<FontArc> {
-        crate::fonts::load_system_font()
+    fn font() -> Option<&'static UiFont> {
+        Some(crate::fonts::ui_font())
     }
 
     #[test]
@@ -407,13 +376,13 @@ pub(crate) mod tests {
             eprintln!("skipping: no known system font on this host");
             return;
         };
-        let w = text_width(&f, 14.0, "Hello");
+        let w = text_width(f, 14.0, "Hello");
         assert!(w > 20.0 && w < 200.0, "width {w}");
         let stride = 120;
         let mut fb = vec![0u8; stride * 30 * 4];
         let adv = {
             let mut fbw = Fb::new(&mut fb, stride);
-            fbw.draw_text(&f, 14.0, "Hi", 4.0, 4.0, C4::rgb(255, 255, 255))
+            fbw.draw_text(f, 14.0, "Hi", 4.0, 4.0, C4::rgb(255, 255, 255))
         };
         assert!(adv > 5.0);
         let lit = fb.as_chunks::<4>().0.iter().filter(|p| p[0] > 128).count();
@@ -638,7 +607,7 @@ pub(crate) mod tests {
         check_fb("outside", |f| f.fill_rect(0, 0, 10, 10, c));
         if let Some(font) = font() {
             check_fb("text", |f| {
-                f.draw_text(&font, 14.0, "Hello wy", 24.0, 12.0, c);
+                f.draw_text(font, 14.0, "Hello wy", 24.0, 12.0, c);
             });
         }
     }

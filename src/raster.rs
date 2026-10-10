@@ -332,6 +332,132 @@ impl<'a> Surf<'a> {
     }
 }
 
+/// Filled-outline coverage on a `w` x `h` grid (nonzero winding, exact
+/// area coverage): each edge deposits signed area into an accumulation
+/// buffer, and a running prefix sum yields per-pixel coverage. This is the
+/// font-rs / ab_glyph_rasterizer algorithm (same arithmetic, so glyphs
+/// come out as they did with ab_glyph); used for the baked UI font.
+pub struct Coverage {
+    w: usize,
+    h: usize,
+    a: Vec<f32>,
+}
+
+impl Coverage {
+    pub fn new(w: usize, h: usize) -> Self {
+        Coverage { w, h, a: vec![0.0; w * h + 4] }
+    }
+
+    fn add(&mut self, i: usize, v: f32) -> bool {
+        match self.a.get_mut(i) {
+            Some(p) => {
+                *p += v;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Edge `p0` -> `p1` in grid coordinates (y down).
+    pub fn line(&mut self, p0: Pt, p1: Pt) {
+        if (p0.y - p1.y).abs() <= f32::EPSILON {
+            return;
+        }
+        let (dir, p0, p1) = if p0.y < p1.y { (1.0, p0, p1) } else { (-1.0, p1, p0) };
+        let dxdy = (p1.x - p0.x) / (p1.y - p0.y);
+        let mut x = p0.x;
+        if p0.y < 0.0 {
+            x -= p0.y * dxdy;
+        }
+        // `as usize` saturates negative rows to 0.
+        for y in p0.y as usize..self.h.min(p1.y.ceil() as usize) {
+            let row = y * self.w;
+            let dy = ((y + 1) as f32).min(p1.y) - (y as f32).max(p0.y);
+            let xnext = x + dxdy * dy;
+            let d = dy * dir;
+            let (x0, x1) = if x < xnext { (x, xnext) } else { (xnext, x) };
+            let x0floor = x0.floor();
+            let x0i = x0floor as i32;
+            let x1ceil = x1.ceil();
+            let x1i = x1ceil as i32;
+            let start = row as isize + x0i as isize;
+            // An out-of-grid index abandons the rest of the row (and, as in
+            // the reference rasteriser, keeps `x` where it was).
+            if start < 0 {
+                continue;
+            }
+            let start = start as usize;
+            let at = |xi: i32| row.wrapping_add(xi as usize);
+            if x1i <= x0i + 1 {
+                let xmf = 0.5 * (x + xnext) - x0floor;
+                if !self.add(start, d - d * xmf) || !self.add(start + 1, d * xmf) {
+                    continue;
+                }
+            } else {
+                let s = (x1 - x0).recip();
+                let x0f = x0 - x0floor;
+                let a0 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f);
+                let x1f = x1 - x1ceil + 1.0;
+                let am = 0.5 * s * x1f * x1f;
+                if !self.add(start, d * a0) {
+                    continue;
+                }
+                if x1i == x0i + 2 {
+                    if !self.add(start + 1, d * (1.0 - a0 - am)) {
+                        continue;
+                    }
+                } else {
+                    let a1 = s * (1.5 - x0f);
+                    if !self.add(start + 1, d * (a1 - a0)) {
+                        continue;
+                    }
+                    for xi in x0i + 2..x1i - 1 {
+                        self.add(at(xi), d * s);
+                    }
+                    let a2 = a1 + (x1i - x0i - 3) as f32 * s;
+                    if !self.add(at(x1i - 1), d * (1.0 - a2 - am)) {
+                        continue;
+                    }
+                }
+                if !self.add(at(x1i), d * am) {
+                    continue;
+                }
+            }
+            x = xnext;
+        }
+    }
+
+    /// Quadratic Bézier `p0` -> `p2` with control `p1`, flattened.
+    pub fn quad(&mut self, p0: Pt, p1: Pt, p2: Pt) {
+        let devx = p0.x - 2.0 * p1.x + p2.x;
+        let devy = p0.y - 2.0 * p1.y + p2.y;
+        let devsq = devx * devx + devy * devy;
+        if devsq < 0.333 {
+            self.line(p0, p2);
+            return;
+        }
+        let n = 1 + (3.0 * devsq).sqrt().sqrt().floor() as usize;
+        let lerp = |t: f32, a: Pt, b: Pt| Pt::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y));
+        let (mut p, step, mut t) = (p0, (n as f32).recip(), 0.0);
+        for _ in 0..n - 1 {
+            t += step;
+            let pn = lerp(t, lerp(t, p0, p1), lerp(t, p1, p2));
+            self.line(p, pn);
+            p = pn;
+        }
+        self.line(p, p2);
+    }
+
+    /// Visit every cell with its coverage (0 = empty, 1 or more = full).
+    pub fn for_each(&self, mut f: impl FnMut(u32, u32, f32)) {
+        let mut acc = 0.0f32;
+        for (i, c) in self.a[..self.w * self.h].iter().enumerate() {
+            acc += c;
+            f((i % self.w) as u32, (i / self.w) as u32, acc.abs());
+        }
+    }
+}
+
 /// Signed distance from `p` to segment `a..b` (endpoints clamped).
 fn dist_seg(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     let (vx, vy) = (bx - ax, by - ay);
