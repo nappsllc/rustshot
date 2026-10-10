@@ -139,7 +139,8 @@ fn remember_worker(handle: std::thread::JoinHandle<()>) {
 /// `SetClipboardData` returning).
 fn serve_clipboard(clip: Clip) -> Result<()> {
     // Probe on the caller's thread so a dead display is reported here, not
-    // as a silently lost worker.
+    // as a silently lost worker. XInitThreads must precede any Xlib use.
+    crate::wind::init_x11();
     unsafe {
         let probe = XOpenDisplay(core::ptr::null());
         if probe.is_null() {
@@ -159,6 +160,7 @@ fn serve_clipboard(clip: Clip) -> Result<()> {
 }
 
 fn clipboard_worker(clip: Clip, done: mpsc::Sender<Result<()>>) {
+    crate::wind::init_x11();
     unsafe {
         let dpy = XOpenDisplay(core::ptr::null());
         if dpy.is_null() {

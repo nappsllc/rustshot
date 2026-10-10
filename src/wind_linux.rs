@@ -363,14 +363,20 @@ std::thread_local! {
 
 // --- public API -----------------------------------------------------------
 
-/// Ask for a repaint of the window's client area.
+/// Whether `hwnd` is the running overlay's window (not 0, not stale).
+fn is_overlay(hwnd: Hwnd) -> bool {
+    hwnd.0 != 0 && MAIN_WINDOW.load(Ordering::SeqCst) == hwnd.0
+}
+
+/// Ask for a repaint of the window's client area. An unknown or stale
+/// handle is a no-op.
 pub fn invalidate(hwnd: Hwnd) {
-    if !with_slot(hwnd, |s| s.present = true) {
+    if !with_slot(hwnd, |s| s.present = true) && is_overlay(hwnd) {
         PRESENT.store(true, Ordering::SeqCst);
     }
 }
 
-/// The event loop reads `tick_ms()` each pass; nothing to re-arm.
+/// The event loops read `tick_ms(win)` each pass; nothing to re-arm.
 pub fn retime(_hwnd: Hwnd, _ms: u64) {}
 
 /// Position + show the overlay at an exact physical rect and take focus.
@@ -408,8 +414,9 @@ pub fn hide(hwnd: Hwnd) {
 pub fn close(hwnd: Hwnd) {
     // Never destroy the window from here: callers run inside event handling
     // on the pump thread, exactly like DestroyWindow on Win32 (whose effect
-    // is also deferred until the current dispatch returns).
-    if !with_slot(hwnd, |s| s.quit = true) {
+    // is also deferred until the current dispatch returns). An unknown or
+    // stale handle is a no-op.
+    if !with_slot(hwnd, |s| s.quit = true) && is_overlay(hwnd) {
         QUIT.store(true, Ordering::SeqCst);
     }
 }
@@ -457,13 +464,14 @@ pub fn run(driver: &mut dyn Driver) -> i32 {
         let mut down: HashSet<u32> = HashSet::new();
         let mut cursor: Option<Cursor> = None;
         let mut cursors: [c_ulong; 8] = [0; 8];
-        let mut next_tick = Instant::now() + Duration::from_millis(tick_ms());
+        let me = Hwnd(win);
+        let mut next_tick = Instant::now() + Duration::from_millis(tick_ms(me));
         loop {
             if QUIT.load(Ordering::SeqCst) {
                 break;
             }
             // Honour a slow->fast switch made during the previous pass.
-            next_tick = next_tick.min(Instant::now() + Duration::from_millis(tick_ms()));
+            next_tick = next_tick.min(Instant::now() + Duration::from_millis(tick_ms(me)));
             let mut repaint = false;
             if XPending(dpy) == 0 {
                 // Sleep until the next tick (150 ms idle, 16 ms animating)
@@ -483,7 +491,7 @@ pub fn run(driver: &mut dyn Driver) -> i32 {
                 }
             }
             if Instant::now() >= next_tick {
-                next_tick = Instant::now() + Duration::from_millis(tick_ms());
+                next_tick = Instant::now() + Duration::from_millis(tick_ms(me));
                 // Idle ticks (nothing animating) cost no frame.
                 repaint |= driver.on_event(Ev::Timer);
             }
@@ -505,6 +513,7 @@ pub fn run(driver: &mut dyn Driver) -> i32 {
             }
         }
         driver.on_quit();
+        forget_tick(me);
         XFreeGC(dpy, gc);
         XDestroyWindow(dpy, win);
         XFlush(dpy);
@@ -763,9 +772,10 @@ mod window {
             let mut down: HashSet<u32> = HashSet::new();
             let mut cursor: Option<Cursor> = None;
             let mut cursors: [c_ulong; 8] = [0; 8];
-            let mut next_tick = Instant::now() + Duration::from_millis(tick_ms());
+            let me = Hwnd(win);
+            let mut next_tick = Instant::now() + Duration::from_millis(tick_ms(me));
             while !quit() {
-                next_tick = next_tick.min(Instant::now() + Duration::from_millis(tick_ms()));
+                next_tick = next_tick.min(Instant::now() + Duration::from_millis(tick_ms(me)));
                 let mut repaint = false;
                 if XPending(dpy) == 0 {
                     let wait = next_tick.saturating_duration_since(Instant::now()).as_micros().div_ceil(1000) as c_int;
@@ -777,7 +787,7 @@ mod window {
                     }
                 }
                 if Instant::now() >= next_tick {
-                    next_tick = Instant::now() + Duration::from_millis(tick_ms());
+                    next_tick = Instant::now() + Duration::from_millis(tick_ms(me));
                     repaint |= driver.on_event(Ev::Timer);
                 }
                 while XPending(dpy) > 0 && !quit() {
@@ -826,6 +836,7 @@ mod window {
                 }
             }
             driver.on_quit();
+            forget_tick(me);
             XFreeGC(dpy, gc);
             XDestroyWindow(dpy, win);
             XFlush(dpy);

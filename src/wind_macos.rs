@@ -245,14 +245,20 @@ std::thread_local! {
 
 // --- public API -----------------------------------------------------------
 
-/// Ask for a repaint of the window's client area.
+/// Whether `hwnd` is the running overlay's window (not 0, not stale).
+fn is_overlay(hwnd: Hwnd) -> bool {
+    hwnd.0 != 0 && MAIN_WINDOW.load(Ordering::SeqCst) == hwnd.0
+}
+
+/// Ask for a repaint of the window's client area. An unknown or stale
+/// handle is a no-op.
 pub fn invalidate(hwnd: Hwnd) {
-    if !with_slot(hwnd, |s| s.present = true) {
+    if !with_slot(hwnd, |s| s.present = true) && is_overlay(hwnd) {
         PRESENT.store(true, Ordering::SeqCst);
     }
 }
 
-/// The event loop reads `tick_ms()` each pass; nothing to re-arm.
+/// The event loops read `tick_ms(win)` each pass; nothing to re-arm.
 pub fn retime(_hwnd: Hwnd, _ms: u64) {}
 
 /// Position + show the overlay at an exact rect (points, Quartz space) and
@@ -304,11 +310,24 @@ pub fn hide(hwnd: Hwnd) {
 
 /// Never destroy the window from here: callers run inside driver callbacks
 /// on the pump thread, exactly like `DestroyWindow` on Win32 (whose effect
-/// is also deferred until the current dispatch returns).
+/// is also deferred until the current dispatch returns). An unknown or
+/// stale handle is a no-op.
 pub fn close(hwnd: Hwnd) {
-    if !with_slot(hwnd, |s| s.quit = true) {
+    if !with_slot(hwnd, |s| s.quit = true) && is_overlay(hwnd) {
         QUIT.store(true, Ordering::SeqCst);
     }
+}
+
+/// Activation policy + `finishLaunching`, once per process whichever of
+/// the overlay and `run_window` comes first. Accessory policy: no Dock
+/// tile, no menu bar (the overlay is the whole UI; activation still works
+/// for a borderless window).
+unsafe fn launch_app(app: *mut c_void) {
+    static LAUNCHED: std::sync::Once = std::sync::Once::new();
+    LAUNCHED.call_once(|| unsafe {
+        let _: () = msg1(app, objc_sel(c"setActivationPolicy:"), 1i64);
+        let _: () = msg0(app, objc_sel(c"finishLaunching"));
+    });
 }
 
 /// Create the (initially hidden) overlay and pump messages until quit.
@@ -338,10 +357,7 @@ fn pump_loop(driver: &mut dyn Driver) -> i32 {
             eprintln!("failed to create NSApplication");
             return 1;
         }
-        // Accessory policy: no Dock tile, no menu bar — the overlay is the
-        // whole UI (activation still works for a borderless window).
-        let _: () = msg1(app, objc_sel(c"setActivationPolicy:"), 1i64);
-        let _: () = msg0(app, objc_sel(c"finishLaunching"));
+        launch_app(app);
         let window = create_window();
         if window.is_null() {
             eprintln!("failed to create overlay window");
@@ -353,7 +369,8 @@ fn pump_loop(driver: &mut dyn Driver) -> i32 {
 
         let mut hook: Option<HotkeyHook> = None;
         let mut cursor: Option<Cursor> = None;
-        let mut next_tick = Instant::now() + Duration::from_millis(tick_ms());
+        let me = Hwnd(window as usize);
+        let mut next_tick = Instant::now() + Duration::from_millis(tick_ms(me));
         loop {
             if QUIT.load(Ordering::SeqCst) {
                 break;
@@ -375,7 +392,7 @@ fn pump_loop(driver: &mut dyn Driver) -> i32 {
                 (h.pump)();
             }
             // Honour a slow->fast switch made during the previous pass.
-            next_tick = next_tick.min(Instant::now() + Duration::from_millis(tick_ms()));
+            next_tick = next_tick.min(Instant::now() + Duration::from_millis(tick_ms(me)));
             let pool = Pool::new();
             let mut repaint = false;
             // Block only for the rest of the current tick slice on the first wait,
@@ -412,7 +429,7 @@ fn pump_loop(driver: &mut dyn Driver) -> i32 {
                 }
             }
             if !QUIT.load(Ordering::SeqCst) && Instant::now() >= next_tick {
-                next_tick = Instant::now() + Duration::from_millis(tick_ms());
+                next_tick = Instant::now() + Duration::from_millis(tick_ms(me));
                 // Idle ticks (nothing animating) cost no frame.
                 repaint |= driver.on_event(Ev::Timer);
             }
@@ -433,6 +450,7 @@ fn pump_loop(driver: &mut dyn Driver) -> i32 {
             (h.shutdown)();
         }
         driver.on_quit();
+        forget_tick(me);
         let _: () = msg1(
             window,
             objc_sel(c"orderOut:"),
@@ -596,6 +614,31 @@ mod window {
         }
     }
 
+    /// A message taking and returning a CGRect (see `msg_rect`).
+    unsafe fn msg_rect1(recv: *mut c_void, sel: usize, a1: CGRect) -> CGRect {
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let f: unsafe extern "C" fn(*mut c_void, usize, CGRect) -> CGRect =
+                    core::mem::transmute(objc_msgSend_stret as unsafe extern "C" fn());
+                f(recv, sel, a1)
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                msg1(recv, sel, a1)
+            }
+        }
+    }
+
+    /// Height in points the frame adds above the content (the title bar).
+    unsafe fn title_bar_height(win: *mut c_void) -> f64 {
+        unsafe {
+            let frame = msg_rect(win, objc_sel(c"frame"));
+            let content = msg_rect1(win, objc_sel(c"contentRectForFrameRect:"), frame);
+            (frame.size.height - content.size.height).max(0.0)
+        }
+    }
+
     /// Backing scale of a window (2.0 on Retina): points -> pixels.
     pub fn scale(hwnd: Hwnd) -> f32 {
         if hwnd.0 == 0 {
@@ -673,9 +716,7 @@ mod window {
                 anyhow::bail!("failed to load AppKit (NSApplication missing)");
             }
             let app: *mut c_void = msg0(app_cls, objc_sel(c"sharedApplication"));
-            if MAIN_WINDOW.load(Ordering::SeqCst) == 0 {
-                let _: () = msg0(app, objc_sel(c"finishLaunching"));
-            }
+            launch_app(app);
             let class = window_class();
             if class.is_null() {
                 anyhow::bail!("failed to create the window class");
@@ -715,7 +756,8 @@ mod window {
             let (cx, cy) = crate::capture::cursor_pos();
             let mons = crate::capture::monitors().unwrap_or_default();
             if let Some(m) = mons.iter().find(|m| m.contains(cx, cy)).or(mons.first()) {
-                let (x, y) = centre_in((m.x, m.y, m.w as i32, m.h as i32), w as i32, h as i32 + 28);
+                let outer_h = h + title_bar_height(win);
+                let (x, y) = centre_in((m.x, m.y, m.w as i32, m.h as i32), w as i32, outer_h.round() as i32);
                 let top_left = CGPoint { x: x as f64, y: crate::capture::main_display_height() - y as f64 };
                 let _: () = msg1(win, objc_sel(c"setFrameTopLeftPoint:"), top_left);
             } else {
@@ -736,10 +778,11 @@ mod window {
                 let _: () = msg1(win, objc_sel(c"makeKeyAndOrderFront:"), core::ptr::null_mut::<c_void>());
             }
             let mut key = false;
+            let mut pressed = false;
             let mut cursor: Option<Cursor> = None;
-            let mut next_tick = Instant::now() + Duration::from_millis(tick_ms());
+            let mut next_tick = Instant::now() + Duration::from_millis(tick_ms(hwnd));
             while !quit() {
-                next_tick = next_tick.min(Instant::now() + Duration::from_millis(tick_ms()));
+                next_tick = next_tick.min(Instant::now() + Duration::from_millis(tick_ms(hwnd)));
                 let pool = Pool::new();
                 let mut repaint = false;
                 let mut first = true;
@@ -767,8 +810,7 @@ mod window {
                     let ty: u64 = msg0(ev, objc_sel(c"type"));
                     let ours = target == win;
                     if ours {
-                        let (_, ch) = content_size(win);
-                        repaint |= dispatch_window(ev, ty, driver, ch, s);
+                        repaint |= dispatch_window(ev, ty, driver, content_size(win), s, &mut pressed);
                     }
                     // Keys stay ours (no responder chain: it would beep);
                     // everything else also goes to AppKit so the title bar,
@@ -801,7 +843,7 @@ mod window {
                     repaint = true;
                 }
                 if !quit() && Instant::now() >= next_tick {
-                    next_tick = Instant::now() + Duration::from_millis(tick_ms());
+                    next_tick = Instant::now() + Duration::from_millis(tick_ms(hwnd));
                     repaint |= driver.on_event(Ev::Timer);
                 }
                 with_slot(hwnd, |v| repaint |= core::mem::take(&mut v.present));
@@ -819,6 +861,7 @@ mod window {
                 drop(pool);
             }
             driver.on_quit();
+            forget_tick(hwnd);
             let _: () = msg1(win, objc_sel(c"orderOut:"), core::ptr::null_mut::<c_void>());
             let _: () = msg0(win, objc_sel(c"close"));
             let _: () = msg0(win, objc_sel(c"release"));
@@ -842,29 +885,56 @@ mod window {
     }
 
     /// Mouse events in client pixels (top-left origin); keys as the overlay.
-    unsafe fn dispatch_window(ev: *mut c_void, ty: u64, driver: &mut dyn Driver, content_h: f64, s: f64) -> bool {
+    /// Only the content rect is client area: moves, presses and wheel over
+    /// the title bar or frame are left to AppKit. A press that started
+    /// inside keeps its drags and release wherever they land (SetCapture
+    /// parity).
+    unsafe fn dispatch_window(
+        ev: *mut c_void,
+        ty: u64,
+        driver: &mut dyn Driver,
+        content: (f64, f64),
+        s: f64,
+        pressed: &mut bool,
+    ) -> bool {
         unsafe {
+            let (content_w, content_h) = content;
             let pos = || {
                 let p: CGPoint = msg0(ev, objc_sel(c"locationInWindow"));
-                ((p.x * s).round() as i32, ((content_h - p.y) * s).round() as i32)
+                // Window coordinates are y-up with the content at the bottom.
+                let inside = p.x >= 0.0 && p.x < content_w && p.y >= 0.0 && p.y < content_h;
+                ((p.x * s).round() as i32, ((content_h - p.y) * s).round() as i32, inside)
             };
             match ty {
                 MOUSE_MOVED | LEFT_DRAGGED => {
-                    let (x, y) = pos();
-                    driver.on_event(Ev::Move { x, y });
+                    let (x, y, inside) = pos();
+                    if inside || (ty == LEFT_DRAGGED && *pressed) {
+                        driver.on_event(Ev::Move { x, y });
+                    }
                     false
                 }
                 LEFT_DOWN => {
-                    let (x, y) = pos();
+                    let (x, y, inside) = pos();
+                    if !inside {
+                        return false;
+                    }
+                    *pressed = true;
                     driver.on_event(Ev::Down { x, y });
                     true
                 }
                 LEFT_UP => {
-                    let (x, y) = pos();
+                    if !core::mem::take(pressed) {
+                        return false;
+                    }
+                    let (x, y, _) = pos();
                     driver.on_event(Ev::Up { x, y });
                     true
                 }
                 SCROLL_WHEEL => {
+                    let (x, y, inside) = pos();
+                    if !inside {
+                        return false;
+                    }
                     let dy: f64 = msg0(ev, objc_sel(c"scrollingDeltaY"));
                     let mut delta = (dy * 120.0).round() as i32;
                     if delta == 0 {
@@ -874,7 +944,6 @@ mod window {
                     if inverted != 0 {
                         delta = -delta;
                     }
-                    let (x, y) = pos();
                     driver.on_event(Ev::Wheel { delta, x, y });
                     true
                 }

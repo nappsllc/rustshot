@@ -59,10 +59,10 @@ pub enum Ev {
     /// arrive here and are for the consumer to filter.
     Char(u16),
     Timer,
-    #[cfg_attr(not(test), allow(dead_code))]
     /// `run_window` only: the close button (or Alt+F4 / WM_DELETE_WINDOW)
     /// was pressed. Nothing closes by itself: the driver calls
     /// `wind::close(hwnd)` to end the loop, or ignores it to stay open.
+    #[cfg_attr(not(test), allow(dead_code))]
     Close,
     /// `run_window` only: new client size in physical pixels. Also sent
     /// once right after `on_create`, so the driver always knows its size.
@@ -244,24 +244,86 @@ pub fn request(hwnd: Hwnd, drv: &mut dyn Driver) {
     }
 }
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 /// Idle cadence (hotkey/upload polling, caret blink).
 pub const SLOW_TICK_MS: u64 = 150;
 /// Cadence while an animation runs.
 pub const FAST_TICK_MS: u64 = 16;
 
-static FAST_TICK: AtomicBool = AtomicBool::new(false);
-
-pub fn tick_ms() -> u64 {
-    if FAST_TICK.load(Ordering::Relaxed) { FAST_TICK_MS } else { SLOW_TICK_MS }
+/// Per-window timer cadence: the windows currently on the fast tick (keyed
+/// by raw handle). Every window starts slow, so the overlay and a dialog on
+/// another thread switch independently.
+#[derive(Default, Debug)]
+pub(crate) struct Cadence {
+    fast: Vec<u64>,
 }
 
-/// Switch the window timer between 16 ms (animating) and 150 ms (idle).
-pub fn set_fast_timer(hwnd: Hwnd, on: bool) {
-    if FAST_TICK.swap(on, Ordering::Relaxed) != on {
-        imp::retime(hwnd, tick_ms());
+impl Cadence {
+    pub(crate) const fn new() -> Self {
+        Cadence { fast: Vec::new() }
     }
+
+    /// Record `on` for `win`; true when its cadence changed.
+    pub(crate) fn set(&mut self, win: u64, on: bool) -> bool {
+        let pos = self.fast.iter().position(|&w| w == win);
+        match (pos, on) {
+            (None, true) => self.fast.push(win),
+            (Some(i), false) => {
+                self.fast.swap_remove(i);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    pub(crate) fn tick_ms(&self, win: u64) -> u64 {
+        if self.fast.contains(&win) { FAST_TICK_MS } else { SLOW_TICK_MS }
+    }
+
+    /// The window is gone (its handle may be reused): drop its entry.
+    pub(crate) fn forget(&mut self, win: u64) {
+        self.set(win, false);
+    }
+}
+
+static CADENCE: std::sync::Mutex<Cadence> = std::sync::Mutex::new(Cadence::new());
+
+fn cadence() -> std::sync::MutexGuard<'static, Cadence> {
+    CADENCE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Raw handle as the cadence key.
+fn win_key(hwnd: Hwnd) -> u64 {
+    #[cfg(windows)]
+    {
+        hwnd.0 as usize as u64
+    }
+    #[cfg(target_os = "linux")]
+    {
+        hwnd.0
+    }
+    #[cfg(target_os = "macos")]
+    {
+        hwnd.0 as u64
+    }
+}
+
+/// Current timer cadence of `hwnd` (each window has its own).
+pub fn tick_ms(hwnd: Hwnd) -> u64 {
+    cadence().tick_ms(win_key(hwnd))
+}
+
+/// Switch `hwnd`'s timer between 16 ms (animating) and 150 ms (idle);
+/// other windows keep their cadence.
+pub fn set_fast_timer(hwnd: Hwnd, on: bool) {
+    let changed = cadence().set(win_key(hwnd), on);
+    if changed {
+        imp::retime(hwnd, tick_ms(hwnd));
+    }
+}
+
+/// Backends call this when a window is destroyed.
+pub(crate) fn forget_tick(hwnd: Hwnd) {
+    cadence().forget(win_key(hwnd));
 }
 
 #[cfg(test)]
@@ -396,10 +458,30 @@ Xft.dpi:	144
     #[test]
     fn tick_switches_between_fast_and_slow() {
         set_fast_timer(Hwnd::default(), false);
-        assert_eq!(tick_ms(), SLOW_TICK_MS);
+        assert_eq!(tick_ms(Hwnd::default()), SLOW_TICK_MS);
         set_fast_timer(Hwnd::default(), true);
-        assert_eq!(tick_ms(), FAST_TICK_MS);
+        assert_eq!(tick_ms(Hwnd::default()), FAST_TICK_MS);
         set_fast_timer(Hwnd::default(), false);
-        assert_eq!(tick_ms(), SLOW_TICK_MS);
+        assert_eq!(tick_ms(Hwnd::default()), SLOW_TICK_MS);
+    }
+
+    /// The overlay and a dialog toggle their cadence independently.
+    #[test]
+    fn cadence_is_per_window() {
+        let (overlay, dialog) = (0x1001, 0x2002);
+        let mut c = Cadence::new();
+        assert_eq!((c.tick_ms(overlay), c.tick_ms(dialog)), (SLOW_TICK_MS, SLOW_TICK_MS));
+        assert!(c.set(overlay, true), "slow -> fast is a change");
+        assert!(!c.set(overlay, true), "fast -> fast is not");
+        assert_eq!((c.tick_ms(overlay), c.tick_ms(dialog)), (FAST_TICK_MS, SLOW_TICK_MS));
+        assert!(!c.set(dialog, false), "the dialog was already slow");
+        assert_eq!(c.tick_ms(overlay), FAST_TICK_MS, "a dialog going idle leaves the overlay fast");
+        assert!(c.set(dialog, true));
+        assert!(c.set(overlay, false));
+        assert_eq!((c.tick_ms(overlay), c.tick_ms(dialog)), (SLOW_TICK_MS, FAST_TICK_MS));
+        c.forget(dialog);
+        assert_eq!(c.tick_ms(dialog), SLOW_TICK_MS, "a reused handle starts slow");
+        c.forget(dialog);
+        assert_eq!(c.fast.len(), 0);
     }
 }

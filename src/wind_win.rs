@@ -5,7 +5,9 @@
 use super::*;
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateRectRgn, DeleteObject, EndPaint, GetMonitorInfoW, GetRegionData,
     GetUpdateRgn, InvalidateRect, MonitorFromPoint, ScreenToClient, StretchDIBits, UpdateWindow,
@@ -42,8 +44,16 @@ unsafe fn module_handle() -> windows::core::Result<*mut core::ffi::c_void> {
     }
 }
 
+/// RegisterClassExW succeeded, or the class exists already (another thread
+/// won the race): either way the class is usable.
+unsafe fn class_ok(atom: u16) -> bool {
+    atom != 0 || unsafe { GetLastError() } == ERROR_CLASS_ALREADY_EXISTS
+}
+
 unsafe fn register_class() {
-    if CLASS_REGISTERED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    // Only a success is remembered: a failed registration is retried by
+    // the next call.
+    if CLASS_REGISTERED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     unsafe {
@@ -55,7 +65,9 @@ unsafe fn register_class() {
         wc.hInstance = HINSTANCE(h);
         wc.hCursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
         wc.lpszClassName = w!("rustshot_overlay");
-        let _ = RegisterClassExW(&wc);
+        if class_ok(RegisterClassExW(&wc)) {
+            CLASS_REGISTERED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -145,6 +157,7 @@ unsafe extern "system" fn wndproc(
         }
         let drv = &mut **slot;
         if msg == WM_DESTROY {
+            forget_tick(hwnd);
             drv.on_quit();
             PostQuitMessage(0);
             return LRESULT(0);
@@ -338,7 +351,7 @@ pub fn run(driver: &mut dyn Driver) -> i32 {
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             w!("rustshot_overlay"),
-            w!("rustshot"),
+            w!("Rustshot"),
             WS_POPUP,
             -32000,
             -32000,
@@ -354,18 +367,29 @@ pub fn run(driver: &mut dyn Driver) -> i32 {
                 driver.on_create(hwnd);
                 let _ = SetTimer(Some(hwnd), 1, SLOW_TICK_MS as u32, None);
                 let mut msg = MSG::default();
-                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
+                let mut code = 0;
+                loop {
+                    match GetMessageW(&mut msg, None, 0, 0).0 {
+                        0 => break,
+                        -1 => {
+                            eprintln!("overlay message loop failed: {}", windows::core::Error::from_thread());
+                            code = 1;
+                            break;
+                        }
+                        _ => {
+                            let _ = TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                    }
                 }
                 let _ = DestroyWindow(hwnd);
+                code
             }
             Err(e) => {
                 eprintln!("failed to create overlay window: {e}");
-                return 1;
+                1
             }
         }
-        0
     }
 }
 
@@ -389,14 +413,19 @@ struct WinState<'a> {
 }
 
 const WINDOW_CLASS: PCWSTR = w!("rustshot_window");
-static WINDOW_CLASS_ONCE: std::sync::Once = std::sync::Once::new();
+/// Registered successfully (a failure is not cached: the next call retries).
+static WINDOW_CLASS_OK: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 
 /// Register the decorated-window class once (any thread may be first).
 /// Icons come from the exe's icon resource (ID 1, embedded by build.rs);
 /// shared handles, so nothing is destroyed. Builds without the resource
 /// (tests, non-MSVC) fall back to the default icon.
-unsafe fn register_window_class(h: HINSTANCE) {
-    WINDOW_CLASS_ONCE.call_once(|| unsafe {
+unsafe fn register_window_class(h: HINSTANCE) -> anyhow::Result<()> {
+    let mut ok = WINDOW_CLASS_OK.lock().unwrap_or_else(|e| e.into_inner());
+    if *ok {
+        return Ok(());
+    }
+    unsafe {
         let icon = |cx, cy| {
             LoadImageW(Some(h), PCWSTR(std::ptr::without_provenance(1)) /* MAKEINTRESOURCE(1) */, IMAGE_ICON, cx, cy, LR_SHARED)
                 .map(|i| HICON(i.0))
@@ -411,8 +440,12 @@ unsafe fn register_window_class(h: HINSTANCE) {
         wc.hIcon = icon(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
         wc.hIconSm = icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
         wc.lpszClassName = WINDOW_CLASS;
-        let _ = RegisterClassExW(&wc);
-    });
+        if !class_ok(RegisterClassExW(&wc)) {
+            anyhow::bail!("RegisterClassExW failed: {}", windows::core::Error::from_thread());
+        }
+    }
+    *ok = true;
+    Ok(())
 }
 
 /// DPI scale of a window (1.0 = 96 dpi): logical -> physical px factor.
@@ -507,6 +540,7 @@ unsafe extern "system" fn wndproc_window(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
             WM_SETCURSOR if (lp.0 & 0xffff) as u32 != HTCLIENT => DefWindowProcW(hwnd, msg, wp, lp),
             WM_DESTROY => {
                 st.done.set(true);
+                forget_tick(hwnd);
                 drv.on_quit();
                 LRESULT(0)
             }
@@ -540,7 +574,7 @@ pub fn run_window(spec: WindowSpec, drv: &mut dyn Driver) -> anyhow::Result<()> 
 unsafe fn window_loop(spec: &WindowSpec, drv: &mut dyn Driver) -> anyhow::Result<()> {
     unsafe {
         let h = HINSTANCE(module_handle()?);
-        register_window_class(h);
+        register_window_class(h)?;
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
@@ -595,7 +629,7 @@ unsafe fn window_loop(spec: &WindowSpec, drv: &mut dyn Driver) -> anyhow::Result
             (*st.drv).on_event(Ev::Resize(size.0, size.1));
         }
         if !st.done.get() {
-            let _ = SetTimer(Some(hwnd), 1, tick_ms() as u32, None);
+            let _ = SetTimer(Some(hwnd), 1, tick_ms(hwnd) as u32, None);
             // Tests never steal the user's focus.
             if cfg!(test) {
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -606,6 +640,7 @@ unsafe fn window_loop(spec: &WindowSpec, drv: &mut dyn Driver) -> anyhow::Result
             let _ = UpdateWindow(hwnd);
         }
         let mut quit = None;
+        let mut failed = None;
         let mut msg = MSG::default();
         while !st.done.get() {
             match GetMessageW(&mut msg, None, 0, 0).0 {
@@ -613,7 +648,10 @@ unsafe fn window_loop(spec: &WindowSpec, drv: &mut dyn Driver) -> anyhow::Result
                     quit = Some(msg.wParam.0 as i32);
                     break;
                 }
-                -1 => break,
+                -1 => {
+                    failed = Some(windows::core::Error::from_thread());
+                    break;
+                }
                 _ => {
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
@@ -625,6 +663,9 @@ unsafe fn window_loop(spec: &WindowSpec, drv: &mut dyn Driver) -> anyhow::Result
         }
         if let Some(code) = quit {
             PostQuitMessage(code);
+        }
+        if let Some(e) = failed {
+            anyhow::bail!("run_window message loop failed: {e}");
         }
         Ok(())
     }
@@ -679,17 +720,25 @@ mod tests {
         }
     }
 
+    /// Outer sizes the resize helper cycles through (all above the minimum).
+    const RESIZES: [(i32, i32); 3] = [(560, 430), (480, 370), (640, 480)];
+
     /// Records what `run_window` delivers; ignores the first close request
-    /// (the window must stay open) and closes on the second.
+    /// (the window must stay open) and closes on the second. On the first
+    /// close a helper thread resizes and repaints the window (cross-thread,
+    /// so the messages arrive through this loop, never re-entrantly inside
+    /// a driver callback), then posts the second WM_CLOSE.
     struct Closer {
         hwnd: HWND,
         fb: PixBuf,
         created: bool,
         first: Option<&'static str>,
         size: (u32, u32),
+        resizes: u32,
         closes: u32,
         frames: u32,
         quit: bool,
+        helper: Option<std::thread::JoinHandle<()>>,
     }
 
     impl Driver for Closer {
@@ -707,15 +756,23 @@ mod tests {
             });
             match ev {
                 Ev::Resize(w, h) => {
+                    self.resizes += 1;
                     self.size = (w, h);
                     self.fb = PixBuf::new(w, h);
                 }
                 Ev::Close => {
                     self.closes += 1;
                     if self.closes == 1 {
-                        unsafe {
-                            let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
-                        }
+                        let raw = self.hwnd.0 as usize;
+                        self.helper = Some(std::thread::spawn(move || unsafe {
+                            use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_INVALIDATE, RDW_UPDATENOW};
+                            let hwnd = HWND(raw as *mut core::ffi::c_void);
+                            for (w, h) in RESIZES {
+                                let _ = SetWindowPos(hwnd, None, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                                let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
+                            }
+                            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                        }));
                     } else {
                         close(self.hwnd);
                     }
@@ -744,9 +801,11 @@ mod tests {
             created: false,
             first: None,
             size: (0, 0),
+            resizes: 0,
             closes: 0,
             frames: 0,
             quit: false,
+            helper: None,
         };
         let spec = WindowSpec {
             title: "rustshot wind test".into(),
@@ -756,6 +815,9 @@ mod tests {
             min: (200, 150),
         };
         run_window(spec, &mut d).expect("window loop");
+        if let Some(h) = d.helper.take() {
+            h.join().expect("resize helper");
+        }
         d
     }
 
@@ -774,8 +836,9 @@ mod tests {
             assert_eq!(d.first, Some("resize"), "first event is the initial size");
             assert!(d.size.0 >= 400 && d.size.1 >= 300, "client {:?} at scale >= 1", d.size);
             assert_eq!(d.closes, 2, "the first close was ignored");
+            assert_eq!(d.resizes, 1 + RESIZES.len() as u32, "initial size plus each SetWindowPos");
             assert!(d.quit, "on_quit ran");
-            assert!(d.frames >= 1, "painted");
+            assert!(d.frames > RESIZES.len() as u32, "painted after every resize: {} frames", d.frames);
             assert!(unsafe { !IsWindow(Some(d.hwnd)).as_bool() }, "window destroyed");
             // A real handle: the GetCurrentProcess pseudo handle reads 0.
             let me = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, false, std::process::id()) }
@@ -785,7 +848,8 @@ mod tests {
             let ok = (0..3).any(|_| {
                 let before = count();
                 for _ in 0..5 {
-                    run_closer();
+                    let d = run_closer();
+                    assert_eq!(d.resizes, 1 + RESIZES.len() as u32);
                 }
                 let after = count();
                 seen.push((before, after));
@@ -797,6 +861,79 @@ mod tests {
         })
         .join()
         .expect("window thread");
+    }
+
+    /// Two `run_window` threads at once: the "overlay-style" window goes
+    /// fast, the dialog goes fast then idle again; each keeps its own
+    /// cadence (the dialog going idle must not slow the other window).
+    #[test]
+    fn run_window_cadence_is_per_window() {
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+        struct Ticker {
+            hwnd: HWND,
+            fb: PixBuf,
+            idle_again: bool,
+            barrier: Arc<Barrier>,
+            cadence: u64,
+            start: Option<Instant>,
+            ticks: u32,
+        }
+        impl Driver for Ticker {
+            fn on_create(&mut self, hwnd: HWND) {
+                self.hwnd = hwnd;
+                set_fast_timer(hwnd, true);
+                if self.idle_again {
+                    set_fast_timer(hwnd, false);
+                }
+                // Both windows have toggled once everyone is past here.
+                self.barrier.wait();
+                self.cadence = tick_ms(hwnd);
+                self.start = Some(Instant::now());
+            }
+            fn on_event(&mut self, ev: Ev) -> bool {
+                if let Ev::Timer = ev {
+                    self.ticks += 1;
+                    if self.start.is_some_and(|s| s.elapsed() >= Duration::from_millis(450)) {
+                        close(self.hwnd);
+                    }
+                }
+                false
+            }
+            fn frame(&mut self) -> Option<&mut PixBuf> {
+                Some(&mut self.fb)
+            }
+            fn cursor(&self) -> Cursor {
+                Cursor::Arrow
+            }
+        }
+        let barrier = Arc::new(Barrier::new(2));
+        let spawn = |idle_again: bool| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut d = Ticker {
+                    hwnd: HWND::default(),
+                    fb: PixBuf::new(1, 1),
+                    idle_again,
+                    barrier,
+                    cadence: 0,
+                    start: None,
+                    ticks: 0,
+                };
+                let title = if idle_again { "rustshot dialog" } else { "rustshot animating" };
+                let spec = WindowSpec { title: title.into(), w: 200, h: 150, resizable: false, min: (0, 0) };
+                run_window(spec, &mut d).expect("window loop");
+                (d.cadence, d.ticks, tick_ms(d.hwnd))
+            })
+        };
+        let (fast, dialog) = (spawn(false), spawn(true));
+        let (fast, dialog) = (fast.join().expect("fast window"), dialog.join().expect("dialog"));
+        println!("(cadence, ticks in 450 ms, cadence after destroy): animating {fast:?}, dialog {dialog:?}");
+        assert_eq!(fast.0, FAST_TICK_MS, "the dialog going idle left the other window fast");
+        assert_eq!(dialog.0, SLOW_TICK_MS);
+        assert!(fast.1 >= 10, "fast window ticked {} times", fast.1);
+        assert!(dialog.1 <= 4, "idle dialog ticked {} times", dialog.1);
+        assert_eq!((fast.2, dialog.2), (SLOW_TICK_MS, SLOW_TICK_MS), "destroyed windows are forgotten");
     }
 
     /// Interactive: a 400x300 window rendering a filled rect; close it
