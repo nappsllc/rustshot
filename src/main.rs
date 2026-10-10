@@ -15,6 +15,7 @@ mod keymap;
 mod objects;
 mod pixbuf;
 mod raster;
+mod sha256;
 mod theme;
 mod tray;
 #[cfg(windows)]

@@ -519,6 +519,12 @@ mod imp;
 
 pub use imp::*;
 
+#[cfg(not(windows))]
+#[path = "export_curl.rs"]
+mod curl;
+#[cfg(not(windows))]
+pub use curl::download_to;
+
 #[cfg(test)]
 mod tests {
     use super::*;

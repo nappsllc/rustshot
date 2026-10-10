@@ -201,38 +201,50 @@ pub fn http_get(host: &str, path: &str, headers: &[(&str, &str)]) -> Result<Stri
     }
 }
 
-/// One HTTPS request over WinHTTP; returns (status code, response body).
-fn winhttp(
+/// Owned WinHTTP handle.
+struct Handle(*mut std::ffi::c_void);
+impl Drop for Handle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _ = windows::Win32::Networking::WinHttp::WinHttpCloseHandle(self.0);
+            }
+        }
+    }
+}
+
+/// A sent request whose response headers have arrived. Fields drop in
+/// declaration order: request, connection, session.
+struct Response {
+    req: Handle,
+    _conn: Handle,
+    _session: Handle,
+    status: u32,
+}
+
+/// Null-terminated UTF-16, for PCWSTR parameters.
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Send one HTTPS request over WinHTTP and wait for the response headers.
+/// With `follow_redirects` false, a 3xx is returned as is (see `download_to`).
+fn winhttp_send(
     method: &str,
     host: &str,
     path: &str,
     headers: &str,
     body: &[u8],
-) -> Result<(u32, String), String> {
+    follow_redirects: bool,
+) -> Result<Response, String> {
     use std::ptr;
     use windows::Win32::Networking::WinHttp::{
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
-        WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect, WinHttpOpen,
-        WinHttpOpenRequest, WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData,
-        WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_OPTION_REDIRECT_POLICY,
+        WINHTTP_OPTION_REDIRECT_POLICY_NEVER, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
+        WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
+        WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts,
     };
     use windows::core::PCWSTR;
-
-    struct Handle(*mut std::ffi::c_void);
-    impl Drop for Handle {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe {
-                    let _ = WinHttpCloseHandle(self.0);
-                }
-            }
-        }
-    }
-
-    /// Null-terminated UTF-16, for PCWSTR parameters.
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
 
     let err = |step: &str| format!("{step}: {}", std::io::Error::last_os_error());
 
@@ -270,6 +282,11 @@ fn winhttp(
         if request.0.is_null() {
             return Err(err("WinHttpOpenRequest"));
         }
+        if !follow_redirects {
+            let never = WINHTTP_OPTION_REDIRECT_POLICY_NEVER.to_ne_bytes();
+            WinHttpSetOption(Some(request.0), WINHTTP_OPTION_REDIRECT_POLICY, Some(&never))
+                .map_err(|e| format!("WinHttpSetOption: {e}"))?;
+        }
 
         // Counted (not NUL-terminated): windows-rs passes slice.len() as the
         // header block length.
@@ -297,27 +314,164 @@ fn winhttp(
         )
         .map_err(|e| format!("WinHttpQueryHeaders: {e}"))?;
 
-        let mut out: Vec<u8> = Vec::new();
-        loop {
-            let mut avail = 0u32;
-            WinHttpQueryDataAvailable(request.0, &mut avail)
-                .map_err(|e| format!("WinHttpQueryDataAvailable: {e}"))?;
-            if avail == 0 {
-                break;
-            }
-            let mut buf = vec![0u8; avail as usize];
-            let mut read = 0u32;
-            WinHttpReadData(request.0, buf.as_mut_ptr() as _, avail, &mut read)
-                .map_err(|e| format!("WinHttpReadData: {e}"))?;
-            buf.truncate(read as usize);
-            if buf.is_empty() {
-                break;
-            }
-            out.extend_from_slice(&buf);
-        }
-
-        Ok((status, String::from_utf8_lossy(&out).into_owned()))
+        Ok(Response { req: request, _conn: conn, _session: session, status })
     }
+}
+
+/// Read the next chunk of the response body; 0 at the end.
+fn read_some(resp: &Response, buf: &mut [u8]) -> Result<usize, String> {
+    let mut read = 0u32;
+    let len = buf.len().min(u32::MAX as usize) as u32;
+    unsafe {
+        windows::Win32::Networking::WinHttp::WinHttpReadData(
+            resp.req.0,
+            buf.as_mut_ptr() as _,
+            len,
+            &mut read,
+        )
+    }
+    .map_err(|e| format!("WinHttpReadData: {e}"))?;
+    Ok(read as usize)
+}
+
+/// `Location` of a redirect response.
+fn location(resp: &Response) -> Option<String> {
+    use windows::Win32::Networking::WinHttp::{WINHTTP_QUERY_LOCATION, WinHttpQueryHeaders};
+    use windows::core::PCWSTR;
+    let mut buf = vec![0u16; 4096];
+    let mut size = (buf.len() * 2) as u32;
+    unsafe {
+        WinHttpQueryHeaders(
+            resp.req.0,
+            WINHTTP_QUERY_LOCATION,
+            PCWSTR::null(),
+            Some(buf.as_mut_ptr() as *mut _),
+            &mut size,
+            std::ptr::null_mut(),
+        )
+        .ok()?;
+    }
+    buf.truncate(size as usize / 2);
+    String::from_utf16(&buf).ok()
+}
+
+/// `Content-Length`, when the server sent one.
+fn content_length(resp: &Response) -> Option<u64> {
+    use windows::Win32::Networking::WinHttp::{
+        WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_QUERY_FLAG_NUMBER64, WinHttpQueryHeaders,
+    };
+    use windows::core::PCWSTR;
+    let mut len = 0u64;
+    let mut size = std::mem::size_of::<u64>() as u32;
+    unsafe {
+        WinHttpQueryHeaders(
+            resp.req.0,
+            WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER64,
+            PCWSTR::null(),
+            Some(&mut len as *mut u64 as *mut _),
+            &mut size,
+            std::ptr::null_mut(),
+        )
+        .ok()?;
+    }
+    Some(len)
+}
+
+/// One HTTPS request over WinHTTP; returns (status code, response body).
+fn winhttp(
+    method: &str,
+    host: &str,
+    path: &str,
+    headers: &str,
+    body: &[u8],
+) -> Result<(u32, String), String> {
+    let resp = winhttp_send(method, host, path, headers, body, true)?;
+    let mut out: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = read_some(&resp, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    Ok((resp.status, String::from_utf8_lossy(&out).into_owned()))
+}
+
+const MAX_REDIRECTS: usize = 5;
+
+/// Download a release asset to `dest`. Starts only at a URL that passes
+/// `update::is_safe_download_url`; redirects are followed by hand and each
+/// hop must pass `update::is_allowed_download_hop`. `progress(got, total)`
+/// returning false cancels (error `update::CANCELLED`). A partial file is
+/// deleted on any failure.
+#[allow(dead_code)] // reached through update::fetch_verified (dialog: later task)
+pub fn download_to(
+    url: &str,
+    dest: &Path,
+    progress: &dyn Fn(u64, Option<u64>) -> bool,
+) -> Result<(), String> {
+    use crate::update::{is_allowed_download_hop, is_safe_download_url, split_https_url};
+    if !is_safe_download_url(url) {
+        return Err("refusing to download from an unexpected URL".into());
+    }
+    let mut current = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        let (host, path) = split_https_url(&current).ok_or("unexpected download URL")?;
+        let resp = winhttp_send("GET", host, path, "", &[], false)?;
+        match resp.status {
+            301 | 302 | 303 | 307 | 308 => {
+                let next = location(&resp).ok_or("redirect without a Location")?;
+                if !is_allowed_download_hop(&next) {
+                    return Err("refusing a redirect to an unexpected host".into());
+                }
+                current = next;
+            }
+            200 => {
+                let r = write_body(&resp, dest, progress);
+                if r.is_err() {
+                    let _ = std::fs::remove_file(dest);
+                }
+                return r;
+            }
+            s => return Err(format!("HTTP {s}")),
+        }
+    }
+    Err("too many redirects".into())
+}
+
+fn write_body(
+    resp: &Response,
+    dest: &Path,
+    progress: &dyn Fn(u64, Option<u64>) -> bool,
+) -> Result<(), String> {
+    use std::io::Write;
+    let total = content_length(resp);
+    let wr = |e: std::io::Error| format!("write {}: {e}", dest.display());
+    let mut file = std::fs::File::create(dest).map_err(wr)?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut got = 0u64;
+    if !progress(0, total) {
+        return Err(crate::update::CANCELLED.into());
+    }
+    loop {
+        let n = read_some(resp, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n]).map_err(wr)?;
+        got += n as u64;
+        if total.is_some_and(|t| got > t) {
+            return Err("download is larger than announced".into());
+        }
+        if !progress(got, total) {
+            return Err(crate::update::CANCELLED.into());
+        }
+    }
+    if total.is_some_and(|t| got != t) {
+        return Err("download ended early".into());
+    }
+    file.sync_all().map_err(wr)
 }
 
 /// Minimal `"key": "value"` extraction; avoids pulling in a JSON crate.

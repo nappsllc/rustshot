@@ -49,6 +49,9 @@ pub struct Config {
     pub capture_active_monitor: bool,
     /// Let the daemon check GitHub for a newer release once a day.
     pub check_updates: bool,
+    /// A release version the user chose to skip; the daily check ignores it
+    /// (a manual check still offers it). Empty = none.
+    pub skip_version: String,
     /// Overlay renderer on Windows: "gdi" (screenshot kept in GDI bitmaps,
     /// only changed rects repainted; the default) or "software" (whole
     /// frame composed in memory). Linux/macOS always use software.
@@ -90,6 +93,7 @@ impl Default for Config {
             copy_url_after_upload: true,
             capture_active_monitor: false,
             check_updates: true,
+            skip_version: String::new(),
             renderer: "gdi".into(),
             shortcuts: BTreeMap::new(),
         }
@@ -301,6 +305,9 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
             "check_updates" => {
                 cfg.check_updates = as_bool(val).map_err(|e| bad("boolean", &e))?
             }
+            "skip_version" => {
+                cfg.skip_version = as_string(val).map_err(|e| bad("string", &e))?
+            }
             "renderer" => cfg.renderer = as_string(val).map_err(|e| bad("string", &e))?,
             _ => {} // unknown keys are ignored, as with serde's default
         }
@@ -338,6 +345,7 @@ pub fn to_toml(c: &Config) -> String {
          copy_url_after_upload = {}\n\
          capture_active_monitor = {}\n\
          check_updates = {}\n\
+         skip_version = {}\n\
          renderer = {}\n",
         q(&c.save_path),
         c.save_subfolder,
@@ -362,6 +370,7 @@ pub fn to_toml(c: &Config) -> String {
         c.copy_url_after_upload,
         c.capture_active_monitor,
         c.check_updates,
+        q(&c.skip_version),
         q(&c.renderer),
     );
     if !c.shortcuts.is_empty() {
@@ -558,6 +567,9 @@ mod tests {
         assert!(back.check_updates);
         let off = to_toml(&Config { check_updates: false, ..Config::default() });
         assert!(!parse_config(&off).unwrap().check_updates);
+        assert_eq!(back.skip_version, "");
+        let skip = to_toml(&Config { skip_version: "0.1.2".into(), ..Config::default() });
+        assert_eq!(parse_config(&skip).unwrap().skip_version, "0.1.2");
         assert_eq!(back.renderer, "gdi");
         let sw = to_toml(&Config { renderer: "software".into(), ..Config::default() });
         assert_eq!(parse_config(&sw).unwrap().renderer, "software");

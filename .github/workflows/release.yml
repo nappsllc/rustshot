@@ -37,6 +37,14 @@ jobs:
         run: |
           mv artifacts/rustshot-windows-x86_64/rustshot.exe \
              "artifacts/rustshot-windows-x86_64/rustshot-${GITHUB_REF_NAME#v}-windows-x86_64.exe"
+      # The in-app updater refuses any asset without a matching entry here.
+      - name: Write SHA256SUMS
+        run: |
+          set -euo pipefail
+          for f in artifacts/*/*; do
+            (cd "$(dirname "$f")" && sha256sum -- "$(basename "$f")")
+          done > SHA256SUMS
+          cat SHA256SUMS
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -45,7 +53,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "rustshot $GITHUB_REF_NAME" \
             --generate-notes \
-            artifacts/*/*
+            artifacts/*/* SHA256SUMS
 
   msstore:
     needs: publish

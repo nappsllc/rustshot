@@ -132,7 +132,7 @@ mod tests {
     fn update_messages() {
         assert!(update_message(&Ok(None)).contains("up to date"));
         assert!(update_message(&Err("boom".into())).contains("boom"));
-        let r = crate::update::Release { version: "9.9.9".into(), url: String::new() };
+        let r = crate::update::Release { version: "9.9.9".into(), ..Default::default() };
         assert!(update_message(&Ok(Some(r))).contains("9.9.9"));
     }
 
