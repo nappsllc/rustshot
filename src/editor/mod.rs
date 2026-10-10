@@ -167,6 +167,8 @@ pub fn run(
         // The update worker asks us to go idle (`RestartWhenIdle`), then to
         // quit once the new version starts (`Restart`).
         crate::update_ui::set_quit_sender(h.sender());
+        // A save in the Settings window makes us reload the config.
+        crate::settings_ui::set_daemon(h.sender());
     }
     let updates = match kind {
         RunKind::Daemon => crate::update::spawn_checker(cfg.check_updates),
@@ -340,6 +342,7 @@ impl App {
                 self.updating = false;
                 self.idle_reply = None;
             }
+            HotEvent::ReloadConfig => self.reload_config(crate::config::load()),
             // No new capture while an update installs or restarts us.
             HotEvent::Capture if self.updating || self.restart_pending => {
                 eprintln!("rustshot: an update is installing; capture ignored");
@@ -348,6 +351,21 @@ impl App {
             HotEvent::Capture => {}
         }
         true
+    }
+
+    /// Take `cfg` (Settings saved it): the next capture uses it, the global
+    /// hotkeys are re-registered and the update checker follows
+    /// `check_updates`. An open capture keeps the config it started with.
+    fn reload_config(&mut self, cfg: Config) {
+        if let Some(h) = self.hot.as_mut() {
+            h.reload(&cfg);
+        }
+        if cfg.check_updates != self.cfg.check_updates && self.kind == RunKind::Daemon {
+            // Dropping the receiver ends the old checker; it also re-reads
+            // `check_updates` before every check.
+            self.updates = crate::update::spawn_checker(cfg.check_updates);
+        }
+        self.cfg = cfg;
     }
 
     /// No capture, editor or export is open or about to open, and no
@@ -1991,6 +2009,22 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         *app.upload_slot.lock().unwrap() = Some(rx);
         tx
+    }
+
+    /// A Settings save: the next capture uses the new config (the open one
+    /// keeps its own) and the update checker follows `check_updates`.
+    #[test]
+    fn reload_takes_the_new_config() {
+        let mut app = preview_app(theme::DARK, None);
+        app.kind = RunKind::Daemon;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.updates = Some(rx);
+        let cfg = Config { save_format: "jpg".into(), check_updates: false, ..Config::default() };
+        app.reload_config(cfg.clone());
+        assert_eq!(app.cfg, cfg);
+        assert!(app.updates.is_none(), "checker stopped");
+        let State::Edit(edit) = &app.st else { panic!("capture still open") };
+        assert_eq!(edit.cfg.save_format, "png");
     }
 
     /// The update worker installs only once no capture, editor or upload

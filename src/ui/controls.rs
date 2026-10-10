@@ -68,7 +68,6 @@ fn fade(ui: &Ui) -> f32 {
 
 /// Text field / dropdown / shortcut box: subtle fill, 1 px border, accent
 /// border while focused.
-#[allow(dead_code)] // Settings window (Task 8)
 pub(super) fn field_frame(ui: &mut Ui, r: FRect, focused: bool, hovered: bool) {
     let th = ui.theme;
     let k = fade(ui);
@@ -102,7 +101,6 @@ fn press_logic(ui: &mut Ui, id: u64, r: FRect) -> (bool, bool, bool) {
 
 /// A table column: title and share of the width (the last takes the rest).
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // Settings window (Task 8)
 pub struct Col<'a> {
     pub title: &'a str,
     pub frac: f32,
@@ -110,7 +108,6 @@ pub struct Col<'a> {
 
 /// A table row: one string per column; `error` paints it in the error colour.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // Settings window (Task 8)
 pub struct Row<'a> {
     pub cells: &'a [&'a str],
     pub error: bool,
@@ -118,7 +115,6 @@ pub struct Row<'a> {
 
 /// Table selection and scroll offset (logical px).
 #[derive(Clone, Debug, Default, PartialEq)]
-#[allow(dead_code)] // Settings window (Task 8)
 pub struct TableState {
     pub selected: Option<usize>,
     pub scroll: f32,
@@ -126,7 +122,6 @@ pub struct TableState {
     pub body: Option<(FRect, f32)>,
 }
 
-#[allow(dead_code)] // Settings window (Task 8)
 impl TableState {
     /// Where row `i` was drawn last frame (physical px), when visible.
     pub fn row_rect(&self, i: usize) -> Option<FRect> {
@@ -142,14 +137,21 @@ impl TableState {
 
 impl Ui<'_> {
     /// One line of body text.
-    #[allow(dead_code)] // Settings window (Task 8)
     pub fn label(&mut self, s: &str) {
-        self.text_line(s, text_size(), false);
+        let c = self.theme.text;
+        self.text_line(s, text_size(), c);
     }
 
     /// Secondary text: muted and slightly smaller.
     pub fn note(&mut self, s: &str) {
-        self.text_line(s, 12.0, true);
+        let c = self.theme.text_muted;
+        self.text_line(s, 12.0, c);
+    }
+
+    /// A [`Ui::note`] in the error colour (conflicts, invalid input).
+    pub fn error_note(&mut self, s: &str) {
+        let c = self.theme.error;
+        self.text_line(s, 12.0, c);
     }
 
     /// Section heading; below other controls it gets extra space above.
@@ -157,16 +159,58 @@ impl Ui<'_> {
         if !self.lay.in_row() && self.cursor_y() > self.bounds().y + 0.5 {
             self.space(8.0);
         }
-        self.text_line(s, 15.0, false);
+        let c = self.theme.text;
+        self.text_line(s, 15.0, c);
     }
 
-    fn text_line(&mut self, s: &str, size: f32, muted: bool) {
+    fn text_line(&mut self, s: &str, size: f32, c: C4) {
         let w = tw(self, size, s).ceil();
         let h = if self.lay.in_row() { H } else { (size * 1.6).round() };
         let r = self.alloc(Some(w), h);
-        let c = if muted { self.theme.text_muted } else { self.theme.text };
         let c = c.fade(fade(self));
         text(self, size, s, r.x, r.y + r.h / 2.0, c);
+    }
+
+    /// Text button styled as a link: accent text, underlined on hover.
+    /// Clicked like a button (release over it, Enter/Space while focused).
+    pub fn link(&mut self, id: &str, label: &str) -> bool {
+        let w = tw(self, text_size(), label).ceil();
+        let r = self.alloc(Some(w), H);
+        let id = id_of(id);
+        let focused = self.focusable(id);
+        let (hov, _, mut clicked) = press_logic(self, id, r);
+        clicked |= self.take_key(focused, &[key::RETURN, key::SPACE]);
+        let c = self.theme.accent_fg.fade(fade(self));
+        let cy = r.y + r.h / 2.0;
+        text(self, text_size(), label, r.x, cy, c);
+        if hov {
+            let lw = self.k.round().max(1.0);
+            let y = (cy + self.px(8.0)).round();
+            self.fb.fill_rect(r.x as i32, y as i32, r.w as i32, lw as i32, c);
+        }
+        if show_focus(self, id) {
+            let fr = FRect { x: r.x - self.px(4.0), y: cy - self.px(11.0), w: r.w + self.px(8.0), h: self.px(22.0) };
+            focus_ring(self, fr, 4.0);
+        }
+        clicked && self.enabled
+    }
+
+    /// Dim everything drawn so far (a modal question is up) and draw a
+    /// raised card at `r` (logical px) to lay the question out in.
+    pub fn modal_card(&mut self, r: FRect) {
+        let (w, h) = (self.fb.stride as i32, self.fb.height());
+        let a = if self.theme.dark { 120 } else { 70 };
+        self.fb.fill_rect(self.fb.ox, self.fb.oy, w, h, C4::new(0, 0, 0, a));
+        let k = self.k;
+        let pr = FRect { x: (r.x * k).round(), y: (r.y * k).round(), w: (r.w * k).round(), h: (r.h * k).round() };
+        let cu = self.chrome();
+        let layers: &[usize] = if self.theme.dark { &ALL_LAYERS } else { &[0, 1] };
+        chrome::surface(&mut self.fb, &cu, pr, 12.0, layers, 1.0);
+    }
+
+    /// Width `tabs` takes for `labels` (logical px), for centring it.
+    pub fn tabs_width(&self, labels: &[&str]) -> f32 {
+        labels.iter().map(|s| (tw(self, text_size(), s) + 2.0 * 14.0).ceil()).sum::<f32>() + 2.0 * 4.0
     }
 
     /// Push button; `primary` is the accent-filled default action.
@@ -209,7 +253,6 @@ impl Ui<'_> {
     }
 
     /// On/off switch. Returns whether it flipped.
-    #[allow(dead_code)] // Settings window (Task 8)
     pub fn toggle(&mut self, id: &str, on: &mut bool) -> bool {
         let r = self.alloc(Some(36.0), H);
         let id = id_of(id);
@@ -244,7 +287,6 @@ impl Ui<'_> {
 
     /// Choice from `items`; the list opens below the box (above when it
     /// would leave the window). Returns whether `sel` changed.
-    #[allow(dead_code)] // Settings window (Task 8)
     pub fn dropdown(&mut self, id: &str, items: &[&str], sel: &mut usize) -> bool {
         let wmax = items.iter().map(|s| tw(self, text_size(), s)).fold(0.0, f32::max);
         let r = self.alloc(Some((wmax + 12.0 + 16.0 + 10.0 + 12.0).max(120.0).ceil()), H);
@@ -356,7 +398,6 @@ impl Ui<'_> {
 
     /// Integer slider over `min..=max` with the value printed at its right.
     /// Drag, click, arrows (±1), PageUp/PageDown (±10), Home/End.
-    #[allow(dead_code)] // Settings window (Task 8)
     pub fn slider(&mut self, id: &str, v: &mut u8, min: u8, max: u8) -> bool {
         let r = self.alloc(None, H);
         let id = id_of(id);
@@ -429,7 +470,6 @@ impl Ui<'_> {
 
     /// Segmented tab bar; the current tab has the active-tool tint.
     /// Left/Right switch while focused. Returns whether `sel` changed.
-    #[allow(dead_code)] // Settings window (Task 8)
     pub fn tabs(&mut self, id: &str, labels: &[&str], sel: &mut usize) -> bool {
         let pad = 4.0;
         let ws: Vec<f32> = labels.iter().map(|s| (tw(self, text_size(), s) + 2.0 * 14.0).ceil()).collect();
@@ -495,7 +535,6 @@ impl Ui<'_> {
     /// Up/Down/Home/End/PageUp/PageDown while focused, wheel to scroll).
     /// Fills the width; height = `height(..)` or 8 rows. Returns whether
     /// the selection changed.
-    #[allow(dead_code)] // Settings window (Task 8)
     pub fn table(&mut self, id: &str, cols: &[Col], rows: &[Row], st: &mut TableState) -> bool {
         let r = self.alloc(None, ITEM_H * 9.0);
         let id = id_of(id);
@@ -637,7 +676,6 @@ impl Ui<'_> {
     /// Backspace clears, Tab moves on, a click elsewhere stops recording;
     /// modifier keys alone wait for the key. Esc is recorded like any key.
     /// Returns whether `chord` changed.
-    #[allow(dead_code)] // Settings window (Task 8)
     pub fn key_capture(&mut self, id: &str, chord: &mut Option<Chord>) -> bool {
         let r = self.alloc(Some(140.0), H);
         let id = id_of(id);
@@ -668,7 +706,8 @@ impl Ui<'_> {
                     *chord = None;
                     recording = false;
                 } else if hotkey::key_name(vk).is_some() {
-                    *chord = Some(Chord { vk, ctrl: m.ctrl, shift: m.shift, alt: m.alt, meta: false });
+                    let meta = self.allow_meta && crate::wind::meta_down();
+                    *chord = Some(Chord { vk, ctrl: m.ctrl, shift: m.shift, alt: m.alt, meta });
                     recording = false;
                 }
             }
@@ -708,7 +747,6 @@ impl Ui<'_> {
     }
 }
 
-#[allow(dead_code)] // Settings window (Task 8)
 fn is_modifier(vk: u32) -> bool {
     matches!(vk, 0x10..=0x12 | 0x5B | 0x5C | 0xA0..=0xA5 | 0x14)
 }
@@ -805,6 +843,11 @@ impl Ui<'_> {
         for (i, l) in lines.iter().take(n).enumerate() {
             text(self, text_size(), l, r.x, r.y + (i as f32 + 0.5) * lh, c);
         }
+    }
+
+    /// Width of `s` as body text (logical px).
+    pub fn text_width(&self, s: &str) -> f32 {
+        tw(self, text_size(), s)
     }
 
     /// Height `paragraph` takes for `s` at width `w` (logical px).

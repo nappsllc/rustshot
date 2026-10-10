@@ -1,6 +1,5 @@
 //! Single-line text field: caret, selection, clipboard, horizontal scroll.
 //! No IME (out of scope) and no caret blink (frames are input-driven).
-#![allow(dead_code)] // Settings window (Task 8)
 
 use super::controls::{field_frame, text_size};
 use super::layout::H;
@@ -30,6 +29,7 @@ impl TextState {
         *self = TextState::new(text);
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // tests drive it; no window needs it yet
     pub fn caret(&self) -> usize {
         self.caret
     }
@@ -49,6 +49,7 @@ impl TextState {
     }
 
     /// Select `range` with the caret at its end (clamped to char boundaries).
+    #[cfg_attr(not(test), allow(dead_code))] // tests drive it; no window needs it yet
     pub fn select(&mut self, range: std::ops::Range<usize>) {
         self.anchor = self.floor(range.start);
         self.caret = self.floor(range.end);
@@ -62,6 +63,7 @@ impl TextState {
         self.anchor = self.caret;
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // tests drive it; no window needs it yet
     fn floor(&self, mut i: usize) -> usize {
         i = i.min(self.text.len());
         while !self.text.is_char_boundary(i) {

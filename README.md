@@ -21,8 +21,11 @@ renderer.
 - **Annotation tools:** pencil, line, arrow, rectangle, ellipse, highlighter,
   text, pixelate and invert, with Shift constraints (squares, circles, 45°
   lines) and unlimited undo/redo.
-- **Export:** copy to the clipboard, save as PNG (native save dialog), or
-  upload to imgur with the link copied for you.
+- **Export:** copy to the clipboard, save as PNG, JPEG or BMP straight into
+  a dated folder (or through the native save dialog), or upload to imgur
+  with the link copied for you.
+- **Settings window** for the theme, hotkeys, saving and every editor
+  shortcut (no need to edit `config.toml` by hand).
 - **Modern overlay UI:** dark and light themes that follow your OS, a grouped
   toolbar that wraps and repositions near screen edges, tooltips with the real
   shortcuts, and short animations.
@@ -31,7 +34,8 @@ renderer.
 - **Global hotkey daemon** (default <kbd>Meta</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd>).
 - **Scriptable CLI** for headless captures (`rustshot full --clip`,
   `--region`, `--raw` to stdout, `--upload`, delays).
-- **Update notices** for direct downloads (store installs update themselves).
+- **In-app updates** for direct downloads: download, verify and restart
+  from one dialog (store installs update themselves).
 
 ## Install
 
@@ -83,8 +87,63 @@ rustshot screen -n 1 --edit       # second monitor, open the editor
 rustshot gui --region 800x600+100+100 --upload
 rustshot full --raw > shot.png    # PNG bytes to stdout
 rustshot update                   # check for a newer release
+rustshot settings                 # open the Settings window
 rustshot --help
 ```
+
+### Settings
+
+Open **Settings…** from the tray menu, or run `rustshot settings` (a running
+daemon opens its window; otherwise the window opens on its own). Three tabs:
+
+- **General:** theme (Auto follows the OS), the overlay renderer (Windows),
+  start at login (hidden for store installs), the daily update check, and
+  the global capture and quit hotkeys (click a box, then press the keys;
+  <kbd>Backspace</kbd> clears it). *Open config file* opens `config.toml`.
+- **Saving:** see [Saving](#saving).
+- **Shortcuts:** every editor shortcut (see below).
+
+**OK** saves and closes, **Apply** saves and keeps the window open,
+**Cancel** (or <kbd>Esc</kbd>) discards. The running daemon picks the new
+settings up at once: the next capture uses them and the hotkeys are
+re-registered. Saving rewrites `config.toml`: if the file has comments or
+keys Rustshot does not know, the first save asks before removing them.
+On macOS the window is not available yet; Settings opens `config.toml`
+in your editor instead.
+
+### Saving
+
+<kbd>Ctrl</kbd>+<kbd>S</kbd> (and <kbd>Enter</kbd> when no other task was
+asked for) saves without a dialog to
+
+    <folder>/<subfolder pattern>/<file name pattern>.<png|jpg|bmp>
+
+By default that is `Pictures/rustshot/2026-10-10/2026-10-10_14-30.png`: one
+folder per day. A name that is taken gets `_1`, `_2`, ...; the toast shows
+the full path. <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> always asks
+(Save As, seeded with that folder and name; the format follows the
+extension you pick), and *Ask where to save* makes
+<kbd>Ctrl</kbd>+<kbd>S</kbd> ask too. The clipboard and uploads stay PNG.
+
+In Settings › Saving: the folder (with **Browse…**), daily subfolders and
+their pattern, the format (JPEG has a quality slider, 1-100, default 90),
+and the file name. The token buttons insert at the caret of the last
+pattern field you used; the line under the field shows where the next
+capture would go. **Restore** brings back `%F_%H-%M`, **Clear** empties it.
+
+| Token | Meaning | Token | Meaning |
+|---|---|---|---|
+| `%C` | century (00-99) | `%M` | minute (00-59) |
+| `%j` | day of year (001-366) | `%m` | month (01-12) |
+| `%d` | day (01-31) | `%S` | second (00-59) |
+| `%e` | day of month (1-31) | `%V` | ISO week (01-53) |
+| `%F` | `%Y-%m-%d` | `%u` | weekday (1 = Monday ... 7) |
+| `%H` | hour (00-23) | `%y` | year (00-99) |
+| `%I` | hour (01-12) | `%Y` | year (2026) |
+| `%T` / `%R` | `%H:%M:%S` / `%H:%M` | `%p`, `%s` | AM/PM, Unix time |
+
+Characters Windows does not allow in names (`<>:"/\|?*`) become `-`; in the
+subfolder pattern `/` nests folders (`%Y/%m`) and `..` is dropped.
 
 ### Editor shortcuts
 
@@ -107,10 +166,14 @@ rustshot --help
 
 On macOS, <kbd>⌘</kbd> works wherever <kbd>Ctrl</kbd> is listed.
 
-The keys above (except arrows, the mouse wheel and hold-while-drawing modifiers) can be
-remapped in a `[shortcuts]` table at the end of `config.toml` (one or more
-chords separated by commas, `""` unbinds; `rustshot config --check` reports
-unknown actions and chords bound twice, where the first action listed wins):
+The keys above (except arrows, the mouse wheel and hold-while-drawing
+modifiers) can be remapped in Settings › Shortcuts: select an action, press
+its new keys (<kbd>Backspace</kbd> unbinds it), and **Reset all** goes back
+to the defaults. Keys bound to two actions are shown in red with a note;
+the first action in the list wins. In `config.toml` the same lives in a
+`[shortcuts]` table at the end (one or more chords separated by commas,
+`""` unbinds; `rustshot config --check` reports unknown actions and chords
+bound twice):
 
 ```toml
 [shortcuts]
@@ -160,6 +223,20 @@ skip_version = ""                 # a version the daily check ignores ("Skip thi
 renderer = "gdi"                  # Windows overlay: "gdi" (low memory) or "software"; ignored elsewhere
 upload_client_id = "313baf0c7b4d3ff"
 ```
+
+## Updates
+
+The daemon checks GitHub for a new release once a day (turn it off in
+Settings › General or with `check_updates = false`); the tray's *Check for
+updates* checks now. A new version opens a dialog with the release notes:
+**Update** downloads it, checks its SHA-256 against the release's
+`SHA256SUMS` (it refuses to install on a mismatch or a missing entry),
+waits for an open capture to close and restarts into the new version;
+**Skip this version** silences the daily check for that version (a manual
+check still offers it). Downloads come only from the project's GitHub
+releases. This protects against corrupted or swapped downloads, not
+against a compromised GitHub account. Store, Flathub, Snap and package
+installs are updated by their store; `.deb` installs open the release page.
 
 ## Platform notes
 

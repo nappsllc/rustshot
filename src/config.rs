@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Settings, mirroring Flameshot's key names where they apply.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// Directory to save captures into. Empty = `<Pictures>/rustshot`.
     pub save_path: String,
@@ -162,6 +162,28 @@ pub fn load() -> Config {
         },
         Err(_) => Config::default(),
     }
+}
+
+/// Write `cfg` to `path` (normally [`config_path`]; its directory is
+/// created): the whole file, as [`to_toml`] renders it, atomically.
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no Settings window yet
+pub fn save_at(path: &std::path::Path, cfg: &Config) -> std::io::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    write_atomic(path, to_toml(cfg).as_bytes())
+}
+
+/// Whether rewriting the config file `text` with [`to_toml`] would lose
+/// something: comments, keys rustshot does not know, values written
+/// differently, or a file that does not parse. Keys that are merely missing
+/// or in another order do not count.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub fn rewrite_loses(text: &str) -> bool {
+    let Ok(cfg) = parse_config(text) else { return true };
+    let ours = to_toml(&cfg);
+    let kept: std::collections::HashSet<&str> = ours.lines().map(str::trim).collect();
+    text.lines().map(str::trim).any(|l| !l.is_empty() && !kept.contains(l))
 }
 
 /// "Skip this version": set `skip_version` in the config file at `path`
@@ -749,6 +771,43 @@ bogus = 1
         // A path that cannot be a file reports the error.
         assert!(save_skip_version_at(&dir, "1.0.0").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_writes_the_whole_config_atomically() {
+        let dir = scratch("save");
+        let p = dir.join("sub").join("config.toml");
+        let cfg = Config {
+            save_format: "jpg".into(),
+            jpeg_quality: 70,
+            save_path: "D:\\shots \"x\"".into(),
+            shortcuts: [("save".to_string(), "Ctrl+Alt+S".to_string())].into_iter().collect(),
+            ..Config::default()
+        };
+        save_at(&p, &cfg).unwrap();
+        save_at(&p, &cfg).unwrap();
+        let back = parse_config(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(to_toml(&back), to_toml(&cfg), "every value survives");
+        assert_eq!(back.save_path, cfg.save_path);
+        assert_eq!(only(&dir.join("sub")), ["config.toml"], "no temp file left");
+        // An unwritable target fails without touching anything.
+        assert!(save_at(&dir, &cfg).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewrite_loss_detection() {
+        let ours = to_toml(&Config::default());
+        assert!(!rewrite_loses(&ours));
+        assert!(!rewrite_loses(&ours.replace('\n', "\r\n")), "line endings only");
+        assert!(!rewrite_loses("theme = \"dark\"\n\nsave_format = \"jpg\"\n"), "missing keys");
+        assert!(!rewrite_loses(""));
+        assert!(rewrite_loses(&format!("# mine\n{ours}")), "comment");
+        assert!(rewrite_loses("theme = \"dark\" # why\n"), "inline comment");
+        assert!(rewrite_loses("bogus = 1\n"), "unknown key");
+        assert!(rewrite_loses("[other]\nx = 1\n"), "unknown table");
+        assert!(rewrite_loses("theme = 1\n"), "does not parse");
+        assert!(!rewrite_loses("[shortcuts]\nsave = \"Ctrl+Alt+S\"\n"));
     }
 
     #[test]

@@ -19,9 +19,7 @@ pub mod folder_dialog;
 pub mod layout;
 mod text_field;
 
-#[cfg_attr(not(test), allow(unused_imports))]
 pub use controls::{Col, Row, TableState};
-#[cfg_attr(not(test), allow(unused_imports))]
 pub use text_field::TextState;
 
 use crate::editor::style as chrome;
@@ -175,25 +173,26 @@ pub struct FocusState {
 }
 
 impl FocusState {
-    #[allow(dead_code)] // Settings window (Task 8)
     pub fn is_focused(&self, id: &str) -> bool {
         self.focused == Some(id_of(id))
     }
 
     /// Focus control `id` (with the focus ring, as if tabbed to).
-    #[allow(dead_code)] // Settings window (Task 8)
     pub fn focus(&mut self, id: &str) {
         self.set(Some(id_of(id)), true);
     }
 
-    #[allow(dead_code)] // Settings window (Task 8)
-    pub fn clear(&mut self) {
-        self.set(None, false);
+    /// Focus key_capture `id` and start recording, as a click on it does
+    /// (call after the frame's controls are drawn: a press this frame
+    /// would otherwise stop the recording again).
+    pub fn record(&mut self, id: &str) {
+        self.set(Some(id_of(id)), false);
+        self.recording = Some(id_of(id));
     }
 
     /// Whether any dropdown list is open or a shortcut is being recorded
     /// (a dialog should then not treat Esc/Enter as its own).
-    #[allow(dead_code)] // Settings window (Task 8)
+    #[cfg_attr(not(test), allow(dead_code))] // tests drive it; no window needs it yet
     pub fn busy(&self) -> bool {
         self.open.is_some() || self.recording.is_some()
     }
@@ -225,9 +224,7 @@ impl FocusState {
 
 /// Text get/set; tests inject a fake.
 pub trait Clipboard {
-    #[allow(dead_code)] // Settings window (Task 8)
     fn get(&mut self) -> Option<String>;
-    #[allow(dead_code)] // Settings window (Task 8)
     fn set(&mut self, text: &str);
 }
 
@@ -337,10 +334,12 @@ pub struct Ui<'a> {
     pub focus: &'a mut FocusState,
     /// Physical px per logical px.
     pub k: f32,
-    #[allow(dead_code)] // Settings window (Task 8)
     pub clip: &'a mut dyn Clipboard,
     /// Controls drawn while false are dimmed, inert and skipped by Tab.
     pub enabled: bool,
+    /// key_capture records a held Win/Super key (global hotkeys; editor
+    /// shortcuts cannot use it).
+    pub allow_meta: bool,
     pub(crate) lay: Layout,
     /// `used[i]`: `input.keys[i]` was consumed.
     used: Vec<bool>,
@@ -375,6 +374,7 @@ impl<'a> Ui<'a> {
             k,
             clip,
             enabled: true,
+            allow_meta: false,
             lay: Layout::new(area),
             used: vec![false; input.keys.len()],
             seen: Default::default(),
@@ -492,7 +492,6 @@ impl<'a> Ui<'a> {
         self.used[i] = true;
     }
 
-    #[allow(dead_code)] // Settings window (Task 8)
     fn is_used(&self, i: usize) -> bool {
         self.used[i]
     }

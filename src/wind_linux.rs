@@ -323,10 +323,21 @@ pub fn init_x11() {
 /// Mod1Mask=8). Only called from driver callbacks on the pump thread, whose
 /// thread-local display is therefore open; any other caller sees defaults.
 pub fn current_mods() -> Mods {
+    let mask = pointer_mask().unwrap_or(0);
+    Mods { shift: mask & 1 != 0, ctrl: mask & 4 != 0, alt: mask & 8 != 0 }
+}
+
+/// Super (Mod4Mask) held now; see [`current_mods`].
+pub fn meta_down() -> bool {
+    pointer_mask().is_some_and(|m| m & 0x40 != 0)
+}
+
+/// The modifier mask from `XQueryPointer` on this thread's display.
+fn pointer_mask() -> Option<u32> {
     RUN_DPY.with(|slot| {
         let dpy = slot.get();
         if dpy.is_null() {
-            return Mods::default();
+            return None;
         }
         unsafe {
             let root = XRootWindow(dpy, XDefaultScreen(dpy));
@@ -343,13 +354,9 @@ pub fn current_mods() -> Mods {
                 &mut mask,
             ) == 0
             {
-                return Mods::default();
+                return None;
             }
-            Mods {
-                shift: mask & 1 != 0,
-                ctrl: mask & 4 != 0,
-                alt: mask & 8 != 0,
-            }
+            Some(mask)
         }
     })
 }

@@ -60,7 +60,6 @@ impl Action {
     }
 
     /// Description for the Settings shortcut table.
-    #[allow(dead_code)] // used by the Settings window (later task)
     pub fn label(self) -> &'static str {
         self.info().1
     }
@@ -213,8 +212,12 @@ impl Keymap {
         by.into_iter().filter(|(_, v)| v.len() > 1).collect()
     }
 
+    /// Bind `a` to exactly `chords` (empty = unbound).
+    pub fn set(&mut self, a: Action, chords: Vec<Chord>) {
+        self.chords[a.index()] = chords;
+    }
+
     /// The `[shortcuts]` entries that differ from the defaults.
-    #[allow(dead_code)] // used by the Settings window (later task)
     pub fn to_config(&self) -> BTreeMap<String, String> {
         let def = Keymap::defaults();
         Action::ALL

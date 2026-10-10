@@ -428,3 +428,154 @@ fn renderers_show_the_same_overlay() {
     assert!(bar_max <= 12, "toolbar differs by {bar_max}");
     assert!((n as f64) < 0.1 * (w * h) as f64, "overlays differ in {n} pixels");
 }
+
+/// Whether this process can register `mods`+`vk` as a global hotkey now
+/// (released right away): false while another process holds it.
+fn hotkey_free(mods: u32, vk: u32) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS};
+    unsafe {
+        let ok = RegisterHotKey(None, 0x5e7, HOT_KEY_MODIFIERS(mods), vk).is_ok();
+        if ok {
+            let _ = UnregisterHotKey(None, 0x5e7);
+        }
+        ok
+    }
+}
+
+/// Wait for the visible window of `pid` to go away.
+fn wait_gone(pid: u32, ms: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(ms);
+    while find_window(pid).is_some() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
+fn wait_pid_window(pid: u32, ms: u64) -> Option<HWND> {
+    let deadline = Instant::now() + Duration::from_millis(ms);
+    loop {
+        if let Some(h) = find_window(pid) {
+            return Some(h);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Keys posted one by one with a short pause (each is its own frame).
+fn keys(hwnd: HWND, vks: &[u32]) {
+    for &vk in vks {
+        key(hwnd, vk);
+        std::thread::sleep(Duration::from_millis(60));
+    }
+}
+
+/// The Settings window in a private daemon (own instance name, config dir
+/// and unusual hotkeys): Saving → JPEG into another folder (with the
+/// rewrite question), Shortcuts → Accept on K; the daemon reloads (its
+/// capture hotkey moves to the one now in the file), and a capture
+/// accepted with K writes `<folder>/<date>/<name>.jpg`.
+///
+///     cargo test --test e2e settings_window -- --ignored --nocapture
+#[test]
+#[ignore = "live display access"]
+fn settings_window_saves_and_the_daemon_reloads() {
+    const TAB: u32 = 0x09;
+    const RET: u32 = 0x0D;
+    const MODS: u32 = 1 | 2 | 4; // Alt+Ctrl+Shift
+    const F9: u32 = 0x78;
+    const F11: u32 = 0x7A;
+    let root = config_root("settings", &renderer());
+    let cfg = root.join("rustshot").join("config.toml");
+    let shots = root.join("shots");
+    let base = "check_updates = false\ncapture_hotkey = \"Ctrl+Alt+Shift+F11\"\nquit_hotkey = \"Ctrl+Alt+Shift+F10\"\n";
+    std::fs::write(&cfg, format!("# e2e\n{base}")).unwrap();
+    let instance = format!("e2e-set-{}", std::process::id());
+    let run = |args: &[&str]| {
+        let mut c = rustshot(&root);
+        c.env("RUSTSHOT_INSTANCE", &instance).args(args).stdout(Stdio::null()).stderr(Stdio::null());
+        c
+    };
+    let mut daemon = run(&["daemon"]).spawn().expect("spawn daemon");
+    let pid = daemon.id();
+    println!("daemon pid {pid}");
+    std::thread::sleep(Duration::from_millis(1500));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(!hotkey_free(MODS, F11), "the daemon holds its capture hotkey");
+        // Session 1: Saving tab.
+        let mut c = run(&["settings"]).spawn().unwrap();
+        println!("settings pid {}", c.id());
+        assert_eq!(wait_exit(&mut c, 5000), Some(0), "`rustshot settings` hands over to the daemon");
+        let w = wait_pid_window(pid, 5000).expect("settings window in the daemon");
+        std::thread::sleep(Duration::from_millis(500));
+        keys(w, &[TAB, 0x27, TAB, 0x23]); // tabs → Saving, folder field, End
+        keys(w, &[0x08; 120]); // clear the folder
+        for ch in shots.display().to_string().chars() {
+            char_msg(w, ch);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        // Browse, subfolder toggle, pattern, format: JPEG; then the quality slider.
+        keys(w, &[TAB, TAB, TAB, TAB, 0x28, TAB]);
+        // Meanwhile the file gets a new capture hotkey (as if edited by hand):
+        // the window's untouched values follow the file.
+        std::fs::write(&cfg, format!("# e2e\n{}", base.replace("F11", "F9"))).unwrap();
+        key(w, RET); // OK: asks to rewrite (the comment)
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(find_window(pid).is_some(), "the question is up");
+        key(w, RET); // Save
+        assert!(wait_gone(pid, 5000), "OK closes the window");
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("save_format = \"jpg\""), "{text}");
+        assert!(text.contains(&format!("save_path = {:?}", shots.display().to_string())), "{text}");
+        assert!(text.contains("capture_hotkey = \"Ctrl+Alt+Shift+F9\"") && !text.contains("# e2e"), "{text}");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(hotkey_free(MODS, F11), "the old capture hotkey is released");
+        assert!(!hotkey_free(MODS, F9), "the new one is registered");
+        // Session 2: Shortcuts tab, Accept → K.
+        assert_eq!(wait_exit(&mut run(&["settings"]).spawn().unwrap(), 5000), Some(0));
+        let w = wait_pid_window(pid, 5000).expect("settings window again");
+        std::thread::sleep(Duration::from_millis(500));
+        // tabs → Shortcuts, table: End (Cancel), Up (Accept), rebind box: record K.
+        keys(w, &[TAB, 0x27, 0x27, TAB, 0x23, 0x26, TAB, RET, 'K' as u32]);
+        keys(w, &[TAB, TAB, RET]); // Reset all, OK
+        assert!(wait_gone(pid, 5000), "OK closes the window");
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("[shortcuts]\naccept = \"K\""), "{text}");
+        std::thread::sleep(Duration::from_millis(500));
+        // A capture in the daemon: click selects the screen, K accepts (saves).
+        let _ = run(&[]).spawn().unwrap().wait();
+        let o = wait_pid_window(pid, 8000).expect("overlay");
+        std::thread::sleep(Duration::from_millis(800));
+        mouse_move(o, 300, 300);
+        mouse_down(o, 300, 300);
+        mouse_up(o, 300, 300);
+        std::thread::sleep(Duration::from_millis(300));
+        key(o, 'K' as u32);
+        assert!(wait_gone(pid, 8000), "K accepted the capture");
+        std::thread::sleep(Duration::from_millis(1000));
+        let mut found = Vec::new();
+        for d in std::fs::read_dir(&shots).expect("save folder created").flatten() {
+            for f in std::fs::read_dir(d.path()).unwrap().flatten() {
+                found.push(f.path());
+            }
+        }
+        println!("saved: {found:?}");
+        assert_eq!(found.len(), 1, "{found:?}");
+        let f = &found[0];
+        let day = f.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        assert!(day.len() == 10 && day.as_bytes()[4] == b'-' && day.as_bytes()[7] == b'-', "{day}");
+        assert_eq!(f.extension().unwrap(), "jpg");
+        let b = std::fs::read(f).unwrap();
+        assert_eq!(&b[..2], &[0xFF, 0xD8], "a JPEG");
+    }));
+    let _ = daemon.kill(); // only the daemon this test started
+    let _ = daemon.wait();
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}

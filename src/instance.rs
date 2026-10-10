@@ -53,6 +53,12 @@ pub fn tray_class() -> windows::core::PCWSTR {
     windows::core::PCWSTR(w.as_ptr())
 }
 
+/// Ask a running daemon to open its Settings window; false when none
+/// answers (no daemon, or one too old to know the request).
+pub fn signal_settings() -> bool {
+    imp::signal_settings()
+}
+
 /// Held for the daemon's lifetime.
 pub struct Guard(imp::Inner);
 
@@ -78,6 +84,15 @@ mod imp {
 
     /// Posted to the tray window: "capture now".
     pub const WM_CAPTURE: u32 = WM_APP + 7;
+    /// Posted to the tray window: "open Settings".
+    pub const WM_SETTINGS: u32 = WM_APP + 8;
+
+    pub fn signal_settings() -> bool {
+        unsafe {
+            FindWindowW(super::tray_class(), PCWSTR::null())
+                .is_ok_and(|hwnd| PostMessageW(Some(hwnd), WM_SETTINGS, WPARAM(0), LPARAM(0)).is_ok())
+        }
+    }
 
     static TX: Mutex<Option<Sender<HotEvent>>> = Mutex::new(None);
 
@@ -123,6 +138,10 @@ mod imp {
             if let Some(tx) = TX.lock().unwrap().as_ref() {
                 let _ = tx.send(HotEvent::Capture);
             }
+            return LRESULT(0);
+        }
+        if m == WM_SETTINGS {
+            crate::settings_ui::show();
             return LRESULT(0);
         }
         unsafe { DefWindowProcW(h, m, w, l) }
@@ -293,11 +312,13 @@ mod imp {
                     // A silent client must not block later signals.
                     let _ = conn.set_read_timeout(Some(Duration::from_secs(1)));
                     let mut line = String::new();
-                    if BufReader::new(conn).read_line(&mut line).is_ok()
-                        && line.trim() == "capture"
-                        && tx.send(HotEvent::Capture).is_err()
-                    {
-                        break;
+                    if BufReader::new(conn).read_line(&mut line).is_err() {
+                        continue;
+                    }
+                    match line.trim() {
+                        "capture" if tx.send(HotEvent::Capture).is_err() => break,
+                        "settings" => crate::settings_ui::show(),
+                        _ => {}
                     }
                 }
             });
@@ -345,7 +366,15 @@ mod imp {
     }
 
     fn signal(path: &Path) -> bool {
-        UnixStream::connect(path).and_then(|mut s| s.write_all(b"capture\n")).is_ok()
+        send_line(path, b"capture\n")
+    }
+
+    fn send_line(path: &Path, line: &[u8]) -> bool {
+        UnixStream::connect(path).and_then(|mut s| s.write_all(line)).is_ok()
+    }
+
+    pub fn signal_settings() -> bool {
+        send_line(&default_path(), b"settings\n")
     }
 
     fn solo(err: impl std::fmt::Display, lock: Option<File>) -> Option<Instance> {

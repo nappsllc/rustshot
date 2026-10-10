@@ -26,6 +26,34 @@ fn day_of_year(year: i32, month: u16, day: u16) -> u32 {
     CUM[m] + day as u32 + if leap && month > 2 { 1 } else { 0 }
 }
 
+/// ISO weekday (1 = Monday .. 7 = Sunday) of a civil date.
+fn weekday(year: i32, month: u32, day: u32) -> u32 {
+    // Sakamoto's method: 0 = Sunday.
+    const T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let m = month.clamp(1, 12) as usize;
+    let y = if m < 3 { year - 1 } else { year };
+    let w = (y + y.div_euclid(4) - y.div_euclid(100) + y.div_euclid(400) + T[m - 1] + day as i32).rem_euclid(7);
+    if w == 0 { 7 } else { w as u32 }
+}
+
+/// ISO 8601 week number (1-53) of a civil date.
+fn iso_week(year: i32, month: u32, day: u32) -> u32 {
+    // Years with 53 weeks start on a Thursday (or a Wednesday in leap years).
+    let weeks = |y: i32| -> i32 {
+        let p = |y: i32| (y + y.div_euclid(4) - y.div_euclid(100) + y.div_euclid(400)).rem_euclid(7);
+        if p(y) == 4 || p(y - 1) == 3 { 53 } else { 52 }
+    };
+    let doy = day_of_year(year, month as u16, day as u16) as i32;
+    let w = (doy - weekday(year, month, day) as i32 + 10) / 7;
+    if w < 1 {
+        weeks(year - 1) as u32
+    } else if w > weeks(year) {
+        1
+    } else {
+        w as u32
+    }
+}
+
 /// Local wall-clock time: (year, month, day, hour, minute, second).
 pub type Tm = (i32, u32, u32, u32, u32, u32);
 
@@ -204,6 +232,10 @@ fn expand_pattern(pattern: &str, now: Tm, epoch: u64) -> String {
             'S' => format!("{s:02}"),
             'Y' => format!("{y:04}"),
             'y' => format!("{:02}", y.rem_euclid(100)),
+            'C' => format!("{:02}", y.div_euclid(100)),
+            'e' => format!("{d}"),
+            'V' => format!("{:02}", iso_week(ty, tmo, td)),
+            'u' => format!("{}", weekday(ty, tmo, td)),
             'm' => format!("{mo:02}"),
             'd' => format!("{d:02}"),
             'j' => format!("{:03}", day_of_year(ty, tmo as u16, td as u16)),
@@ -231,7 +263,7 @@ fn expand_pattern(pattern: &str, now: Tm, epoch: u64) -> String {
 
 /// Local (year, month, day, hour, min, sec) wall-clock time.
 #[cfg(unix)]
-fn local_ymdhms() -> Tm {
+pub fn local_ymdhms() -> Tm {
     #[repr(C)]
     #[derive(Default)]
     struct CTm {
@@ -539,6 +571,29 @@ mod tests {
     }
 
     const NOW: Tm = (2026, 3, 7, 9, 5, 2);
+
+    #[test]
+    fn settings_tokens() {
+        // 2026-03-07 is a Saturday in ISO week 10.
+        let e = |p: &str, t: Tm| expand_pattern(p, t, 0);
+        assert_eq!(e("%C|%e|%V|%u", NOW), "20|7|10|6");
+        assert_eq!(e("%e", (2026, 3, 17, 0, 0, 0)), "17");
+        assert_eq!(e("%C", (1999, 1, 1, 0, 0, 0)), "19");
+        // Week-year boundaries (ISO 8601).
+        for (t, w, u) in [
+            ((2021, 1, 1), 53, 5),  // Friday, week 53 of 2020
+            ((2021, 1, 4), 1, 1),   // Monday
+            ((2024, 12, 30), 1, 1), // Monday, week 1 of 2025
+            ((2026, 12, 31), 53, 4),
+            ((2027, 1, 3), 53, 7),  // Sunday, still week 53 of 2026
+            ((2023, 1, 1), 52, 7),
+            ((2020, 12, 31), 53, 4),
+        ] {
+            assert_eq!(iso_week(t.0, t.1, t.2), w, "{t:?}");
+            assert_eq!(weekday(t.0, t.1, t.2), u, "{t:?}");
+        }
+        assert_eq!(e("%V-%u", (2026, 10, 10, 0, 0, 0)), "41-6");
+    }
 
     #[test]
     fn auto_save_paths() {

@@ -7,7 +7,7 @@ use std::sync::mpsc::Sender;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuItem {
     Capture,
-    OpenConfig,
+    Settings,
     CheckUpdates,
     /// Start at login; payload = currently enabled.
     Autostart(bool),
@@ -18,7 +18,7 @@ impl MenuItem {
     pub fn label(self) -> &'static str {
         match self {
             MenuItem::Capture => "Capture",
-            MenuItem::OpenConfig => "Open config file",
+            MenuItem::Settings => "Settings…",
             MenuItem::CheckUpdates => "Check for updates",
             MenuItem::Autostart(_) => "Start at login",
             MenuItem::Quit => "Quit Rustshot",
@@ -28,7 +28,7 @@ impl MenuItem {
 
 /// Menu contents; `autostart` = None hides "Start at login" (managed installs).
 pub fn menu(autostart: Option<bool>) -> Vec<MenuItem> {
-    let mut v = vec![MenuItem::Capture, MenuItem::OpenConfig, MenuItem::CheckUpdates];
+    let mut v = vec![MenuItem::Capture, MenuItem::Settings, MenuItem::CheckUpdates];
     if let Some(on) = autostart {
         v.push(MenuItem::Autostart(on));
     }
@@ -100,7 +100,7 @@ mod tests {
             menu(Some(true)),
             vec![
                 MenuItem::Capture,
-                MenuItem::OpenConfig,
+                MenuItem::Settings,
                 MenuItem::CheckUpdates,
                 MenuItem::Autostart(true),
                 MenuItem::Quit
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn labels() {
         assert_eq!(MenuItem::Capture.label(), "Capture");
-        assert_eq!(MenuItem::OpenConfig.label(), "Open config file");
+        assert_eq!(MenuItem::Settings.label(), "Settings…");
         assert_eq!(MenuItem::CheckUpdates.label(), "Check for updates");
         assert_eq!(MenuItem::Autostart(false).label(), "Start at login");
         assert_eq!(MenuItem::Quit.label(), "Quit Rustshot");

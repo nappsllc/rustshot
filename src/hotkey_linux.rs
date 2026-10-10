@@ -36,6 +36,7 @@ unsafe extern "C" {
     fn XPeekEvent(dpy: *mut c_void, event: *mut XEvent) -> c_int;
     fn XPending(dpy: *mut c_void) -> c_int;
     fn XSync(dpy: *mut c_void, discard: c_int) -> c_int;
+    fn XConnectionNumber(dpy: *mut c_void) -> c_int;
     fn XSetErrorHandler(
         handler: Option<unsafe extern "C" fn(*mut c_void, *mut XErrorEvent) -> c_int>,
     ) -> Option<unsafe extern "C" fn(*mut c_void, *mut XErrorEvent) -> c_int>;
@@ -103,9 +104,42 @@ unsafe extern "C" fn record_grab_error(_dpy: *mut c_void, _ev: *mut XErrorEvent)
     0
 }
 
-/// Serve `specs` until the receiver goes away. Mirrors hotkey_win: register
-/// everything, loop on events, warn (never die) when a grab is refused.
-pub fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>) {
+#[repr(C)]
+struct PollFd {
+    fd: c_int,
+    events: i16,
+    revents: i16,
+}
+
+unsafe extern "C" {
+    fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
+}
+
+/// A running grab thread.
+pub struct Worker {
+    join: std::thread::JoinHandle<()>,
+    stop: std::sync::Arc<AtomicBool>,
+}
+
+impl Worker {
+    pub fn start(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>) -> Worker {
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        let join = std::thread::spawn(move || hotkey_thread(specs, tx, &s));
+        Worker { join, stop }
+    }
+
+    /// End the thread (its grabs are released) and wait for it.
+    pub fn stop(self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = self.join.join();
+    }
+}
+
+/// Serve `specs` until the receiver goes away or `stop` is set. Mirrors
+/// hotkey_win: register everything, loop on events, warn (never die) when
+/// a grab is refused.
+fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>, stop: &AtomicBool) {
     crate::wind::init_x11();
     unsafe {
         let dpy = XOpenDisplay(core::ptr::null());
@@ -122,6 +156,9 @@ pub fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEv
         // (keycode, modifiers, index into specs)
         let mut grabs: Vec<(u8, c_uint, usize)> = Vec::new();
         for (i, (_, spec, _)) in specs.iter().enumerate() {
+            if spec.trim().is_empty() {
+                continue; // no hotkey for this action
+            }
             let Some((mods, vk)) = parse_hotkey(spec) else {
                 eprintln!("warning: invalid hotkey {spec:?}");
                 continue;
@@ -174,7 +211,17 @@ pub fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEv
         // Passive grabs deliver KeyPress/KeyRelease here. `held` drops the
         // server's auto-repeat press/release pairs (MOD_NOREPEAT parity).
         let mut held: HashSet<u8> = HashSet::new();
+        let fd = XConnectionNumber(dpy);
         loop {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            if XPending(dpy) == 0 {
+                // Wait for the connection, waking now and then for `stop`.
+                let mut p = PollFd { fd, events: 1, revents: 0 }; // POLLIN
+                poll(&mut p, 1, 200);
+                continue;
+            }
             let mut ev: XEvent = core::mem::zeroed();
             XNextEvent(dpy, &mut ev);
             let keycode = ev.key.detail as u8;

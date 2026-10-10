@@ -17,6 +17,7 @@ mod pixbuf;
 #[cfg(windows)]
 mod proc_win;
 mod raster;
+mod settings_ui;
 mod sha256;
 mod text;
 mod theme;
@@ -56,6 +57,8 @@ enum Cmd {
     Daemon { after_update: bool },
     /// Check for a newer release and open its download page.
     Update,
+    /// Open the Settings window (in the running daemon, if any).
+    Settings,
     /// Show or validate the config file.
     Config {
         /// Validate the config file and exit non-zero on errors.
@@ -105,6 +108,7 @@ Commands:
   daemon    Run in the background and wait for the global capture hotkey (default;
             launching again while it runs triggers a capture)
   update    Check for a newer release and open its download page
+  settings  Open the Settings window
   config    Show or validate the config file (--check)
   help      Print this help
 
@@ -169,6 +173,12 @@ fn parse_from(args: &[String]) -> Result<Parsed, String> {
                 return Err(format!("unexpected argument '{a}'"));
             }
             Some(Cmd::Update)
+        }
+        Some("settings") => {
+            if let Some(a) = rest.first() {
+                return Err(format!("unexpected argument '{a}'"));
+            }
+            Some(Cmd::Settings)
         }
         Some("config") => {
             let mut check = false;
@@ -505,6 +515,14 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Settings => {
+            // A running daemon opens it (and reloads after a save);
+            // otherwise the window runs here.
+            if !instance::signal_settings() {
+                settings_ui::run_here();
+            }
+            Ok(())
+        }
         Cmd::Update => {
             if let Some(channel) = update::managed_install() {
                 println!("Rustshot is managed by {channel}; update it there.");
@@ -706,6 +724,13 @@ mod cli_tests {
     fn update_command() {
         assert!(matches!(cmd(&["update"]), Cmd::Update));
         assert!(p(&["update", "x"]).is_err());
+    }
+
+    #[test]
+    fn settings_command() {
+        assert!(matches!(cmd(&["settings"]), Cmd::Settings));
+        assert!(p(&["settings", "--x"]).is_err());
+        assert!(HELP.contains("settings  Open the Settings window"));
     }
 
     #[test]

@@ -5,7 +5,6 @@
 //! Windows: IFileOpenDialog with FOS_PICKFOLDERS (COM, apartment-threaded
 //! on the calling thread). Linux: zenity, then kdialog. macOS: NSOpenPanel
 //! (directories only).
-#![allow(dead_code)] // Settings window (Task 8)
 
 use std::path::{Path, PathBuf};
 

@@ -830,6 +830,11 @@ pub fn spawn_checker(enabled: bool) -> Option<std::sync::mpsc::Receiver<Release>
         let stamp = dir.join(STAMP_FILE);
         std::thread::sleep(FIRST_DELAY);
         loop {
+            // Turned off in Settings meanwhile (a new checker starts when
+            // it is turned on again).
+            if !crate::config::load().check_updates {
+                return;
+            }
             let last = std::fs::read_to_string(&stamp).ok().and_then(|t| parse_stamp(&t));
             let (new_stamp, release) = tick(last, unix_now(), check_now);
             if let Some(t) = new_stamp {

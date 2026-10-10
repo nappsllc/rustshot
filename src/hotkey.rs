@@ -14,6 +14,9 @@ pub enum HotEvent {
     RestartAborted,
     /// An installed update is starting: quit once no capture is open.
     Restart,
+    /// The Settings window saved `config.toml`: re-read it, re-register the
+    /// global hotkeys and apply `check_updates`.
+    ReloadConfig,
 }
 
 /// Global hotkeys backed by Win32 `RegisterHotKey` (replaces the
@@ -22,18 +25,58 @@ pub enum HotEvent {
 pub struct Hotkeys {
     rx: Receiver<HotEvent>,
     tx: Sender<HotEvent>,
+    /// The registration thread (stopped and replaced by `reload`).
+    #[cfg(not(target_os = "macos"))]
+    worker: Option<imp::Worker>,
+    /// The specs registered now.
+    specs: [String; 2],
+}
+
+/// Registration specs for `cfg`: capture (id 1) and quit (id 2).
+fn specs_of(cfg: &Config) -> [(i32, String, HotEvent); 2] {
+    [(1, cfg.capture_hotkey.clone(), HotEvent::Capture), (2, cfg.quit_hotkey.clone(), HotEvent::Quit)]
 }
 
 impl Hotkeys {
     pub fn new(cfg: &Config) -> Self {
         let (tx, rx) = mpsc::channel();
-        let hot_tx = tx.clone();
-        let specs = [
-            (1i32, cfg.capture_hotkey.clone(), HotEvent::Capture),
-            (2i32, cfg.quit_hotkey.clone(), HotEvent::Quit),
-        ];
-        std::thread::spawn(move || imp::hotkey_thread(specs, hot_tx));
-        Self { rx, tx }
+        let specs = specs_of(cfg);
+        let now = [specs[0].1.clone(), specs[1].1.clone()];
+        #[cfg(not(target_os = "macos"))]
+        let worker = Some(imp::Worker::start(specs, tx.clone()));
+        #[cfg(target_os = "macos")]
+        {
+            let hot_tx = tx.clone();
+            std::thread::spawn(move || imp::hotkey_thread(specs, hot_tx));
+        }
+        Self {
+            rx,
+            tx,
+            #[cfg(not(target_os = "macos"))]
+            worker,
+            specs: now,
+        }
+    }
+
+    /// Register `cfg`'s hotkeys instead of the current ones (no-op when
+    /// they are unchanged). The old registrations are released first, so
+    /// a chord can move between capture and quit.
+    pub fn reload(&mut self, cfg: &Config) {
+        let specs = specs_of(cfg);
+        let want = [specs[0].1.clone(), specs[1].1.clone()];
+        if want == self.specs {
+            return;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if let Some(w) = self.worker.take() {
+                w.stop();
+            }
+            self.worker = Some(imp::Worker::start(specs, self.tx.clone()));
+            self.specs = want;
+        }
+        #[cfg(target_os = "macos")]
+        eprintln!("rustshot: new global hotkeys take effect after a restart");
     }
 
     /// Another producer of events (single-instance listener, tray).

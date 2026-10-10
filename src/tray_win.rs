@@ -252,9 +252,7 @@ fn run(hwnd: HWND, item: MenuItem) {
     match item {
         MenuItem::Capture => send(HotEvent::Capture),
         MenuItem::Quit => send(HotEvent::Quit),
-        MenuItem::OpenConfig => {
-            std::thread::spawn(crate::actions::open_config);
-        }
+        MenuItem::Settings => crate::settings_ui::show(),
         MenuItem::Autostart(_) => {
             if let Err(e) = crate::actions::toggle_autostart() {
                 *BALLOON.lock().unwrap() = Some(format!("Could not change Start at login: {e}"));

@@ -30,6 +30,24 @@ impl Mods {
     }
 }
 
+/// Whether a Win/Super key is held now (`Mods` has no meta state; the
+/// Settings window's global-hotkey fields need it). False on macOS.
+#[cfg(windows)]
+pub fn meta_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_LWIN, VK_RWIN};
+    unsafe { [VK_LWIN, VK_RWIN].iter().any(|k| GetKeyState(k.0 as i32) as u16 & 0x8000 != 0) }
+}
+
+#[cfg(target_os = "linux")]
+pub fn meta_down() -> bool {
+    imp::meta_down()
+}
+
+#[cfg(target_os = "macos")]
+pub fn meta_down() -> bool {
+    false
+}
+
 #[cfg(target_os = "linux")]
 impl Mods {
     pub fn current() -> Self {
