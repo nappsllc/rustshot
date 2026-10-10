@@ -264,7 +264,7 @@ impl App {
 
     /// Run hotkey/upload polling and advance the state machine until stable.
     fn pump(&mut self) {
-        while let Some(ev) = self.hot.as_ref().and_then(|h| h.poll()) {
+        while let Some(ev) = self.hot.as_mut().and_then(|h| h.poll()) {
             if !self.on_hot(ev) {
                 return;
             }
@@ -2357,6 +2357,27 @@ mod tests {
 
         let mut app = annotated(theme::DARK, FRect { x: 500.0, y: 300.0, w: 380.0, h: 200.0 });
         save(&mut app, "dark-narrow.png");
+
+        // Tooltips with word key caps (Ctrl Shift Z): the widest ones, and
+        // at the screen edge on a toolbar pushed against it.
+        let btn = |app: &mut App, act: Act| {
+            let e = edit_of(app);
+            e.toolbar.as_ref().and_then(|t| t.items.iter().position(|i| i.kind == toolbar::Kind::Btn(act))).expect("button")
+        };
+        for (name, th, sel, act) in [
+            ("dark-tooltip-redo.png", theme::DARK, big, Act::Redo),
+            ("light-tooltip-save.png", theme::LIGHT, big, Act::Save),
+            ("dark-tooltip-edge.png", theme::DARK, FRect { x: 1036.0, y: 4.0, w: 400.0, h: 200.0 }, Act::Exit),
+            ("light-tooltip-edge-left.png", theme::LIGHT, FRect { x: 4.0, y: 700.0, w: 300.0, h: 196.0 }, Act::Undo),
+        ] {
+            let mut app = annotated(th, sel);
+            app.frame();
+            let i = btn(&mut app, act);
+            let e = edit_of(&mut app);
+            e.hover = Some(i);
+            e.hover_at = Instant::now() - Duration::from_secs(2);
+            save(&mut app, name);
+        }
 
         let mut app = annotated(theme::LIGHT, big);
         let e = edit_of(&mut app);

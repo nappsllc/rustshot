@@ -55,7 +55,8 @@ fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>
         tid.store(windows::Win32::System::Threading::GetCurrentThreadId(), Ordering::SeqCst);
 
         let mut registered = Vec::new();
-        for (id, spec, _) in &specs {
+        let mut result: Registered = [Ok(()); 2];
+        for (i, (id, spec, _)) in specs.iter().enumerate() {
             if spec.trim().is_empty() {
                 continue; // no hotkey for this action
             }
@@ -65,14 +66,19 @@ fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>
                     match RegisterHotKey(None, *id, flags, vk) {
                         Ok(()) => registered.push(*id),
                         Err(e) => {
-                            eprintln!("warning: could not register hotkey {spec:?}: {e}")
+                            // ERROR_HOTKEY_ALREADY_REGISTERED, in practice.
+                            eprintln!("warning: could not register hotkey {spec:?}: {e}");
+                            result[i] = Err(Cause::InUse);
                         }
                     }
                 }
-                None => eprintln!("warning: invalid hotkey {spec:?}"),
+                None => {
+                    eprintln!("warning: invalid hotkey {spec:?}");
+                    result[i] = Err(Cause::Invalid);
+                }
             }
         }
-        let _ = done.send(std::array::from_fn(|i| specs[i].1.trim().is_empty() || registered.contains(&specs[i].0)));
+        let _ = done.send(result);
 
         loop {
             let mut msg = MSG::default();

@@ -146,7 +146,7 @@ fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>
         let dpy = XOpenDisplay(core::ptr::null());
         if dpy.is_null() {
             eprintln!("warning: cannot open X display; global hotkeys disabled");
-            let _ = done.send(std::array::from_fn(|i| specs[i].1.trim().is_empty()));
+            let _ = done.send(std::array::from_fn(|i| if specs[i].1.trim().is_empty() { Ok(()) } else { Err(Cause::NoDisplay) }));
             return;
         }
         let root = XRootWindow(dpy, XDefaultScreen(dpy));
@@ -157,21 +157,25 @@ fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>
         let prev = XSetErrorHandler(Some(record_grab_error));
         // (keycode, modifiers, index into specs)
         let mut grabs: Vec<(u8, c_uint, usize)> = Vec::new();
+        let mut result: Registered = [Ok(()); 2];
         for (i, (_, spec, _)) in specs.iter().enumerate() {
             if spec.trim().is_empty() {
                 continue; // no hotkey for this action
             }
             let Some((mods, vk)) = parse_hotkey(spec) else {
                 eprintln!("warning: invalid hotkey {spec:?}");
+                result[i] = Err(Cause::Invalid);
                 continue;
             };
             let Some(sym) = keysym_of_vk(vk) else {
                 eprintln!("warning: unsupported hotkey key in {spec:?}");
+                result[i] = Err(Cause::Invalid);
                 continue;
             };
             let keycode = XKeysymToKeycode(dpy, sym);
             if keycode == 0 {
                 eprintln!("warning: could not register hotkey {spec:?}: key not on this keyboard");
+                result[i] = Err(Cause::Invalid);
                 continue;
             }
             let base = x_mods(mods);
@@ -206,10 +210,11 @@ fn hotkey_thread(specs: [(i32, String, HotEvent); 2], tx: mpsc::Sender<HotEvent>
                     }
                 }
                 grabs.retain(|&(_, _, idx)| idx != i);
+                result[i] = Err(Cause::InUse);
             }
         }
         XSetErrorHandler(prev);
-        let _ = done.send(std::array::from_fn(|i| specs[i].1.trim().is_empty() || grabs.iter().any(|g| g.2 == i)));
+        let _ = done.send(result);
 
         // Passive grabs deliver KeyPress/KeyRelease here. `held` drops the
         // server's auto-repeat press/release pairs (MOD_NOREPEAT parity).

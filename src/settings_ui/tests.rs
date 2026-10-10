@@ -249,16 +249,49 @@ fn reset_writes_defaults_and_a_backup() {
     assert!(matches!(s.modal, Some(Modal::Broken(_))));
     assert_eq!(std::fs::read_to_string(&p).unwrap(), BROKEN);
     s.on(Click::ResetDefaults);
+    assert_eq!(backup_path(&p), dir.join("config.toml.bak"));
     let acts = s.on(Click::Replace);
     assert!(matches!(&acts[..], [Act::Saved(c)] if **c == Config::default()), "{acts:?}");
     assert_eq!(s.modal, None);
-    assert_eq!(std::fs::read_to_string(backup_path(&p)).unwrap(), BROKEN);
-    assert_eq!(backup_path(&p), dir.join("config.toml.bak"));
+    assert_eq!(std::fs::read_to_string(dir.join("config.toml.bak")).unwrap(), BROKEN);
     assert_eq!(config::read_at(&p), Ok(Some(Config::default())));
     // The window works on the new file.
     assert!(!s.dirty());
     s.form.ask = true;
     assert!(matches!(&s.on(Click::Apply)[..], [Act::Saved(c)] if c.save_dialog));
+    // Broken again and reset again: the first backup is not overwritten.
+    std::fs::write(&p, "oops 2\n").unwrap();
+    let mut s = settings_at(&p);
+    s.on(Click::ResetDefaults);
+    assert!(matches!(&s.on(Click::Replace)[..], [Act::Saved(_)]));
+    assert_eq!(std::fs::read_to_string(dir.join("config.toml.bak")).unwrap(), BROKEN);
+    assert_eq!(std::fs::read_to_string(dir.join("config.toml.bak.1")).unwrap(), "oops 2\n");
+    assert_eq!(backup_path(&p), dir.join("config.toml.bak.2"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The file was fixed in an editor while the reset question was open:
+/// Replace goes back to the form and writes nothing.
+#[test]
+fn reset_of_a_fixed_file_writes_nothing() {
+    let dir = scratch("reset-fixed");
+    let p = dir.join("config.toml");
+    std::fs::write(&p, BROKEN).unwrap();
+    let mut s = settings_at(&p);
+    s.on(Click::ResetDefaults);
+    let fixed = "theme = \"light\"\nmystery = 1\n";
+    std::fs::write(&p, fixed).unwrap();
+    assert_eq!(s.on(Click::Replace), vec![]);
+    assert_eq!((s.modal.clone(), s.stale, s.form.theme), (None, false, 2));
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), fixed, "not overwritten");
+    assert!(!dir.join("config.toml.bak").exists(), "no backup either");
+    // Still broken, but differently: the reset goes ahead with the new file.
+    std::fs::write(&p, "oops\n").unwrap();
+    let mut s = settings_at(&p);
+    s.on(Click::ResetDefaults);
+    std::fs::write(&p, "still broken\n").unwrap();
+    assert!(matches!(&s.on(Click::Replace)[..], [Act::Saved(_)]));
+    assert_eq!(std::fs::read_to_string(dir.join("config.toml.bak")).unwrap(), "still broken\n");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -320,7 +353,13 @@ fn folder_notes() {
     assert_eq!(folder_note(&here), None);
     #[cfg(windows)]
     {
-        assert!(folder_note(r"\shots").unwrap().contains("relative"), "no drive");
+        assert_eq!(
+            folder_note(r"\shots").as_deref(),
+            Some("A folder without a drive is saved relative to the root of the current drive."),
+            "no drive"
+        );
+        assert_eq!(folder_kind(r"C:\Users\x"), FolderKind::Root(PathBuf::from(r"C:\")));
+        assert!(!remote_drive(Path::new(r"C:\")), "the system drive is local");
         // A drive letter that is not there (the last one free, if any).
         if let Some(d) = ('D'..='Z').rev().find(|d| !Path::new(&format!(r"{d}:\")).exists()) {
             assert_eq!(folder_note(&format!(r"{d}:\shots")), Some(format!("Drive {d}: is not on this computer.")));
@@ -329,6 +368,68 @@ fn folder_notes() {
     }
     #[cfg(unix)]
     assert_eq!(folder_note("/no-such-root-rustshot/x"), Some("/no-such-root-rustshot does not exist.".into()));
+}
+
+/// The drive is probed once per root: typing within it reads the cache.
+#[test]
+fn folder_probe_is_cached_by_root() {
+    let mut s = sample();
+    let here = std::env::temp_dir();
+    let FolderKind::Root(root) = folder_kind(&here.display().to_string()) else { panic!("an absolute folder") };
+    // A cached answer for the root stands in for the disk.
+    s.folder_probe = Some((root.clone(), Some("cached".into())));
+    for t in [here.display().to_string(), here.join("a").display().to_string(), here.join("ab").display().to_string()] {
+        s.form.folder.set(&t);
+        assert_eq!(s.folder_note().as_deref(), Some("cached"), "{t}");
+    }
+    // A relative folder needs no probe and leaves the cache alone.
+    s.form.folder.set("shots");
+    assert!(s.folder_note().unwrap().contains("relative"));
+    assert_eq!(s.folder_probe.as_ref().map(|p| &p.0), Some(&root));
+}
+
+#[test]
+fn conflict_target_prefers_the_edited_row() {
+    let bad = [false, true, false, true];
+    assert_eq!(conflict_target(&bad, None), Some(1));
+    assert_eq!(conflict_target(&bad, Some(3)), Some(3), "the edited row is in the conflict");
+    assert_eq!(conflict_target(&bad, Some(2)), Some(1), "it is not: the first conflict");
+    assert_eq!(conflict_target(&[false; 4], Some(1)), None);
+    assert_eq!(conflict_target(&bad, Some(9)), Some(1));
+}
+
+/// A hotkey the daemon could not register: a note next to its box, and
+/// Apply / OK ask the daemon to try again though nothing changed.
+#[test]
+fn unregistered_hotkey_can_be_retried() {
+    use crate::hotkey::{Cause, Failure};
+    let dir = scratch("retry");
+    let p = dir.join("config.toml");
+    config::save_at(&p, &Config::default()).unwrap();
+    let mut s = settings_at(&p);
+    assert!(!s.retry_hotkeys());
+    assert_eq!((s.hotkey_slot_note(0), s.hotkey_slot_note(1)), (None, None));
+    assert_eq!(s.on(Click::Apply), vec![]);
+    s.hotkey_failures = vec![
+        Failure { slot: 0, wanted: "Ctrl+Alt+F9".into(), cause: Cause::InUse, kept: Some("Ctrl+Alt+Shift+Q".into()) },
+        Failure { slot: 1, wanted: "Ctrl+Alt+F10".into(), cause: Cause::Unknown, kept: None },
+    ];
+    assert!(s.retry_hotkeys() && !s.dirty());
+    assert_eq!(s.hotkey_slot_note(0).as_deref(), Some("Not registered — using Ctrl+Alt+Shift+Q"));
+    assert_eq!(s.hotkey_slot_note(1).as_deref(), Some("Not registered"));
+    assert_eq!(s.on(Click::Apply), vec![Act::Reload]);
+    assert_eq!(s.on(Click::Ok), vec![Act::Reload, Act::Close]);
+    assert_eq!(s.on(Click::Enter), vec![Act::Reload, Act::Close]);
+    assert_eq!(s.on(Click::Cancel), vec![Act::Close], "Cancel never retries");
+    // With a change it saves (the save makes the daemon reload anyway).
+    s.form.ask = true;
+    assert!(matches!(&s.on(Click::Apply)[..], [Act::Saved(_)]));
+    // Apply is enabled for the retry: a click on it lands.
+    let mut s = sample();
+    s.hotkey_failures = vec![Failure { slot: 0, wanted: "Ctrl+Alt+F9".into(), cause: Cause::InUse, kept: None }];
+    let (_, c) = render(&mut s, &DARK, 1.0, &click_at(W as f32 - PAD - 20.0, H as f32 - PAD - 16.0, 1.0), &mut FocusState::default());
+    assert_eq!(c, Some(Click::Apply));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A conflict scrolls its first row into view.
@@ -343,6 +444,17 @@ fn conflict_scrolls_into_view() {
     render(&mut s, &DARK, 1.0, &Input::default(), &mut focus);
     let r = s.table.row_rect(17).unwrap_or_else(|| panic!("Accept is visible: {:?} {:?}", s.table, s.conflict_row));
     assert!(r.h > 0.0 && s.table.scroll > 0.0);
+    // Editing a conflicting row far down (the other one is near the top):
+    // the edited row is the one revealed.
+    let mut s = sample();
+    s.tab = 2;
+    render(&mut s, &DARK, 1.0, &Input::default(), &mut focus);
+    let last = Action::ALL.len() - 1;
+    s.table.selected = Some(last);
+    s.form.keys.set(Action::ALL[last], vec![Chord::parse("P").unwrap()]); // Pencil's
+    render(&mut s, &DARK, 1.0, &Input::default(), &mut focus);
+    assert_eq!(s.conflict_row, Some(last));
+    assert!(s.table.row_rect(last).is_some_and(|r| r.h > 0.0), "{:?}", s.table);
 }
 
 #[test]
@@ -523,10 +635,23 @@ fn preview_settings_pngs() {
         s.notify("Couldn't register Ctrl+Alt+F9 — it's in use by another app; kept Shift+Win+X.".into());
         let (img, _) = render(&mut s, th, 1.0, &Input::default(), &mut FocusState::default());
         preview::save(&format!("settings-hotkey-failed-{tname}.png"), &img);
+        // Hotkeys the daemon could not register: notes by their boxes.
+        let mut s = sample();
+        s.hotkey_failures = vec![
+            crate::hotkey::Failure {
+                slot: 0,
+                wanted: "Ctrl+Alt+F9".into(),
+                cause: crate::hotkey::Cause::InUse,
+                kept: Some("Ctrl+Alt+Shift+F11".into()),
+            },
+            crate::hotkey::Failure { slot: 1, wanted: "Ctrl+Alt+F10".into(), cause: crate::hotkey::Cause::Unknown, kept: None },
+        ];
+        let (img, _) = render(&mut s, th, 1.0, &Input::default(), &mut FocusState::default());
+        preview::save(&format!("settings-hotkey-unregistered-{tname}.png"), &img);
         // A folder note (a drive that is not there).
         let mut s = sample();
         s.tab = 1;
-        s.folder_note = (s.form.folder.text.clone(), Some("Drive Q: is not on this computer.".into()));
+        s.folder_probe = Some((PathBuf::from(r"C:\"), Some("Drive Q: is not on this computer.".into())));
         let (img, _) = render(&mut s, th, 1.0, &Input::default(), &mut FocusState::default());
         preview::save(&format!("settings-folder-note-{tname}.png"), &img);
     }
@@ -554,6 +679,24 @@ fn preview_settings_pngs() {
     s.modal = Some(Modal::Broken("line 2: expected key = value".into()));
     let (img, _) = render(&mut s, &DARK, 1.5, &Input::default(), &mut FocusState::default());
     preview::save("settings-invalid-dark-150.png", &img);
+    let mut s = sample();
+    s.form.capture = Chord::parse("X");
+    s.hotkey_failures =
+        vec![crate::hotkey::Failure { slot: 1, wanted: "Ctrl+Alt+F10".into(), cause: crate::hotkey::Cause::InUse, kept: Some("Ctrl+Alt+Shift+Q".into()) }];
+    let (img, _) = render(&mut s, &DARK, 1.5, &Input::default(), &mut FocusState::default());
+    preview::save("settings-hotkey-unregistered-dark-150.png", &img);
+    // The most it can need: both notes under their boxes and the warning.
+    let long = |slot, kept: &str| crate::hotkey::Failure {
+        slot,
+        wanted: "Ctrl+Alt+F10".into(),
+        cause: crate::hotkey::Cause::InUse,
+        kept: Some(kept.into()),
+    };
+    let mut s = sample();
+    s.form.capture = Chord::parse("X");
+    s.hotkey_failures = vec![long(0, "Ctrl+Alt+Shift+Meta+F11"), long(1, "Ctrl+Alt+Shift+Meta+F12")];
+    let (img, _) = render(&mut s, &LIGHT, 1.0, &Input::default(), &mut FocusState::default());
+    preview::save("settings-hotkey-unregistered-worst-light.png", &img);
 }
 
 fn click_at(x: f32, y: f32, k: f32) -> Input {

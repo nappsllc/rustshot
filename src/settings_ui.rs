@@ -13,20 +13,21 @@
 //! A file that does not parse is never replaced by the defaults behind the
 //! user's back: the window shows the error ([`broken_text`]) and offers to
 //! open the file or, after a second question ([`RESET`]), to reset it
-//! (the old file is kept as `config.toml.bak`).
+//! (the old file is kept as `config.toml.bak`, `.bak.1`, ...).
 //! After a save the daemon reloads the config (re-registers its hotkeys,
 //! applies `check_updates`); every later capture uses it.
 //!
 //! Drawn with the `ui` kit in a `wind::run_window` window on its own
 //! thread, one window at a time: another request brings it to the front.
 //! A hotkey the daemon could not register after a save is reported in the
-//! open window ([`notify`]). macOS opens windows only on the main thread,
+//! open window ([`notify`]) and noted next to its box while it stays
+//! unregistered; Apply then asks the daemon to try again. macOS opens windows only on the main thread,
 //! so there the config file opens in the default editor instead.
 #![cfg_attr(target_os = "macos", allow(dead_code))]
 
 use crate::config::{self, Config};
 use crate::export;
-use crate::hotkey::HotEvent;
+use crate::hotkey::{self, HotEvent};
 use crate::keymap::{Action, Chord, Keymap};
 use crate::objects::FRect;
 use crate::pixbuf::PixBuf;
@@ -93,11 +94,24 @@ pub fn broken_text(e: &str) -> String {
     format!("config.toml has an error ({e}). Fix it or reset it.")
 }
 
-/// Where "Reset to defaults…" keeps the old file: `config.toml.bak`.
+/// Where "Reset to defaults…" keeps the old file: `config.toml.bak`, or
+/// `config.toml.bak.1`, `.bak.2`, ... when that is taken (backups never
+/// overwrite each other).
 pub fn backup_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_else(|| "config.toml".into());
     name.push(".bak");
-    path.with_file_name(name)
+    let first = path.with_file_name(&name);
+    if !first.exists() {
+        return first;
+    }
+    (1u32..)
+        .map(|n| {
+            let mut s = name.clone();
+            s.push(format!(".{n}"));
+            path.with_file_name(s)
+        })
+        .find(|p| !p.exists())
+        .expect("a free name")
 }
 
 fn labels<const N: usize>(list: &[(&'static str, &'static str); N]) -> [&'static str; N] {
@@ -290,12 +304,6 @@ impl Form {
             None
         }
     }
-
-    /// A word about the folder that does not stop the save: a relative
-    /// path, or a drive (root folder) this computer does not have.
-    pub fn folder_note(&self) -> Option<String> {
-        folder_note(self.folder.text.trim())
-    }
 }
 
 #[cfg(windows)]
@@ -305,15 +313,29 @@ const BARE_NOTE: &str = "A hotkey without Ctrl, Alt, Shift or Cmd takes that key
 #[cfg(not(any(windows, target_os = "macos")))]
 const BARE_NOTE: &str = "A hotkey without Ctrl, Alt, Shift or Super takes that key from every app.";
 
-/// See [`Form::folder_note`].
-fn folder_note(t: &str) -> Option<String> {
+/// The folder text, looked at without touching the disk.
+#[derive(Clone, Debug, PartialEq)]
+enum FolderKind {
+    /// Nothing to say (empty, or a network share: never probed).
+    Fine,
+    Note(String),
+    /// An absolute folder: its drive (Windows) or top-level folder must
+    /// be probed ([`probe_root`]).
+    Root(PathBuf),
+}
+
+fn folder_kind(t: &str) -> FolderKind {
     use std::path::Component;
     if t.is_empty() {
-        return None;
+        return FolderKind::Fine;
     }
     let p = Path::new(t);
-    if !p.has_root() || p.is_relative() {
-        return Some("A relative folder is saved under the folder Rustshot was started in.".into());
+    if !p.has_root() {
+        return FolderKind::Note("A relative folder is saved under the folder Rustshot was started in.".into());
+    }
+    if p.is_relative() {
+        // Windows: "\shots" has a root but no drive.
+        return FolderKind::Note("A folder without a drive is saved relative to the root of the current drive.".into());
     }
     // The drive (Windows) or the top-level folder (elsewhere: /media, /mnt).
     let mut root = PathBuf::new();
@@ -321,17 +343,62 @@ fn folder_note(t: &str) -> Option<String> {
         if let Component::Prefix(x) = c
             && matches!(x.kind(), std::path::Prefix::UNC(..) | std::path::Prefix::VerbatimUNC(..))
         {
-            return None; // a network share: not probed (it can take seconds)
+            return FolderKind::Fine; // a network share: not probed (it can take seconds)
         }
         root.push(c);
         if cfg!(windows) && matches!(c, Component::RootDir) || matches!(c, Component::Normal(_)) {
             break;
         }
     }
+    FolderKind::Root(root)
+}
+
+/// Whether `root` (from [`folder_kind`]) is there. A mapped network drive
+/// is not probed (that can block for seconds).
+fn probe_root(root: &Path) -> Option<String> {
+    #[cfg(windows)]
+    if remote_drive(root) {
+        return None;
+    }
     (!root.exists()).then(|| {
         let name = root.display().to_string();
         if cfg!(windows) { format!("Drive {} is not on this computer.", name.trim_end_matches('\\')) } else { format!("{name} does not exist.") }
     })
+}
+
+/// `GetDriveTypeW(root) == DRIVE_REMOTE`: a mapped network drive.
+#[cfg(windows)]
+fn remote_drive(root: &Path) -> bool {
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows::core::PCWSTR;
+    const DRIVE_REMOTE: u32 = 4;
+    let mut w: Vec<u16> = root.as_os_str().to_string_lossy().encode_utf16().collect();
+    if w.last() != Some(&(b'\\' as u16)) {
+        w.push(b'\\' as u16);
+    }
+    w.push(0);
+    unsafe { GetDriveTypeW(PCWSTR(w.as_ptr())) == DRIVE_REMOTE }
+}
+
+/// A word about the folder that does not stop the save: a relative
+/// path, or a drive (root folder) this computer does not have.
+#[cfg(test)]
+fn folder_note(t: &str) -> Option<String> {
+    match folder_kind(t) {
+        FolderKind::Fine => None,
+        FolderKind::Note(n) => Some(n),
+        FolderKind::Root(r) => probe_root(&r),
+    }
+}
+
+/// The shortcut row to scroll into view for a conflict: the selected
+/// (being edited) row when it is one of the conflicting rows, else the
+/// first conflicting row.
+fn conflict_target(bad: &[bool], selected: Option<usize>) -> Option<usize> {
+    match selected {
+        Some(i) if bad.get(i) == Some(&true) => Some(i),
+        _ => bad.iter().position(|b| *b),
+    }
 }
 
 /// The pattern field token buttons insert into.
@@ -392,6 +459,9 @@ pub enum Act {
     /// Show the folder picker.
     Browse,
     OpenConfig,
+    /// Nothing to save, but a hotkey is not registered: the daemon tries
+    /// again (it reloads the config).
+    Reload,
 }
 
 /// The window's state: the form, what it was loaded from, the tab and the
@@ -418,10 +488,14 @@ pub struct Settings {
     stale: bool,
     /// Messages waiting for the open question to close.
     pending: Vec<String>,
-    /// The first conflicting shortcut row last revealed.
+    /// The conflicting shortcut row last revealed ([`conflict_target`]).
     conflict_row: Option<usize>,
-    /// The folder text and its note (probing a drive every frame is slow).
-    folder_note: (String, Option<String>),
+    /// The drive (top-level folder) last probed and its note: probed
+    /// again only when the root changes, never while typing in it.
+    folder_probe: Option<(PathBuf, Option<String>)>,
+    /// The hotkeys the daemon could not register as saved
+    /// ([`hotkey::outstanding`]).
+    pub hotkey_failures: Vec<hotkey::Failure>,
     set_autostart: fn(bool) -> Result<(), String>,
 }
 
@@ -441,7 +515,8 @@ impl Settings {
             stale: false,
             pending: Vec::new(),
             conflict_row: None,
-            folder_note: (String::new(), None),
+            folder_probe: None,
+            hotkey_failures: Vec::new(),
             set_autostart: crate::autostart::set,
         }
     }
@@ -518,6 +593,42 @@ impl Settings {
         })
     }
 
+    /// The folder's note ([`folder_kind`]); the drive is probed once per
+    /// root.
+    fn folder_note(&mut self) -> Option<String> {
+        match folder_kind(self.form.folder.text.trim()) {
+            FolderKind::Fine => None,
+            FolderKind::Note(n) => Some(n),
+            FolderKind::Root(r) => {
+                if let Some((root, note)) = &self.folder_probe
+                    && *root == r
+                {
+                    return note.clone();
+                }
+                let note = probe_root(&r);
+                self.folder_probe = Some((r, note.clone()));
+                note
+            }
+        }
+    }
+
+    /// A hotkey is not registered as saved: Apply and OK ask the daemon to
+    /// try again even with nothing to save.
+    pub fn retry_hotkeys(&self) -> bool {
+        !self.hotkey_failures.is_empty()
+    }
+
+    /// The note next to hotkey `slot`'s box while it is not registered:
+    /// "Not registered — using Ctrl+Alt+Shift+Q" (the chord kept in its
+    /// place), or "Not registered".
+    pub fn hotkey_slot_note(&self, slot: usize) -> Option<String> {
+        let f = self.hotkey_failures.iter().find(|f| f.slot == slot)?;
+        Some(match &f.kept {
+            Some(k) => format!("Not registered — using {}", hotkey::chord_label(k)),
+            None => "Not registered".into(),
+        })
+    }
+
     /// Something differs from what is saved.
     pub fn dirty(&self) -> bool {
         let now = self.form.apply(&self.loaded, &self.loaded);
@@ -547,9 +658,11 @@ impl Settings {
             (c, _) => c,
         };
         match c {
+            Click::Ok if !self.dirty() && self.retry_hotkeys() => vec![Act::Reload, Act::Close],
             Click::Ok if !self.dirty() => vec![Act::Close],
             Click::Ok => self.save(true),
             Click::Apply if self.dirty() => self.save(false),
+            Click::Apply if self.retry_hotkeys() => vec![Act::Reload],
             Click::Apply => vec![],
             Click::Cancel => vec![Act::Close],
             Click::Save => {
@@ -633,10 +746,19 @@ impl Settings {
         acts
     }
 
-    /// The reset question's Replace: keep the broken file as
-    /// `config.toml.bak`, then write the defaults.
+    /// The reset question's Replace: read the file again (fixed
+    /// meanwhile: back to the form, nothing written); else keep it as
+    /// `config.toml.bak` (or the next free `.bak.N`), then write the
+    /// defaults.
     fn reset(&mut self) -> Vec<Act> {
-        let Some(Modal::Reset(_)) = &self.modal else { return vec![] };
+        let Some(Modal::Reset(e)) = &self.modal else { return vec![] };
+        // `recheck` works from the error state.
+        self.modal = Some(Modal::Broken(e.clone()));
+        if self.recheck() && !self.broken() {
+            return vec![];
+        }
+        let Some(Modal::Broken(e)) = &self.modal else { return vec![] };
+        self.modal = Some(Modal::Reset(e.clone()));
         let bak = backup_path(&self.path);
         if self.path.exists()
             && let Err(e) = std::fs::copy(&self.path, &bak)
@@ -709,7 +831,7 @@ fn paint(ui: &mut Ui, s: &mut Settings) -> Option<Click> {
         }
         let btns = [("ok", "OK", Click::Ok), ("cancel", "Cancel", Click::Cancel), ("apply", "Apply", Click::Apply)];
         let total: f32 = btns.iter().map(|b| ui.button_width(b.1)).sum::<f32>() + GAP * (btns.len() as f32 - 1.0);
-        let dirty = s.dirty();
+        let dirty = s.dirty() || s.retry_hotkeys();
         ui.area(bar, |ui| {
             ui.row(|ui| {
                 ui.space(inner - total);
@@ -783,12 +905,21 @@ fn question(ui: &mut Ui, m: &Modal) -> Option<Click> {
 
 fn general(ui: &mut Ui, s: &mut Settings, body: FRect) {
     let show_renderer = s.renderer;
+    let slot_notes = [s.hotkey_slot_note(0), s.hotkey_slot_note(1)];
     let f = &mut s.form;
     let note = f.hotkey_note();
+    // A hotkey that is not registered: a note right of its box, or under
+    // it when it does not fit there.
+    let side = body.w - (LABEL_W + GAP) - 200.0 - GAP;
+    let beside = slot_notes.clone().map(|n| n.is_none_or(|n| ui.text_width(&n) <= side));
+    let rows = beside.iter().filter(|b| !**b).count() + note.is_some() as usize;
     ui.area(body, |ui| {
-        // Spread out over the tab (less so when the hotkey note needs a row).
-        let roomy = note.is_none();
-        ui.lay.gap = if roomy { 12.0 } else { 8.0 };
+        // Spread out over the tab; less so when hotkey notes need room,
+        // and tighter still (with short note rows) for two or more rows.
+        let roomy = note.is_none() && slot_notes.iter().all(Option::is_none);
+        let tight = rows >= 2;
+        ui.lay.gap = if roomy { 12.0 } else if tight { 6.0 } else { 8.0 };
+        let note_h = if tight { 18.0 } else { ROW };
         ui.heading("Appearance");
         field(ui, "Theme", |ui| {
             ui.dropdown("theme", &labels(&THEMES), &mut f.theme);
@@ -817,16 +948,26 @@ fn general(ui: &mut Ui, s: &mut Settings, body: FRect) {
         }
         ui.heading("Global hotkeys");
         ui.allow_meta = true;
-        field(ui, "Capture", |ui| {
-            ui.key_capture("capture_hotkey", &mut f.capture);
-        });
-        field(ui, "Quit Rustshot", |ui| {
-            ui.key_capture("quit_hotkey", &mut f.quit);
-        });
+        let boxes: [(&str, &str, &mut Option<Chord>); 2] =
+            [("Capture", "capture_hotkey", &mut f.capture), ("Quit Rustshot", "quit_hotkey", &mut f.quit)];
+        for (((label, id, chord), n), fits) in boxes.into_iter().zip(&slot_notes).zip(beside) {
+            field(ui, label, |ui| {
+                ui.key_capture(id, chord);
+                if let (Some(n), true) = (n, fits) {
+                    ui.error_note(n);
+                }
+            });
+            if let (Some(n), false) = (n, fits) {
+                ui.row(|ui| {
+                    ui.space(LABEL_W + GAP);
+                    ui.height(note_h).error_note(n);
+                });
+            }
+        }
         if let Some(n) = note {
             ui.row(|ui| {
                 ui.space(LABEL_W + GAP);
-                ui.error_note(n);
+                ui.height(note_h).error_note(n);
             });
         }
         ui.allow_meta = false;
@@ -835,10 +976,7 @@ fn general(ui: &mut Ui, s: &mut Settings, body: FRect) {
 
 fn saving(ui: &mut Ui, s: &mut Settings, body: FRect, click: &mut Option<Click>) {
     let base = s.loaded.clone();
-    if s.folder_note.0 != s.form.folder.text {
-        s.folder_note = (s.form.folder.text.clone(), s.form.folder_note());
-    }
-    let folder_note = s.folder_note.1.clone();
+    let folder_note = s.folder_note();
     let f = &mut s.form;
     let mut target = s.pattern;
     let mut token = None;
@@ -955,13 +1093,15 @@ fn shortcuts(ui: &mut Ui, s: &mut Settings, body: FRect, click: &mut Option<Clic
     let cols = [Col { title: "Description", frac: 0.62 }, Col { title: "Key", frac: 0.38 }];
     let note_h = if note.is_some() { 20.0 + GAP } else { 0.0 };
     let table_h = body.h - ROW - GAP - note_h;
-    // A new conflict: scroll its first row into view.
-    let first_bad = rows.iter().position(|r| r.2);
-    if first_bad != s.conflict_row {
-        if let Some(i) = first_bad {
+    // A new conflict: scroll the edited row (when it is one of them) or
+    // the first conflicting row into view.
+    let bad: Vec<bool> = rows.iter().map(|r| r.2).collect();
+    let target = conflict_target(&bad, s.table.selected);
+    if target != s.conflict_row {
+        if let Some(i) = target {
             s.table.reveal(i, table_h);
         }
-        s.conflict_row = first_bad;
+        s.conflict_row = target;
     }
     let mut record = false;
     ui.area(body, |ui| {
@@ -1018,6 +1158,13 @@ pub fn set_daemon(tx: Sender<HotEvent>) {
     *lock(&DAEMON) = Some(tx);
 }
 
+/// Ask the daemon (if any) to read the config again.
+fn reload_daemon() {
+    if let Some(d) = lock(&DAEMON).as_ref() {
+        let _ = d.send(HotEvent::ReloadConfig);
+    }
+}
+
 /// Show `text` in the open Settings window (over the form, with OK);
 /// false when no window is open (the caller tells the user some other way).
 pub fn notify(text: &str) -> bool {
@@ -1061,7 +1208,8 @@ fn claim() -> Option<Receiver<Msg>> {
 
 fn run(rx: Receiver<Msg>) {
     let autostart = crate::update::managed_install().is_none().then(crate::autostart::is_enabled);
-    let s = Settings::open(config::config_path(), autostart);
+    let mut s = Settings::open(config::config_path(), autostart);
+    s.hotkey_failures = hotkey::outstanding();
     let th = crate::theme::resolve(&s.loaded);
     let mut w = Window::new(s, th, rx);
     let spec = WindowSpec { title: "Rustshot Settings".into(), w: W, h: H, resizable: false, min: (W, H) };
@@ -1131,10 +1279,9 @@ impl Window {
             Act::Close => self.closing = true,
             Act::Saved(cfg) => {
                 self.th = crate::theme::resolve(&cfg);
-                if let Some(d) = lock(&DAEMON).as_ref() {
-                    let _ = d.send(HotEvent::ReloadConfig);
-                }
+                reload_daemon();
             }
+            Act::Reload => reload_daemon(),
             Act::Browse if !self.picking => {
                 self.picking = true;
                 let start = PathBuf::from(self.s.form.folder.text.trim());
@@ -1265,6 +1412,12 @@ impl Driver for Window {
                         self.th = crate::theme::resolve(&self.s.loaded);
                         changed = true;
                     }
+                }
+                // A hotkey registered (or failed) since: its note follows.
+                let failures = hotkey::outstanding();
+                if failures != self.s.hotkey_failures {
+                    self.s.hotkey_failures = failures;
+                    changed = true;
                 }
                 while let Ok(p) = self.picked.1.try_recv() {
                     self.picking = false;

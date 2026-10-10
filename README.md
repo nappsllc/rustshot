@@ -96,23 +96,26 @@ rustshot --help
 Open **Settings…** from the tray menu, or run `rustshot settings` (a running
 daemon opens its window; otherwise the window opens on its own). Three tabs:
 
-- **General:** theme (Auto follows the OS), the overlay renderer (Windows),
-  start at login (hidden for store installs), the daily update check, and
-  the global capture and quit hotkeys (click a box, then press the keys;
-  <kbd>Backspace</kbd> clears it). *Open config file* opens `config.toml`.
+- **General:** theme (Auto follows the OS), the overlay renderer
+  (Windows), start at login (hidden for store installs), the daily update
+  check, and the global capture and quit hotkeys (click a box, then press
+  the keys; <kbd>Backspace</kbd> clears it). *Open config file* opens
+  `config.toml`.
 - **Saving:** see [Saving](#saving).
 - **Shortcuts:** every editor shortcut (see below).
 
 **OK** saves and closes, **Apply** saves and keeps the window open,
 **Cancel** (or <kbd>Esc</kbd>) discards. The running daemon picks the new
 settings up at once: the next capture uses them and the hotkeys are
-re-registered; a hotkey another app already uses is reported (in the
-window, or as a tray notification) and the previous one is kept. Saving
+re-registered. A hotkey that cannot be registered (another app uses it,
+or it is not a valid hotkey) is reported once, in the window or as a tray
+notification, and the previous one is kept; while it stays unregistered
+the window says so next to its box, and **Apply** tries again. Saving
 rewrites `config.toml`: if the file has comments or keys Rustshot does not
 know, the first save asks before removing them. A `config.toml` with an
 error is never overwritten silently: the window shows the error and offers
 *Open config file* or *Reset to defaults…* (after a second question; the
-old file is kept as `config.toml.bak`).
+old file is kept as `config.toml.bak`, then `.bak.1`, `.bak.2`, ...).
 
 On Linux, *Browse…* needs `zenity` or `kdialog`, and pasting into the text
 fields needs `wl-paste` (Wayland), `xclip` or `xsel`.
