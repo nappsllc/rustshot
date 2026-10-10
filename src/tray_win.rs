@@ -72,16 +72,76 @@ fn base_data(hwnd: HWND) -> NOTIFYICONDATAW {
     }
 }
 
-/// Loaded once; the handle is shared (and intentionally never destroyed).
-fn icon() -> HICON {
-    static ICON: OnceLock<usize> = OnceLock::new();
-    HICON(*ICON.get_or_init(|| unsafe { load_icon().0 as usize }) as *mut _)
+/// Cached glyph HICON (as usize; 0 = none yet). Replaced on theme/DPI change.
+static GLYPH: Mutex<usize> = Mutex::new(0);
+
+/// True when the taskbar uses the light theme (missing value = dark).
+fn taskbar_is_light() -> bool {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+    let mut val: u32 = 0;
+    let mut len = std::mem::size_of::<u32>() as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
+            w!("SystemUsesLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&raw mut val).cast()),
+            Some(&raw mut len),
+        )
+    };
+    rc.is_ok() && val == 1
 }
 
+/// Render the glyph at the tray size for `hwnd`'s DPI into a new HICON.
+fn build_glyph(hwnd: HWND) -> Option<HICON> {
+    use windows::Win32::Graphics::Gdi::*;
+    use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow, GetSystemMetricsForDpi};
+    unsafe {
+        let mut dpi = GetDpiForWindow(hwnd);
+        if dpi == 0 {
+            dpi = GetDpiForSystem();
+        }
+        let size = GetSystemMetricsForDpi(SM_CXSMICON, dpi.max(96)).max(16) as u32;
+        let rgb = if taskbar_is_light() { (0x1B, 0x1C, 0x20) } else { (255, 255, 255) };
+        let rgba = tray::tray_glyph_rgba(size, rgb);
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: size as i32,
+                biHeight: -(size as i32), // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let color = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        if bits.is_null() {
+            let _ = DeleteObject(color.into());
+            return None;
+        }
+        let dst = std::slice::from_raw_parts_mut(bits.cast::<u8>(), rgba.len());
+        for (d, s) in dst.chunks_exact_mut(4).zip(rgba.chunks_exact(4)) {
+            d.copy_from_slice(&[s[2], s[1], s[0], s[3]]); // RGBA -> BGRA, straight alpha
+        }
+        let mask_bytes = vec![0u8; (size as usize).div_ceil(16) * 2 * size as usize];
+        let mask = CreateBitmap(size as i32, size as i32, 1, 1, Some(mask_bytes.as_ptr().cast()));
+        let info = ICONINFO { fIcon: true.into(), xHotspot: 0, yHotspot: 0, hbmMask: mask, hbmColor: color };
+        let icon = CreateIconIndirect(&info).ok();
+        let _ = DeleteObject(color.into());
+        let _ = DeleteObject(mask.into());
+        icon
+    }
+}
+
+/// The app icon (resource 1) at the small-icon size: fallback if the glyph fails.
 unsafe fn load_icon() -> HICON {
     unsafe {
         let hinst = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
-        // Resource ID 1 is the app icon embedded by build.rs.
         let img = LoadImageW(
             Some(hinst.into()),
             PCWSTR(std::ptr::without_provenance(1)),
@@ -97,12 +157,42 @@ unsafe fn load_icon() -> HICON {
     }
 }
 
+/// Cached glyph icon, rendering it on first use.
+fn icon(hwnd: HWND) -> HICON {
+    let mut g = GLYPH.lock().unwrap();
+    if *g == 0 {
+        *g = match build_glyph(hwnd) {
+            Some(h) => h.0 as usize,
+            None => return unsafe { load_icon() },
+        };
+    }
+    HICON(*g as *mut _)
+}
+
+/// Theme or DPI changed: re-render the glyph and swap it into the tray icon.
+fn refresh_icon(hwnd: HWND) {
+    if *GLYPH.lock().unwrap() == 0 {
+        return; // not added yet
+    }
+    let Some(new) = build_glyph(hwnd) else { return };
+    let old = std::mem::replace(&mut *GLYPH.lock().unwrap(), new.0 as usize);
+    unsafe {
+        let mut nid = base_data(hwnd);
+        nid.uFlags = NIF_ICON;
+        nid.hIcon = new;
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+        if old != 0 {
+            let _ = DestroyIcon(HICON(old as *mut _));
+        }
+    }
+}
+
 fn add_icon(hwnd: HWND) {
     unsafe {
         let mut nid = base_data(hwnd);
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_TRAYICON;
-        nid.hIcon = icon();
+        nid.hIcon = icon(hwnd);
         copy_wide(&mut nid.szTip, "rustshot");
         if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
             eprintln!("rustshot: could not add the notification-area icon");
@@ -202,6 +292,20 @@ pub fn handle(hwnd: HWND, m: u32, _w: WPARAM, l: LPARAM) -> Option<LRESULT> {
             if let Some(text) = BALLOON.lock().unwrap().take() {
                 balloon(hwnd, &text);
             }
+        }
+        WM_DPICHANGED => refresh_icon(hwnd),
+        WM_SETTINGCHANGE => {
+            // lParam is a wide string naming the changed setting; theme switches send this one.
+            let is_theme = l.0 != 0 && {
+                let p = l.0 as *const u16;
+                let want: Vec<u16> = "ImmersiveColorSet".encode_utf16().collect();
+                (0..want.len()).all(|i| unsafe { *p.add(i) } == want[i])
+                    && unsafe { *p.add(want.len()) } == 0
+            };
+            if !is_theme {
+                return None;
+            }
+            refresh_icon(hwnd);
         }
         WM_TRAYICON => match l.0 as u32 {
             WM_LBUTTONUP => send(HotEvent::Capture),

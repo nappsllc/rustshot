@@ -61,6 +61,43 @@ pub fn spawn(tx: Sender<HotEvent>) {
     let _ = tx; // macOS / Linux backends arrive in later tasks.
 }
 
+/// Tray glyph on a 16-unit grid: four rounded corner brackets (stroked) and a centre dot.
+const GLYPH_PATH: &str = "M1.5 6V3.5a2 2 0 0 1 2-2H6 M10 1.5h2.5a2 2 0 0 1 2 2V6 M14.5 10v2.5a2 2 0 0 1-2 2H10 M6 14.5H3.5a2 2 0 0 1-2-2V10";
+const GLYPH_STROKE: f32 = 1.6;
+const GLYPH_DOT_R: f32 = 2.4;
+
+/// Monochrome tray glyph as straight-alpha RGBA, `size`x`size`, in colour `rgb`.
+/// Coverage is rasterised white-on-black into an opaque scratch buffer (the
+/// rasterizer assumes an opaque destination) and its red channel becomes alpha.
+#[allow(dead_code)] // Windows today; the macOS/Linux trays reuse it later
+pub fn tray_glyph_rgba(size: u32, rgb: (u8, u8, u8)) -> Vec<u8> {
+    use crate::raster::Blend;
+    use crate::uifb::{C4, Fb};
+    let n = size as usize;
+    let k = size as f32 / 16.0;
+    let mut scratch = [0u8, 0, 0, 255].repeat(n * n);
+    let white = C4::rgb(255, 255, 255);
+    {
+        let mut fb = Fb::new(&mut scratch, n);
+        if let Some(lines) = crate::icon_path::parse_path(GLYPH_PATH) {
+            let mut surf = fb.surf();
+            for mut line in lines {
+                for p in &mut line {
+                    p.x *= k;
+                    p.y *= k;
+                }
+                surf.stroke_polyline(&line, GLYPH_STROKE * k, white, Blend::Normal);
+            }
+        }
+        fb.fill_circle(8.0 * k, 8.0 * k, GLYPH_DOT_R * k, white);
+    }
+    let mut out = Vec::with_capacity(n * n * 4);
+    for px in scratch.chunks_exact(4) {
+        out.extend_from_slice(&[rgb.0, rgb.1, rgb.2, px[0]]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +134,62 @@ mod tests {
         assert!(update_message(&Err("boom".into())).contains("boom"));
         let r = crate::update::Release { version: "9.9.9".into(), url: String::new() };
         assert!(update_message(&Ok(Some(r))).contains("9.9.9"));
+    }
+
+    fn alpha(buf: &[u8], size: u32, x: u32, y: u32) -> u8 {
+        buf[((y * size + x) * 4 + 3) as usize]
+    }
+
+    #[test]
+    fn glyph_shape() {
+        for size in [16u32, 32] {
+            let b = tray_glyph_rgba(size, (27, 28, 32));
+            assert_eq!(b.len(), (size * size * 4) as usize);
+            let c = size / 2;
+            let i = ((c * size + c) * 4) as usize;
+            assert_eq!(&b[i..i + 4], &[27, 28, 32, 255]);
+            let u = size as f32 / 16.0;
+            // Corner brackets: the arc apex and the straight runs have coverage.
+            assert!(alpha(&b, size, (2.1 * u) as u32, (2.1 * u) as u32) > 100);
+            assert!(alpha(&b, size, (13.9 * u) as u32, (13.9 * u) as u32) > 100);
+            // Gap between bracket and dot, and the image corners, are empty.
+            assert_eq!(alpha(&b, size, (4.5 * u) as u32, (4.5 * u) as u32), 0);
+            for (x, y) in [(0, 0), (size - 1, 0), (0, size - 1), (size - 1, size - 1)] {
+                assert_eq!(alpha(&b, size, x, y), 0);
+            }
+        }
+    }
+
+    /// Writes enlarged previews for eyeballing; run with --ignored.
+    #[test]
+    #[ignore = "writes preview PNGs to the scratchpad"]
+    fn write_glyph_previews() {
+        let dir = std::path::Path::new(
+            "C:/Users/plato/AppData/Local/Temp/claude/E--Personal-rustshot/388c4929-22ab-4934-9dbf-1b81d7818b10/scratchpad/glyph",
+        );
+        std::fs::create_dir_all(dir).unwrap();
+        for size in [16u32, 20, 24, 32] {
+            for (name, fg, bg) in [("dark", (255u8, 255u8, 255u8), 0x20u8), ("light", (27, 28, 32), 0xF3)] {
+                let g = tray_glyph_rgba(size, fg);
+                let scale = 8u32;
+                let w = size * scale;
+                let mut img = Vec::with_capacity((w * w * 3) as usize);
+                for y in 0..w {
+                    for x in 0..w {
+                        let i = (((y / scale) * size + x / scale) * 4) as usize;
+                        let a = g[i + 3] as u32;
+                        for ch in 0..3 {
+                            let v = (g[i + ch] as u32 * a + bg as u32 * (255 - a) + 127) / 255;
+                            img.push(v as u8);
+                        }
+                    }
+                }
+                let f = std::fs::File::create(dir.join(format!("glyph_{size}_{name}.png"))).unwrap();
+                let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w, w);
+                enc.set_color(png::ColorType::Rgb);
+                enc.set_depth(png::BitDepth::Eight);
+                enc.write_header().unwrap().write_image_data(&img).unwrap();
+            }
+        }
     }
 }
