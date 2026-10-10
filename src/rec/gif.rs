@@ -7,7 +7,10 @@
 //! histogram (no dither) and compressed with variable-width LZW. A frame's
 //! delay is patched in once the next frame's timestamp is known
 //! (centiseconds, rounded on the running total so errors do not add up);
-//! frames identical to the previous one only extend its delay.
+//! frames identical to the previous one only extend its delay. A delay
+//! longer than the field holds (655.35 s of no change) is continued by
+//! 1×1 transparent filler frames. After any write error the encoder is
+//! poisoned: later pushes fail and `finish` returns an error.
 
 use super::{Frame, VideoEncoder};
 use anyhow::{bail, Context, Result};
@@ -37,6 +40,8 @@ pub struct GifEncoder<W: Write + Seek> {
     delay_at: Option<u64>,
     quant: Quantizer,
     indices: Vec<u8>,
+    /// A write failed: the stream is incomplete and must not be kept.
+    poisoned: bool,
 }
 
 impl GifEncoder<BufWriter<std::fs::File>> {
@@ -72,6 +77,7 @@ impl<W: Write + Seek> GifEncoder<W> {
             delay_at: None,
             quant: Quantizer::new(),
             indices: Vec::new(),
+            poisoned: false,
         })
     }
 
@@ -82,15 +88,50 @@ impl<W: Write + Seek> GifEncoder<W> {
 
     /// Fill in the last frame's delay so it lasts until `end_cs` (since
     /// the first frame).
+    /// A delay longer than the 16-bit field is split over filler frames,
+    /// so later frames keep their times.
     fn patch_delay(&mut self, end_cs: u64) -> Result<()> {
-        let Some(at) = self.delay_at.take() else { return Ok(()) };
-        let d = end_cs.saturating_sub(self.written_cs).clamp(MIN_DELAY_CS, 0xFFFF);
+        let Some(mut at) = self.delay_at.take() else { return Ok(()) };
+        let mut d = end_cs.saturating_sub(self.written_cs).max(MIN_DELAY_CS);
+        while d > 0xFFFF {
+            self.write_delay(at, 0xFFFF)?;
+            d = (d - 0xFFFF).max(MIN_DELAY_CS);
+            at = self.write_filler()?;
+        }
+        self.write_delay(at, d)
+    }
+
+    /// Seek-patch the delay field at `at` to `d` centiseconds.
+    fn write_delay(&mut self, at: u64, d: u64) -> Result<()> {
         self.written_cs += d;
         let here = self.w.stream_position()?;
         self.w.seek(SeekFrom::Start(at))?;
         self.w.write_all(&(d as u16).to_le_bytes())?;
         self.w.seek(SeekFrom::Start(here))?;
         Ok(())
+    }
+
+    /// A graphic control extension (do not dispose; delay 0 for now);
+    /// returns the stream offset of its delay field.
+    fn write_gce(&mut self, transparent: Option<u8>) -> Result<u64> {
+        let packed = (1 << 2) | u8::from(transparent.is_some());
+        self.w.write_all(&[0x21, 0xF9, 0x04, packed])?;
+        let at = self.w.stream_position()?;
+        self.w.write_all(&[0, 0, transparent.unwrap_or(0), 0])?;
+        Ok(at)
+    }
+
+    /// A 1×1 fully transparent frame that changes nothing on screen;
+    /// returns the offset of its delay field.
+    fn write_filler(&mut self) -> Result<u64> {
+        let at = self.write_gce(Some(0))?;
+        // Descriptor at (0,0) 1×1 with a 2-entry local table; LZW min size 2.
+        self.w.write_all(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0x80, 0, 0, 0, 0, 0, 0, 2])?;
+        let data = lzw_encode(&[0], 2);
+        self.w.write_all(&[data.len() as u8])?;
+        self.w.write_all(&data)?;
+        self.w.write_all(&[0])?;
+        Ok(at)
     }
 
     fn since_first_cs(&self, ts: Duration) -> u64 {
@@ -141,12 +182,9 @@ impl<W: Write + Seek> GifEncoder<W> {
         let quant = &self.quant;
         self.indices.extend(in_box().map(|i| if same(i) { tidx } else { quant.index(px[i]) }));
 
-        let out = &mut self.w;
         // Graphic control extension: do not dispose, delay patched later.
-        let packed = (1 << 2) | u8::from(transparent);
-        out.write_all(&[0x21, 0xF9, 0x04, packed])?;
-        self.delay_at = Some(out.stream_position()?);
-        out.write_all(&[0, 0, if transparent { tidx } else { 0 }, 0])?;
+        self.delay_at = Some(self.write_gce(transparent.then_some(tidx))?);
+        let out = &mut self.w;
         // Image descriptor with a local colour table.
         out.write_all(&[0x2C])?;
         for v in [x0, y0, bw, bh] {
@@ -174,7 +212,13 @@ impl<W: Write + Seek + Send> VideoEncoder for GifEncoder<W> {
         if (f.w, f.h) != (self.width, self.height) || f.bgra.len() != f.w as usize * f.h as usize * 4 {
             bail!("frame is {}x{} ({} bytes); the GIF is {}x{}", f.w, f.h, f.bgra.len(), self.width, self.height);
         }
-        self.write_frame(f)?;
+        if self.poisoned {
+            bail!("the GIF is incomplete after an earlier write error");
+        }
+        if let Err(e) = self.write_frame(f) {
+            self.poisoned = true;
+            return Err(e);
+        }
         self.last_ts = self.last_ts.max(f.ts);
         match &mut self.prev {
             Some(p) => p.copy_from_slice(&f.bgra),
@@ -188,6 +232,9 @@ impl<W: Write + Seek + Send> VideoEncoder for GifEncoder<W> {
     }
 
     fn finish(mut self: Box<Self>) -> Result<()> {
+        if self.poisoned {
+            bail!("the GIF is incomplete after a write error");
+        }
         self.end()
     }
 

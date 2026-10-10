@@ -19,6 +19,7 @@ mod proc_win;
 mod raster;
 // Screen recording pipeline; the platform capture and the UI that start it
 // come in later tasks, so nothing outside its tests calls it yet.
+// Remove this allow when the recording UI (video Task 3) wires it up.
 #[allow(dead_code)]
 mod rec;
 mod settings_ui;

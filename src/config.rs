@@ -359,10 +359,21 @@ pub fn check() -> Result<()> {
     if let Some(w) = renderer_warning(&cfg.renderer) {
         println!("warning: {w}");
     }
-    for w in shortcut_warnings(&cfg) {
+    for w in shortcut_warnings(&cfg).into_iter().chain(hotkey_warnings(&cfg)) {
         println!("warning: {w}");
     }
     Ok(())
+}
+
+/// Global hotkeys (`capture_hotkey`, `quit_hotkey`, `record_hotkey`) that
+/// do not parse as a chord. Warnings rather than parse errors, so configs
+/// that load today keep loading; an empty value means unbound.
+pub fn hotkey_warnings(cfg: &Config) -> Vec<String> {
+    [("capture_hotkey", &cfg.capture_hotkey), ("quit_hotkey", &cfg.quit_hotkey), ("record_hotkey", &cfg.record_hotkey)]
+        .into_iter()
+        .filter(|(_, v)| !v.trim().is_empty() && crate::keymap::Chord::parse(v).is_none())
+        .map(|(k, v)| format!("{k} = {v:?} is not a valid hotkey; it will not be registered"))
+        .collect()
 }
 
 /// `[shortcuts]` problems: unknown actions, bad chords, and chords bound
@@ -1108,6 +1119,12 @@ bogus = 1
         };
         assert_eq!(parse_config(&to_toml(&c)).unwrap(), c);
         assert!(!rewrite_loses(&to_toml(&c)));
+        // Global hotkeys: bad chords warn (the file still loads), empty = unbound.
+        assert!(hotkey_warnings(&d).is_empty() && hotkey_warnings(&c).is_empty());
+        let h = parse_config("capture_hotkey = \"Ctrl+Nope\"\nquit_hotkey = \"\"\nrecord_hotkey = \"Shift+\"\n").unwrap();
+        let w = hotkey_warnings(&h);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].starts_with("capture_hotkey = \"Ctrl+Nope\"") && w[1].starts_with("record_hotkey"), "{w:?}");
         // Enumerations are trimmed and case-folded.
         let t = parse_config(concat!(
             "rec_format = \" GIF \"\n",

@@ -65,6 +65,22 @@ impl Input {
         let used = (self.pos as usize).min(n);
         self.buf.drain(..used);
         self.pos -= used as f64;
+        // Past the end of the input (an underrun) the read position is a
+        // debt that later input pays off first, so a source a little late
+        // stays in sync. A longer gap (WASAPI loopback sends nothing while
+        // nothing plays) is inserted silence: the debt is capped at the lag
+        // window so the audio after the gap is not dropped.
+        self.pos = self.pos.min(self.max_debt());
+    }
+
+    /// Most read position held past the end of the input, in input frames.
+    fn max_debt(&self) -> f64 {
+        f64::from(self.src.rate()) * super::AUDIO_LAG.as_secs_f64()
+    }
+
+    /// Input frames pending beyond the read position (negative with a debt).
+    fn available(&self) -> f64 {
+        self.buf.len() as f64 - self.pos
     }
 }
 
@@ -126,6 +142,21 @@ impl Mixer {
             s.buf.clear();
             s.pos = 0.0;
         }
+    }
+
+    /// Read input without producing output.
+    pub fn feed(&mut self) {
+        for s in &mut self.inputs {
+            s.read();
+        }
+    }
+
+    /// Whether every source has input up to `until` (as of the last read),
+    /// so a [`Mixer::pull`] to it would not underrun.
+    pub fn covered(&self, until: Duration) -> bool {
+        let target = (until.as_nanos() * u128::from(RATE) / 1_000_000_000) as u64;
+        let frames = target.saturating_sub(self.produced) as f64;
+        self.inputs.iter().all(|s| s.available() >= frames * f64::from(s.src.rate()) / f64::from(RATE))
     }
 }
 
@@ -204,15 +235,6 @@ mod tests {
         assert!(worst < 1e-4, "{worst}");
     }
 
-    impl Mixer {
-        /// Read input without producing output.
-        fn feed(&mut self) {
-            for s in &mut self.inputs {
-                s.read();
-            }
-        }
-    }
-
     #[test]
     fn sums_with_gain_and_clamps() {
         let a = fake(48_000, 2, [0.75, -0.75].repeat(480));
@@ -239,6 +261,54 @@ mod tests {
         let mut m = Mixer::new(vec![fake(48_000, 4, quad)]);
         let out = m.pull(Duration::from_millis(10));
         assert!(out.as_chunks::<2>().0.iter().all(|f| *f == [0.1, 0.2]));
+    }
+
+    /// Hands out whatever the test queued since the last read.
+    struct Queued(std::sync::Arc<std::sync::Mutex<Vec<f32>>>);
+
+    impl AudioSource for Queued {
+        fn rate(&self) -> u32 {
+            48_000
+        }
+        fn channels(&self) -> u16 {
+            1
+        }
+        fn read(&mut self, out: &mut Vec<f32>) -> usize {
+            let mut q = self.0.lock().unwrap();
+            let n = q.len();
+            out.append(&mut q);
+            n
+        }
+    }
+
+    #[test]
+    fn a_long_gap_does_not_swallow_the_audio_after_it() {
+        // Loopback sends nothing for 3 s (nothing plays), then a tone.
+        let q = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut m = Mixer::new(vec![Box::new(Queued(q.clone()))]);
+        let mut out = Vec::new();
+        for ms in (10..=3000).step_by(10) {
+            out.extend(m.pull(Duration::from_millis(ms)));
+        }
+        assert!(out.iter().all(|&v| v == 0.0));
+        q.lock().unwrap().extend(std::iter::repeat_n(0.5f32, 48_000));
+        for ms in (3010..=4500).step_by(10) {
+            out.extend(m.pull(Duration::from_millis(ms)));
+        }
+        let first = out.iter().position(|&v| v != 0.0).expect("the tone is in the output") / 2;
+        let onset = Duration::from_secs_f64(first as f64 / 48_000.0);
+        assert!((Duration::from_secs(3)..=Duration::from_millis(3100)).contains(&onset), "tone at {onset:?}");
+        let tone = out.iter().filter(|&&v| v == 0.5).count() / 2;
+        assert!(tone >= 48_000 * 85 / 100, "{tone} of 48000 tone frames played");
+        // A debt within the lag window is still paid off (late input keeps sync).
+        let mut m = Mixer::new(vec![Box::new(Queued(q.clone()))]);
+        m.pull(Duration::from_millis(50));
+        assert!(!m.covered(Duration::from_millis(60)));
+        q.lock().unwrap().extend((0..4800).map(|i| if i < 2400 { 0.25f32 } else { 0.75 }));
+        m.feed();
+        assert!(m.covered(Duration::from_millis(100)) && !m.covered(Duration::from_millis(101)));
+        let o = m.pull(Duration::from_millis(100));
+        assert!(o.iter().all(|&v| v == 0.75), "the 50 ms owed were skipped");
     }
 
     #[test]

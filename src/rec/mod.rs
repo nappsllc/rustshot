@@ -18,7 +18,7 @@ pub mod mix;
 pub use mix::Mixer;
 
 use crate::capture::IRect;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,6 +44,11 @@ pub struct Clock {
     started: Instant,
     paused_at: Option<Instant>,
     paused_total: Duration,
+    /// Pauses so far: a reader that saw a different count knows a pause
+    /// happened since, even if it was already resumed.
+    pauses: u64,
+    /// Clock time at the latest pause.
+    last_pause: Duration,
 }
 
 impl Clock {
@@ -67,12 +72,26 @@ impl Clock {
         self.paused_at.is_some()
     }
 
+    /// How many times the clock was paused (the pause epoch).
+    pub fn pauses(&self) -> u64 {
+        self.pauses
+    }
+
+    /// Clock time at the latest pause (zero before any).
+    pub fn last_pause(&self) -> Duration {
+        self.last_pause
+    }
+
     fn start_at(t: Instant) -> Clock {
-        Clock { started: t, paused_at: None, paused_total: Duration::ZERO }
+        Clock { started: t, paused_at: None, paused_total: Duration::ZERO, pauses: 0, last_pause: Duration::ZERO }
     }
 
     fn pause_at(&mut self, t: Instant) {
-        self.paused_at.get_or_insert(t);
+        if self.paused_at.is_none() {
+            self.last_pause = self.now_at(t);
+            self.paused_at = Some(t);
+            self.pauses += 1;
+        }
     }
 
     fn resume_at(&mut self, t: Instant) {
@@ -98,6 +117,11 @@ pub trait FrameSource: Send {
 }
 
 /// Produces PCM samples as they arrive.
+///
+/// A source may have gaps: it can deliver nothing for a while (WASAPI
+/// loopback sends no packets while nothing plays). The mixer treats a gap
+/// as silence and plays what comes after it without delay; samples are
+/// assumed to arrive in step with the clock otherwise.
 pub trait AudioSource: Send {
     fn rate(&self) -> u32;
     fn channels(&self) -> u16;
@@ -108,10 +132,15 @@ pub trait AudioSource: Send {
 
 /// Writes the recording; created by the caller on [`RecSpec::part_path`].
 pub trait VideoEncoder: Send {
+    /// Frame timestamps normally increase, but may repeat (a frame in flight
+    /// at a pause is stamped with the frozen time) or, in principle, go back.
     fn push_video(&mut self, f: &Frame) -> Result<()>;
     /// 48 kHz stereo interleaved samples starting at `ts`.
     fn push_audio(&mut self, pcm: &[f32], ts: Duration) -> Result<()>;
-    /// Finalise the file (it is playable after an `Ok`).
+    /// Finalise the file. Contract: `Ok` means the file is playable. An
+    /// encoder that hit a write error earlier must return `Err` here rather
+    /// than leave a corrupt file that looks finished (the session then
+    /// removes it).
     fn finish(self: Box<Self>) -> Result<()>;
     /// Whether this encoder takes audio (GIF does not).
     fn audio(&self) -> bool;
@@ -334,7 +363,9 @@ enum Ctl {
 }
 
 /// Audio is mixed this far behind the clock so sources that deliver in
-/// bursts (every 10-20 ms) are not cut short; the rest is flushed on stop.
+/// bursts (every 10-20 ms) are not cut short; on pause and stop the mixer
+/// waits up to this long for the input to catch up before the final pull.
+/// It is also the most a source may owe the mixer after an underrun.
 const AUDIO_LAG: Duration = Duration::from_millis(100);
 /// How often the encode thread wakes without frames (to pull audio).
 const ENCODE_TICK: Duration = Duration::from_millis(10);
@@ -343,10 +374,15 @@ const ENCODE_TICK: Duration = Duration::from_millis(10);
 /// early) and the encoder's own `finish`.
 type EncodeEnd = (Option<anyhow::Error>, Result<()>);
 
+/// Where a session reads the time: [`Instant::now`] normally; tests inject
+/// a stepped clock with [`Session::start_with`].
+pub type TimeFn = Arc<dyn Fn() -> Instant + Send + Sync>;
+
 /// A recording in progress. Dropping it without [`Session::stop`] stops
 /// it too (keeping the file).
 pub struct Session {
     clock: Arc<Mutex<Clock>>,
+    time: TimeFn,
     ctl: mpsc::Sender<Ctl>,
     queue: Arc<FrameQueue>,
     frames: Arc<AtomicU64>,
@@ -363,43 +399,89 @@ fn lock_clock(c: &Mutex<Clock>) -> MutexGuard<'_, Clock> {
 impl Session {
     /// Start recording now: `source` is paced at the spec's frame rate,
     /// `audio` is mixed when the encoder takes audio. `encoder` must write
-    /// [`RecSpec::part_path`].
+    /// [`RecSpec::part_path`]. When a thread cannot be started, nothing
+    /// keeps running, `.part` is removed and the error is returned.
     pub fn start(
         spec: RecSpec,
         source: Box<dyn FrameSource>,
         audio: Vec<Box<dyn AudioSource>>,
         encoder: Box<dyn VideoEncoder>,
-    ) -> Session {
-        let clock = Arc::new(Mutex::new(Clock::start()));
+    ) -> Result<Session> {
+        Session::start_with(spec, source, audio, encoder, Arc::new(Instant::now))
+    }
+
+    /// [`Session::start`] with the clock read from `time`.
+    pub fn start_with(
+        spec: RecSpec,
+        source: Box<dyn FrameSource>,
+        audio: Vec<Box<dyn AudioSource>>,
+        encoder: Box<dyn VideoEncoder>,
+        time: TimeFn,
+    ) -> Result<Session> {
+        let part = spec.part_path();
+        let clock = Arc::new(Mutex::new(Clock::start_at(time())));
         let queue = Arc::new(FrameQueue::new());
         let frames = Arc::new(AtomicU64::new(0));
         let failed = Arc::new(AtomicBool::new(false));
         let (ctl, rx) = mpsc::channel();
         let interval = Duration::from_secs_f64(1.0 / spec.capture_fps() as f64);
         let capture = {
-            let (clock, queue) = (clock.clone(), queue.clone());
+            let (clock, queue, time) = (clock.clone(), queue.clone(), time.clone());
             std::thread::Builder::new()
                 .name("rec-capture".into())
-                .spawn(move || capture_loop(source, interval, &clock, &queue, &rx))
-                .expect("spawn capture thread")
+                .spawn(move || capture_loop(source, interval, &clock, &time, &queue, &rx))
+        };
+        let capture = match capture {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = std::fs::remove_file(&part);
+                return Err(anyhow::Error::new(e).context("start the capture thread"));
+            }
         };
         let encode = {
-            let (clock, queue, frames, failed) = (clock.clone(), queue.clone(), frames.clone(), failed.clone());
+            let (clock, queue, frames, failed, time) =
+                (clock.clone(), queue.clone(), frames.clone(), failed.clone(), time.clone());
             std::thread::Builder::new()
                 .name("rec-encode".into())
-                .spawn(move || encode_loop(encoder, audio, &clock, &queue, &frames, &failed))
-                .expect("spawn encode thread")
+                .spawn(move || encode_loop(encoder, audio, &clock, &time, &queue, &frames, &failed))
         };
-        Session { clock, ctl, queue, frames, failed, capture: Some(capture), encode: Some(encode), out: spec.out }
+        let encode = match encode {
+            Ok(h) => h,
+            Err(e) => {
+                // Capture already runs: stop it before giving up.
+                let _ = ctl.send(Ctl::Stop);
+                queue.close();
+                let _ = capture.join();
+                let _ = std::fs::remove_file(&part);
+                return Err(anyhow::Error::new(e).context("start the encode thread"));
+            }
+        };
+        Ok(Session {
+            clock,
+            time,
+            ctl,
+            queue,
+            frames,
+            failed,
+            capture: Some(capture),
+            encode: Some(encode),
+            out: spec.out,
+        })
     }
 
+    /// Pause: the clock freezes and no more frames are captured. A frame
+    /// already being captured when this is called is still delivered,
+    /// stamped with the frozen time, so it shares its timestamp with the
+    /// first frame after [`Session::resume`] (encoders accept duplicate
+    /// timestamps). Audio is flushed up to the pause and what arrives while
+    /// paused is discarded.
     pub fn pause(&self) {
-        lock_clock(&self.clock).pause();
+        lock_clock(&self.clock).pause_at((self.time)());
         let _ = self.ctl.send(Ctl::Pause);
     }
 
     pub fn resume(&self) {
-        lock_clock(&self.clock).resume();
+        lock_clock(&self.clock).resume_at((self.time)());
         let _ = self.ctl.send(Ctl::Resume);
     }
 
@@ -408,7 +490,7 @@ impl Session {
         Stats {
             frames: self.frames.load(Ordering::Relaxed),
             dropped: self.queue.dropped(),
-            elapsed: c.now(),
+            elapsed: c.now_at((self.time)()),
             paused: c.is_paused(),
             failed: self.failed.load(Ordering::Relaxed),
         }
@@ -418,6 +500,10 @@ impl Session {
     /// path (the output, or a numbered sibling when that name is taken).
     /// When the encoder failed mid-way but could still finish the file, it
     /// is kept and the error says where; otherwise `.part` is removed.
+    ///
+    /// Blocks until the encoder has drained the queue, flushed the audio
+    /// (up to [`AUDIO_LAG`] more) and finished the file, which for a long
+    /// MP4 can take a while: call it off the UI thread.
     pub fn stop(mut self) -> Result<PathBuf> {
         self.end()
     }
@@ -440,12 +526,12 @@ impl Session {
                 None => e,
             });
         }
-        if let Some(dir) = self.out.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        }
+        // The output directory exists: the encoder created `.part` in it.
         let dst = crate::export::unique_path(&self.out);
-        std::fs::rename(&part, &dst)
-            .with_context(|| format!("move {} to {}", part.display(), dst.display()))?;
+        if let Err(e) = std::fs::rename(&part, &dst) {
+            return Err(anyhow::Error::new(e)
+                .context(format!("move the recording to {}; it is kept at {}", dst.display(), part.display())));
+        }
         match push_err {
             Some(e) => Err(e.context(format!("recording stopped early; saved {}", dst.display()))),
             None => Ok(dst),
@@ -465,6 +551,7 @@ fn capture_loop(
     mut source: Box<dyn FrameSource>,
     interval: Duration,
     clock: &Mutex<Clock>,
+    time: &TimeFn,
     queue: &FrameQueue,
     rx: &mpsc::Receiver<Ctl>,
 ) {
@@ -492,7 +579,7 @@ fn capture_loop(
         }
         let deadline = tick + interval;
         if let Some(mut f) = source.next(deadline) {
-            f.ts = lock_clock(clock).now();
+            f.ts = lock_clock(clock).now_at(time());
             if !queue.push(f) {
                 break;
             }
@@ -511,12 +598,13 @@ fn encode_loop(
     mut enc: Box<dyn VideoEncoder>,
     audio: Vec<Box<dyn AudioSource>>,
     clock: &Mutex<Clock>,
+    time: &TimeFn,
     queue: &FrameQueue,
     frames: &AtomicU64,
     failed: &AtomicBool,
 ) -> EncodeEnd {
     let mut mixer = (enc.audio() && !audio.is_empty()).then(|| Mixer::new(audio));
-    let mut was_paused = false;
+    let mut pauses = 0;
     let mut err = None;
     let r = (|| -> Result<()> {
         loop {
@@ -531,16 +619,20 @@ fn encode_loop(
             };
             if let Some(m) = mixer.as_mut() {
                 let c = *lock_clock(clock);
-                let now = c.now();
-                if closed || (c.is_paused() && !was_paused) {
-                    // Stop or pause: everything up to now.
-                    push_mixed(enc.as_mut(), m, now)?;
+                if c.pauses() != pauses {
+                    // Paused since the last look (maybe resumed already):
+                    // everything up to the pause, then drop what came after.
+                    pauses = c.pauses();
+                    flush_mixed(enc.as_mut(), m, c.last_pause())?;
+                    m.discard();
+                }
+                if closed {
+                    flush_mixed(enc.as_mut(), m, c.now_at(time()))?;
                 } else if c.is_paused() {
                     m.discard(); // sound while paused is not recorded
                 } else {
-                    push_mixed(enc.as_mut(), m, now.saturating_sub(AUDIO_LAG))?;
+                    push_mixed(enc.as_mut(), m, c.now_at(time()).saturating_sub(AUDIO_LAG))?;
                 }
-                was_paused = c.is_paused();
             }
             if closed {
                 return Ok(());
@@ -559,6 +651,22 @@ fn push_mixed(enc: &mut dyn VideoEncoder, m: &mut Mixer, until: Duration) -> Res
     let ts = m.position();
     let pcm = m.pull(until);
     if pcm.is_empty() { Ok(()) } else { enc.push_audio(&pcm, ts) }
+}
+
+/// Everything up to `until` (a pause or the stop): up to `until - lag`
+/// at once, then wait at most one lag for the input to reach `until`, so
+/// the tail is not cut off by sources that deliver late.
+fn flush_mixed(enc: &mut dyn VideoEncoder, m: &mut Mixer, until: Duration) -> Result<()> {
+    push_mixed(enc, m, until.saturating_sub(AUDIO_LAG))?;
+    let give_up = Instant::now() + AUDIO_LAG;
+    loop {
+        m.feed();
+        if m.covered(until) || Instant::now() >= give_up {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    push_mixed(enc, m, until)
 }
 
 #[cfg(test)]

@@ -81,13 +81,64 @@ fn queue_with_a_slow_consumer_stays_bounded() {
     assert_eq!(got.last(), Some(&Duration::from_millis(199)), "the newest frame survives");
 }
 
-/// Hands out 4×4 frames, numbered in the blue channel.
-struct FakeSource {
+#[test]
+fn clock_counts_pauses() {
+    let t0 = Instant::now();
+    let s = |ms: u64| t0 + Duration::from_millis(ms);
+    let mut c = Clock::start_at(t0);
+    assert_eq!((c.pauses(), c.last_pause()), (0, Duration::ZERO));
+    c.pause_at(s(300));
+    c.pause_at(s(400)); // already paused: not a new pause
+    assert_eq!((c.pauses(), c.last_pause()), (1, Duration::from_millis(300)));
+    c.resume_at(s(1000));
+    // A reader that saw epoch 0 and looks only now (resumed) still sees the pause.
+    assert!(!c.is_paused());
+    assert_eq!((c.pauses(), c.last_pause()), (1, Duration::from_millis(300)));
+    c.pause_at(s(1500));
+    c.resume_at(s(1600));
+    assert_eq!((c.pauses(), c.last_pause()), (2, Duration::from_millis(800)));
+}
+
+/// The session's time: `base` plus what the test set.
+#[derive(Clone)]
+struct TestTime {
+    base: Instant,
+    ns: Arc<AtomicU64>,
+}
+
+impl TestTime {
+    fn new() -> TestTime {
+        TestTime { base: Instant::now(), ns: Arc::default() }
+    }
+
+    fn set_ms(&self, ms: u64) {
+        self.ns.store(ms * 1_000_000, Ordering::SeqCst);
+    }
+
+    fn time_fn(&self) -> TimeFn {
+        let t = self.clone();
+        Arc::new(move || t.base + Duration::from_nanos(t.ns.load(Ordering::SeqCst)))
+    }
+}
+
+/// Waits (up to 5 s) for `cond`.
+fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    let end = Instant::now() + Duration::from_secs(5);
+    while !cond() {
+        assert!(Instant::now() < end, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Hands out one 4×4 frame (numbered in its bytes) per step the test sends.
+struct StepSource {
+    steps: mpsc::Receiver<()>,
     made: Arc<AtomicUsize>,
 }
 
-impl FrameSource for FakeSource {
-    fn next(&mut self, _deadline: Instant) -> Option<Frame> {
+impl FrameSource for StepSource {
+    fn next(&mut self, deadline: Instant) -> Option<Frame> {
+        self.steps.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok()?;
         let n = self.made.fetch_add(1, Ordering::SeqCst);
         Some(Frame { w: 4, h: 4, bgra: vec![n as u8; 64], ts: Duration::MAX })
     }
@@ -100,22 +151,47 @@ impl FrameSource for FakeSource {
 struct Log {
     frames: Vec<Duration>,
     audio: Vec<(Duration, usize)>,
+    pcm: Vec<f32>,
+}
+
+impl Log {
+    /// Stereo audio frames received.
+    fn audio_frames(&self) -> usize {
+        self.pcm.len() / 2
+    }
+}
+
+/// Holds `push_video` until the test lets it go: `entered` is signalled,
+/// then it waits on `release` (dropping the sender releases for good).
+struct Gate {
+    entered: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+#[derive(Default)]
+struct Opts {
+    enc_audio: bool,
+    fail_push_at: Option<usize>,
+    fail_finish: bool,
+    gate: Option<Gate>,
 }
 
 /// Writes one byte per frame to the `.part` file; can fail on demand.
 struct FakeEncoder {
     file: std::fs::File,
     log: Arc<Mutex<Log>>,
-    audio: bool,
-    fail_push_at: Option<usize>,
-    fail_finish: bool,
+    opts: Opts,
 }
 
 impl VideoEncoder for FakeEncoder {
     fn push_video(&mut self, f: &Frame) -> Result<()> {
         use std::io::Write;
+        if let Some(g) = &self.opts.gate {
+            let _ = g.entered.send(());
+            let _ = g.release.recv();
+        }
         let mut log = self.log.lock().unwrap();
-        if Some(log.frames.len()) == self.fail_push_at {
+        if Some(log.frames.len()) == self.opts.fail_push_at {
             anyhow::bail!("disk full");
         }
         log.frames.push(f.ts);
@@ -123,27 +199,26 @@ impl VideoEncoder for FakeEncoder {
         Ok(())
     }
     fn push_audio(&mut self, pcm: &[f32], ts: Duration) -> Result<()> {
-        self.log.lock().unwrap().audio.push((ts, pcm.len()));
+        let mut log = self.log.lock().unwrap();
+        log.audio.push((ts, pcm.len()));
+        log.pcm.extend_from_slice(pcm);
         Ok(())
     }
     fn finish(self: Box<Self>) -> Result<()> {
-        if self.fail_finish {
+        if self.opts.fail_finish {
             anyhow::bail!("cannot finalise");
         }
         Ok(())
     }
     fn audio(&self) -> bool {
-        self.audio
+        self.opts.enc_audio
     }
 }
 
-/// A steady 48 kHz mono tone, delivered as wall time passes.
-struct FakeMic {
-    started: Instant,
-    sent: usize,
-}
+/// 48 kHz mono samples queued by the test.
+struct FeedMic(Arc<Mutex<Vec<f32>>>);
 
-impl AudioSource for FakeMic {
+impl AudioSource for FeedMic {
     fn rate(&self) -> u32 {
         48_000
     }
@@ -151,10 +226,9 @@ impl AudioSource for FakeMic {
         1
     }
     fn read(&mut self, out: &mut Vec<f32>) -> usize {
-        let due = (self.started.elapsed().as_secs_f64() * 48_000.0) as usize;
-        let n = due.saturating_sub(self.sent);
-        out.extend(std::iter::repeat_n(0.1, n));
-        self.sent = due;
+        let mut q = self.0.lock().unwrap();
+        let n = q.len();
+        out.append(&mut q);
         n
     }
 }
@@ -164,12 +238,14 @@ struct Run {
     spec: RecSpec,
     made: Arc<AtomicUsize>,
     log: Arc<Mutex<Log>>,
+    time: TestTime,
+    steps: Option<mpsc::Sender<()>>,
 }
 
 fn setup(tag: &str, format: RecFormat, fps: u32) -> Run {
     let dir = std::env::temp_dir().join(format!("rustshot-rec-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
     let spec = RecSpec {
         format,
         fps,
@@ -179,16 +255,30 @@ fn setup(tag: &str, format: RecFormat, fps: u32) -> Run {
         mic: None,
         out: dir.join("sub").join(format!("clip.{}", format.ext())),
     };
-    std::fs::create_dir_all(dir.join("sub")).unwrap();
-    Run { dir, spec, made: Arc::default(), log: Arc::default() }
+    Run { dir, spec, made: Arc::default(), log: Arc::default(), time: TestTime::new(), steps: None }
 }
 
 impl Run {
-    fn start(&self, audio: Vec<Box<dyn AudioSource>>, enc_audio: bool, fail_push_at: Option<usize>, fail_finish: bool) -> Session {
+    fn start(&mut self, audio: Vec<Box<dyn AudioSource>>, opts: Opts) -> Session {
         let file = std::fs::File::create(self.spec.part_path()).unwrap();
-        let enc = FakeEncoder { file, log: self.log.clone(), audio: enc_audio, fail_push_at, fail_finish };
-        let src = FakeSource { made: self.made.clone() };
-        Session::start(self.spec.clone(), Box::new(src), audio, Box::new(enc))
+        let enc = FakeEncoder { file, log: self.log.clone(), opts };
+        let (tx, steps) = mpsc::channel();
+        self.steps = Some(tx);
+        let src = StepSource { steps, made: self.made.clone() };
+        Session::start_with(self.spec.clone(), Box::new(src), audio, Box::new(enc), self.time.time_fn()).unwrap()
+    }
+
+    /// Let the source produce one frame at `ms` (without waiting for it).
+    fn step(&self, ms: u64) {
+        self.time.set_ms(ms);
+        self.steps.as_ref().unwrap().send(()).unwrap();
+    }
+
+    /// One frame at `ms`, waited for until the encoder has it.
+    fn shoot(&self, ms: u64) {
+        let n = self.log.lock().unwrap().frames.len();
+        self.step(ms);
+        wait_until("the frame", || self.log.lock().unwrap().frames.len() > n);
     }
 
     fn files(&self) -> Vec<String> {
@@ -207,86 +297,130 @@ impl Drop for Run {
     }
 }
 
-#[test]
-fn session_records_paced_frames_and_renames_the_part_file() {
-    let run = setup("ok", RecFormat::Mp4, 50);
-    let s = run.start(Vec::new(), false, None, false);
-    assert_eq!(run.files(), ["clip.mp4.part"]);
-    std::thread::sleep(Duration::from_millis(300));
-    let st = s.stats();
-    assert!(!st.paused && !st.failed);
-    assert!(st.elapsed >= Duration::from_millis(300));
-    let t = Instant::now();
-    let out = s.stop().unwrap();
-    assert!(t.elapsed() < Duration::from_millis(500), "stops promptly");
-    assert_eq!(out, run.spec.out);
-    assert_eq!(run.files(), ["clip.mp4"]);
-    let log = run.log.lock().unwrap();
-    let made = run.made.load(Ordering::SeqCst);
-    // 50 fps for ~0.3 s: about 15 frames (loose bounds for a busy machine).
-    assert!((5..=25).contains(&made), "{made} frames captured");
-    assert_eq!(log.frames.len(), made, "a fast encoder drops nothing");
-    assert_eq!(std::fs::metadata(&out).unwrap().len(), made as u64);
-    // Stamped from the session clock, increasing, starting near zero.
-    assert!(log.frames[0] < Duration::from_millis(100), "{:?}", log.frames[0]);
-    assert!(log.frames.windows(2).all(|w| w[0] < w[1]));
+fn ms(v: &[u64]) -> Vec<Duration> {
+    v.iter().map(|&m| Duration::from_millis(m)).collect()
 }
 
-#[test]
-fn session_pause_cuts_time_and_frames() {
-    let run = setup("pause", RecFormat::Gif, 50);
-    let s = run.start(Vec::new(), false, None, false);
-    std::thread::sleep(Duration::from_millis(150));
-    s.pause();
-    std::thread::sleep(Duration::from_millis(50)); // let an in-flight frame land
-    let (made, at) = (run.made.load(Ordering::SeqCst), s.stats().elapsed);
-    assert!(s.stats().paused);
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(run.made.load(Ordering::SeqCst), made, "no frames while paused");
-    assert_eq!(s.stats().elapsed, at, "clock frozen");
-    s.resume();
-    std::thread::sleep(Duration::from_millis(150));
-    let total = s.stats().elapsed;
-    assert!(total < Duration::from_millis(450), "paused time is not recorded: {total:?}");
-    s.stop().unwrap();
-    let log = run.log.lock().unwrap();
-    assert!(log.frames.len() > made, "frames after resume");
-    // No gap of the pause length between consecutive frame stamps.
-    let gap = log.frames.windows(2).map(|w| w[1] - w[0]).max().unwrap();
-    assert!(gap < Duration::from_millis(200), "largest gap {gap:?}");
-}
-
-#[test]
-fn session_mixes_audio_continuously() {
-    let run = setup("audio", RecFormat::Mp4, 30);
-    let mic: Box<dyn AudioSource> = Box::new(FakeMic { started: Instant::now(), sent: 0 });
-    let s = run.start(vec![mic], true, None, false);
-    std::thread::sleep(Duration::from_millis(400));
-    s.stop().unwrap();
-    let log = run.log.lock().unwrap();
-    let total: usize = log.audio.iter().map(|a| a.1).sum();
-    // Pushes are back to back: each starts where the last ended.
+/// Audio pushes are back to back: each starts where the last ended.
+fn assert_contiguous(log: &Log) {
     let mut next = Duration::ZERO;
     for &(ts, n) in &log.audio {
         assert!(ts.abs_diff(next) < Duration::from_micros(50), "{ts:?} vs {next:?}");
         next = ts + Duration::from_secs_f64(n as f64 / 2.0 / 48_000.0);
     }
-    let secs = total as f64 / 2.0 / 48_000.0;
-    assert!((0.38..0.8).contains(&secs), "{secs} s of audio");
+}
+
+#[test]
+fn session_records_stepped_frames_and_renames_the_part_file() {
+    let mut run = setup("ok", RecFormat::Mp4, 50);
+    let s = run.start(Vec::new(), Opts::default());
+    assert_eq!(run.files(), ["clip.mp4.part"]);
+    for i in 0..10 {
+        run.shoot(i * 20);
+    }
+    let st = s.stats();
+    assert_eq!((st.frames, st.dropped, st.elapsed, st.paused, st.failed), (10, 0, Duration::from_millis(180), false, false));
+    run.time.set_ms(200);
+    let t = Instant::now();
+    let out = s.stop().unwrap();
+    assert!(t.elapsed() < Duration::from_secs(1), "stops promptly");
+    assert_eq!(out, run.spec.out);
+    assert_eq!(run.files(), ["clip.mp4"]);
+    assert_eq!(run.made.load(Ordering::SeqCst), 10);
+    assert_eq!(run.log.lock().unwrap().frames, ms(&[0, 20, 40, 60, 80, 100, 120, 140, 160, 180]));
+    assert_eq!(std::fs::metadata(&out).unwrap().len(), 10);
+}
+
+#[test]
+fn session_pause_cuts_time_and_frames() {
+    let mut run = setup("pause", RecFormat::Gif, 50);
+    let s = run.start(Vec::new(), Opts::default());
+    for t in [0, 20, 40] {
+        run.shoot(t);
+    }
+    run.time.set_ms(50);
+    s.pause();
+    assert!(s.stats().paused);
+    assert_eq!(s.stats().elapsed, Duration::from_millis(50));
+    run.time.set_ms(1000);
+    assert_eq!(s.stats().elapsed, Duration::from_millis(50), "clock frozen");
+    s.resume();
+    assert!(!s.stats().paused);
+    run.shoot(1020);
+    run.shoot(1040);
+    assert_eq!(s.stats().elapsed, Duration::from_millis(90), "paused time is not recorded");
+    s.stop().unwrap();
+    assert_eq!(run.log.lock().unwrap().frames, ms(&[0, 20, 40, 70, 90]));
+}
+
+#[test]
+fn session_mixes_audio_continuously() {
+    let mut run = setup("audio", RecFormat::Mp4, 30);
+    let q = Arc::new(Mutex::new(Vec::new()));
+    let s = run.start(vec![Box::new(FeedMic(q.clone()))], Opts { enc_audio: true, ..Opts::default() });
+    for k in 1..=5 {
+        q.lock().unwrap().extend(std::iter::repeat_n(0.1f32, 4800));
+        run.time.set_ms(k * 100);
+        // Mixed up to 100 ms behind the clock.
+        let want = (k as usize - 1) * 4800;
+        wait_until("audio behind the clock", || run.log.lock().unwrap().audio_frames() == want);
+    }
+    s.stop().unwrap();
+    let log = run.log.lock().unwrap();
+    assert_contiguous(&log);
+    assert_eq!(log.audio_frames(), 24_000, "exactly the recorded 0.5 s, tail flushed");
+    assert!(log.pcm.iter().all(|&v| v == 0.1), "no gaps or silence");
+    drop(log);
     // An encoder without audio (GIF) never gets any.
-    let run = setup("noaudio", RecFormat::Gif, 15);
-    let mic: Box<dyn AudioSource> = Box::new(FakeMic { started: Instant::now(), sent: 0 });
-    let s = run.start(vec![mic], false, None, false);
-    std::thread::sleep(Duration::from_millis(100));
+    let mut run = setup("noaudio", RecFormat::Gif, 15);
+    let q = Arc::new(Mutex::new(vec![0.1; 4800]));
+    let s = run.start(vec![Box::new(FeedMic(q))], Opts::default());
+    run.shoot(100);
     s.stop().unwrap();
     assert!(run.log.lock().unwrap().audio.is_empty());
 }
 
 #[test]
+fn session_pause_flushes_audio_and_skips_what_came_while_paused() {
+    let mut run = setup("pause-audio", RecFormat::Mp4, 30);
+    let q = Arc::new(Mutex::new(Vec::new()));
+    let (entered, entered_rx) = mpsc::channel();
+    let (release_tx, release) = mpsc::channel::<()>();
+    let opts = Opts { enc_audio: true, gate: Some(Gate { entered, release }), ..Opts::default() };
+    let s = run.start(vec![Box::new(FeedMic(q.clone()))], opts);
+    let frames = |log: &Arc<Mutex<Log>>| log.lock().unwrap().audio_frames();
+    q.lock().unwrap().extend(std::iter::repeat_n(0.1f32, 3 * 4800));
+    run.time.set_ms(300);
+    wait_until("audio to 200 ms", || frames(&run.log) == 9600);
+    // The encode thread takes a frame and is held inside push_video, while
+    // the recording is paused and resumed: one encode iteration.
+    run.step(300);
+    entered_rx.recv().unwrap();
+    s.pause();
+    q.lock().unwrap().extend(std::iter::repeat_n(0.9f32, 4800)); // sound while paused
+    run.time.set_ms(2000);
+    s.resume();
+    drop(release_tx);
+    // The pause is seen: audio up to it, then what came while paused is dropped.
+    wait_until("audio to the pause", || frames(&run.log) == 14_400);
+    q.lock().unwrap().extend(std::iter::repeat_n(0.2f32, 4800));
+    run.time.set_ms(2100);
+    s.stop().unwrap();
+    let log = run.log.lock().unwrap();
+    assert_eq!(log.frames, ms(&[300]));
+    assert_contiguous(&log);
+    assert_eq!(log.audio_frames(), 19_200, "0.3 s before the pause and 0.1 s after");
+    let (before, after) = log.pcm.split_at(28_800);
+    assert!(before.iter().all(|&v| v == 0.1), "up to the pause");
+    assert!(after.iter().all(|&v| v == 0.2), "after the resume; nothing from the pause");
+}
+
+#[test]
 fn session_failure_to_finish_removes_the_part_file() {
-    let run = setup("fail", RecFormat::Gif, 30);
-    let s = run.start(Vec::new(), false, None, true);
-    std::thread::sleep(Duration::from_millis(80));
+    let mut run = setup("fail", RecFormat::Gif, 30);
+    let s = run.start(Vec::new(), Opts { fail_finish: true, ..Opts::default() });
+    run.shoot(0);
+    run.shoot(33);
     let e = s.stop().unwrap_err();
     assert!(format!("{e:#}").contains("cannot finalise"), "{e:#}");
     assert!(run.files().is_empty(), "{:?}", run.files());
@@ -294,32 +428,36 @@ fn session_failure_to_finish_removes_the_part_file() {
 
 #[test]
 fn session_push_error_stops_early_but_keeps_a_finished_file() {
-    let run = setup("push", RecFormat::Mp4, 50);
-    let s = run.start(Vec::new(), false, Some(3), false);
-    std::thread::sleep(Duration::from_millis(250));
-    assert!(s.stats().failed);
-    let made = run.made.load(Ordering::SeqCst);
-    std::thread::sleep(Duration::from_millis(100));
-    assert!(run.made.load(Ordering::SeqCst) <= made + 1, "capture stopped after the failure");
+    let mut run = setup("push", RecFormat::Mp4, 50);
+    let s = run.start(Vec::new(), Opts { fail_push_at: Some(3), ..Opts::default() });
+    for t in [0, 20, 40] {
+        run.shoot(t);
+    }
+    assert!(!s.stats().failed);
+    run.step(60);
+    wait_until("the failure", || s.stats().failed);
     let e = format!("{:#}", s.stop().unwrap_err());
     assert!(e.contains("disk full") && e.contains("clip.mp4"), "{e}");
     assert_eq!(run.files(), ["clip.mp4"]);
-    assert_eq!(run.log.lock().unwrap().frames.len(), 3);
+    assert_eq!(run.log.lock().unwrap().frames, ms(&[0, 20, 40]));
+    assert_eq!(run.made.load(Ordering::SeqCst), 4);
 }
 
 #[test]
 fn session_output_name_taken_gets_a_numbered_sibling() {
-    let run = setup("taken", RecFormat::Gif, 30);
+    let mut run = setup("taken", RecFormat::Gif, 30);
     std::fs::write(&run.spec.out, b"old").unwrap();
-    let s = run.start(Vec::new(), false, None, false);
-    std::thread::sleep(Duration::from_millis(50));
+    let s = run.start(Vec::new(), Opts::default());
+    run.shoot(0);
     let out = s.stop().unwrap();
     assert_ne!(out, run.spec.out);
     assert_eq!(std::fs::read(&run.spec.out).unwrap(), b"old", "never overwritten");
     assert_eq!(run.files().len(), 2);
     // Dropping a session stops it and keeps the file.
-    let run = setup("drop", RecFormat::Gif, 30);
-    drop(run.start(Vec::new(), false, None, false));
+    let mut run = setup("drop", RecFormat::Gif, 30);
+    let s = run.start(Vec::new(), Opts::default());
+    run.shoot(0);
+    drop(s);
     assert_eq!(run.files(), ["clip.gif"]);
 }
 

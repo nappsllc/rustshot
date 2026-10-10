@@ -324,3 +324,75 @@ fn rejects_bad_sizes_and_writes_files() {
     assert!(d.frames.iter().all(|f| f.delay == 10));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn duplicate_and_out_of_order_timestamps_keep_the_total() {
+    let red = |ms| frame(4, 4, ms, |_, _| [255, 0, 0]);
+    let blue = |ms| frame(4, 4, ms, |_, _| [0, 0, 255]);
+    // A repeated stamp (a frame in flight at a pause) and one that goes back.
+    let (_, d) = round_trip(4, 4, 10, &[red(0), blue(0), red(100), blue(50), red(300)]);
+    let delays: Vec<u16> = d.frames.iter().map(|f| f.delay).collect();
+    // 0→0: minimum 2; to 10 cs: 8; back to 5 cs: minimum 2; to 30 cs: 18;
+    // the last lasts one frame (10 cs).
+    assert_eq!(delays, [2, 8, 2, 18, 10]);
+    assert_eq!(delays.iter().map(|&d| d as u32).sum::<u32>(), 40, "total matches the clock");
+    assert_eq!(d.frames.last().unwrap().canvas, rgb_of(&red(0)));
+}
+
+#[test]
+fn long_static_stretches_use_filler_frames() {
+    let red = frame(4, 4, 0, |_, _| [255, 0, 0]);
+    // 1500 s unchanged: more than two 655.35 s delays.
+    let blue = frame(4, 4, 1_500_000, |_, _| [0, 0, 255]);
+    let (_, d) = round_trip(4, 4, 10, &[red.clone(), blue.clone()]);
+    let delays: Vec<u16> = d.frames.iter().map(|f| f.delay).collect();
+    assert_eq!(delays, [0xFFFF, 0xFFFF, 18_930, 10]); // 150000 - 2 * 65535
+    for filler in &d.frames[1..3] {
+        assert_eq!(filler.rect, (0, 0, 1, 1));
+        assert_eq!(filler.indices, [filler.transparent.expect("transparent")], "fully transparent");
+        assert_eq!(filler.disposal, 1);
+        assert_eq!(filler.canvas, rgb_of(&red), "nothing changes on screen");
+    }
+    assert_eq!(d.frames[3].canvas, rgb_of(&blue), "the next frame keeps its time");
+}
+
+/// A writer that fails once `left` bytes have been written.
+struct FailAfter {
+    inner: Cursor<Vec<u8>>,
+    left: usize,
+}
+
+impl std::io::Write for FailAfter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() > self.left {
+            return Err(std::io::Error::other("disk full"));
+        }
+        self.left -= buf.len();
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::io::Seek for FailAfter {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+#[test]
+fn a_write_error_poisons_the_encoder() {
+    let w = FailAfter { inner: Cursor::new(Vec::new()), left: 60 };
+    let mut enc: Box<dyn VideoEncoder> = Box::new(GifEncoder::new(w, 8, 8, 10).unwrap());
+    let noisy = |ms| frame(8, 8, ms, |x, y| [(x * 30) as u8, (y * 30) as u8, (ms / 10) as u8]);
+    assert!(enc.push_video(&noisy(0)).is_err(), "the frame does not fit");
+    let e = enc.push_video(&noisy(100)).unwrap_err();
+    assert!(format!("{e:#}").contains("earlier write error"), "{e:#}");
+    assert!(enc.finish().is_err(), "an incomplete GIF is never reported as playable");
+    // A rejected frame (wrong size) writes nothing and does not poison.
+    let mut enc: Box<dyn VideoEncoder> = Box::new(GifEncoder::new(Cursor::new(Vec::new()), 8, 8, 10).unwrap());
+    assert!(enc.push_video(&frame(4, 4, 0, |_, _| [0; 3])).is_err());
+    enc.push_video(&noisy(0)).unwrap();
+    enc.finish().unwrap();
+}
