@@ -4,7 +4,7 @@ A fast, tiny screenshot and annotation tool for **Windows, macOS and Linux**,
 modelled on [Flameshot](https://flameshot.org) and written in Rust.
 
 Press a hotkey, drag a region, annotate it, and copy, save or upload it.
-The whole app is a single ~550 KB native binary with no runtime and no GUI
+The whole app is a single native binary under 1 MB with no runtime and no GUI
 toolkit: every pixel of the overlay is drawn by Rustshot's own anti-aliased
 renderer.
 
@@ -246,10 +246,33 @@ updates* checks now. A new version opens a dialog with the release notes:
 `SHA256SUMS` (it refuses to install on a mismatch or a missing entry),
 waits for an open capture to close and restarts into the new version;
 **Skip this version** silences the daily check for that version (a manual
-check still offers it). Downloads come only from the project's GitHub
-releases. This protects against corrupted or swapped downloads, not
-against a compromised GitHub account. Store, Flathub, Snap and package
-installs are updated by their store; `.deb` installs open the release page.
+check still offers it); **Cancel** (also during the download) does nothing.
+With nothing new, a manual check says *Rustshot is up to date*.
+
+How the new version is installed depends on how Rustshot was installed:
+
+| Install | Update |
+|---|---|
+| Windows installer (also winget) | runs the new `setup.exe` silently; it waits for Rustshot to exit, installs over it and starts it again |
+| Windows portable `.exe` | swaps the new `.exe` in next to the running one and restarts |
+| AppImage | replaces the `.AppImage` file and restarts |
+| Linux tarball (outside `/usr`, in a writable folder) | replaces the binary and restarts |
+| Microsoft Store, Flathub, Snap, Mac App Store | no daily check (a manual check says the store handles updates) |
+| `.deb`, read-only installs, macOS | opens the release page (macOS in-app updates come once they are tested on a Mac) |
+
+Downloads come only from the project's GitHub releases
+(`github.com/nappsllc/rustshot/releases/download/`, following GitHub's
+redirects to its download servers and nowhere else), into a private
+per-user folder that is cleaned up afterwards.
+
+Limitations:
+
+- `SHA256SUMS` protects against corrupted or substituted downloads, not
+  against a compromised GitHub account or release: whoever can publish a
+  release can publish matching checksums. Builds are not code-signed yet.
+- In-app updates need a release that publishes `SHA256SUMS`. The first one
+  is the release after 0.1.1; 0.1.1 and earlier only open the release page,
+  so moving off them is a manual download once.
 
 ## Platform notes
 
@@ -283,7 +306,8 @@ boards) and [docs/superpowers](docs/superpowers) (specs and plans).
 
 No telemetry. Images leave your machine only when you choose **Upload**. The
 daemon's update check is a single anonymous request to the GitHub Releases
-API, at most once a day, and can be turned off with `check_updates = false`.
+API, at most once a day, and can be turned off with `check_updates = false`;
+an update you accept is downloaded from GitHub's release servers.
 See [PRIVACY.md](PRIVACY.md).
 
 ## License

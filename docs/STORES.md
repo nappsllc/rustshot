@@ -6,6 +6,19 @@ job below runs only after its repository variable `PUBLISH_<X>` is `true`
 (Settings › Secrets and variables › Actions). Set the switch last, after a
 manual first submission where noted.
 
+## In-app updates vs. stores
+- Store builds never update themselves: an MSIX package (Microsoft Store or
+  sideload), Flathub, Snap and the Mac App Store build have no daily check,
+  and *Check for updates* says the store handles updates. Nothing to declare
+  in the listings beyond that.
+- winget installs the NSIS `setup.exe`, so it updates in-app like the
+  installer (silent `setup.exe /S /RELAUNCH`); winget upgrades keep working.
+- Direct downloads (installer, portable, AppImage, tarball) update in-app
+  only from releases that carry `SHA256SUMS`: `release.yml` writes it from
+  every asset. Keep that step, and never edit or re-upload an asset after
+  publishing without regenerating `SHA256SUMS` (the updater refuses on a
+  mismatch or missing entry).
+
 ## Before any store: screenshots
 - [ ] Capture `docs/screenshots/overlay-dark.png` (and `overlay-light.png`) from
       the redesigned UI, 1440×900 or larger; commit to `main`.
