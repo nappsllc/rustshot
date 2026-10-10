@@ -2,67 +2,20 @@
   "v": 3,
   "attachments": {},
   "boards": {
-    "Closeups.dc.html": {
-      "h": 2200,
-      "title": "03 · Close-ups",
-      "w": 1440,
-      "x": 0,
-      "y": 1020
-    },
-    "Light.dc.html": {
-      "h": 900,
-      "title": "02 · Overlay (light)",
-      "w": 1440,
-      "x": 1520,
-      "y": 0
-    },
-    "Main.dc.html": {
-      "h": 900,
-      "title": "01 · Overlay (dark)",
-      "w": 1440,
-      "x": 0,
-      "y": 0
-    },
-    "Spec.dc.html": {
-      "h": 2000,
-      "title": "05 · Spec sheet & tokens",
-      "w": 1360,
-      "x": 1520,
-      "y": 2380
-    },
-    "Variants.dc.html": {
-      "h": 1240,
-      "title": "04 · Wrapped & edge placement",
-      "w": 1360,
-      "x": 1520,
-      "y": 1020
-    }
+    "Closeups.dc.html": { "h": 2200, "title": "03 · Close-ups", "w": 1440, "x": 0, "y": 1020 },
+    "Light.dc.html": { "h": 900, "title": "02 · Overlay (light)", "w": 1440, "x": 1520, "y": 0 },
+    "Main.dc.html": { "h": 900, "title": "01 · Overlay (dark)", "w": 1440, "x": 0, "y": 0 },
+    "Spec.dc.html": { "h": 2000, "title": "05 · Spec sheet & tokens", "w": 1360, "x": 1520, "y": 2380 },
+    "Variants.dc.html": { "h": 1240, "title": "04 · Wrapped & edge placement", "w": 1360, "x": 1520, "y": 1020 },
+    "Icon.dc.html": { "h": 1080, "title": "06 · App icon & tray icon", "w": 1440, "x": 0, "y": 3340 }
   },
-  "createdOnFiles": {
-    "at": "2026-10-09T18:40:00Z",
-    "v": 1
-  },
+  "createdOnFiles": { "at": "2026-10-09T18:40:00Z", "v": 1 },
   "designSystems": [],
-  "launch": {
-    "view": "canvas"
-  },
+  "launch": { "view": "canvas" },
   "notes": {
-    "t1": {
-      "kind": "title1",
-      "maxW": 2960,
-      "text": "rustshot — overlay UI",
-      "w": 240,
-      "x": 0,
-      "y": -260
-    }
+    "t1": { "kind": "title1", "maxW": 2960, "text": "rustshot — overlay UI", "w": 240, "x": 0, "y": -260 }
   },
-  "order": [
-    "Main.dc.html",
-    "Light.dc.html",
-    "Closeups.dc.html",
-    "Variants.dc.html",
-    "Spec.dc.html"
-  ],
+  "order": ["Main.dc.html", "Light.dc.html", "Closeups.dc.html", "Variants.dc.html", "Spec.dc.html", "Icon.dc.html"],
   "pages": [],
   "title": "rustshot UI"
 }

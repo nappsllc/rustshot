@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>rustshot app icon and tray icon</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap">
+<style>
+body{margin:0;font-family:'Inter',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+.h2{font-size:13px;font-weight:600;color:#ECEEF3;letter-spacing:.01em}
+.cap{font-size:11px;font-weight:500;color:#8A8F9C;line-height:1.5}
+.sec{display:flex;flex-direction:column;gap:12px}
+.card{box-sizing:border-box;background:#1E2027;border-radius:14px;padding:22px 24px;display:flex;flex-direction:column;gap:14px;box-shadow:inset 0 0 0 1px rgba(255,255,255,.06)}
+.sz{display:flex;flex-direction:column;align-items:center;gap:8px}
+.sz b{font-size:11px;font-weight:500;color:#8A8F9C;font-family:ui-monospace,Menlo,Consolas,monospace}
+table{border-collapse:collapse;width:100%}
+td{font-size:12px;padding:6px 10px 6px 0;vertical-align:top;border-bottom:1px solid rgba(255,255,255,.06);color:#D4D7DF}
+td.k{color:#ECEEF3;font-weight:500;white-space:nowrap}
+td.m{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;color:#B7BCFF;white-space:nowrap}
+.bar{display:flex;align-items:center;gap:14px;height:28px;padding:0 12px;border-radius:6px;font-size:12px;font-weight:500}
+.bar i{width:16px;height:16px;border-radius:4px;display:block;opacity:.55}
+</style>
+</helmet>
+<div style="position:relative;width:1440px;height:1080px;box-sizing:border-box;background:#15161B;padding:48px;display:flex;flex-direction:column;gap:28px;font-family:'Inter',system-ui,sans-serif">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <!-- Large (64px and up): 24-unit grid. Tile r=5.4 (22.5%), brackets inset 5, arm 5, stroke 2, dot r 3.5 -->
+  <symbol id="app-lg" viewBox="0 0 24 24">
+    <rect width="24" height="24" rx="5.4" fill="#1B1C20"/>
+    <rect x=".5" y=".5" width="23" height="23" rx="5" fill="none" stroke="#FFFFFF" stroke-opacity=".10"/>
+    <path d="M5 10V7a2 2 0 0 1 2-2h3M14 5h3a2 2 0 0 1 2 2v3M19 14v3a2 2 0 0 1-2 2h-3M10 19H7a2 2 0 0 1-2-2v-3" fill="none" stroke="#ECEEF3" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="12" cy="12" r="3.5" fill="#8B93FF"/>
+  </symbol>
+  <!-- Alt colorway: rust -->
+  <symbol id="app-lg-rust" viewBox="0 0 24 24">
+    <rect width="24" height="24" rx="5.4" fill="#1B1C20"/>
+    <rect x=".5" y=".5" width="23" height="23" rx="5" fill="none" stroke="#FFFFFF" stroke-opacity=".10"/>
+    <path d="M5 10V7a2 2 0 0 1 2-2h3M14 5h3a2 2 0 0 1 2 2v3M19 14v3a2 2 0 0 1-2 2h-3M10 19H7a2 2 0 0 1-2-2v-3" fill="none" stroke="#ECEEF3" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="12" cy="12" r="3.5" fill="#E07A4F"/>
+  </symbol>
+  <!-- Light tile variant (for light launchers that want it) -->
+  <symbol id="app-lg-light" viewBox="0 0 24 24">
+    <rect width="24" height="24" rx="5.4" fill="#F4F5F8"/>
+    <rect x=".5" y=".5" width="23" height="23" rx="5" fill="none" stroke="#000000" stroke-opacity=".10"/>
+    <path d="M5 10V7a2 2 0 0 1 2-2h3M14 5h3a2 2 0 0 1 2 2v3M19 14v3a2 2 0 0 1-2 2h-3M10 19H7a2 2 0 0 1-2-2v-3" fill="none" stroke="#1B1C20" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="12" cy="12" r="3.5" fill="#5B63F5"/>
+  </symbol>
+  <!-- Medium (32–48px): thicker stroke 2.5, arm 5.5, dot r 3.75 -->
+  <symbol id="app-md" viewBox="0 0 24 24">
+    <rect width="24" height="24" rx="5.4" fill="#1B1C20"/>
+    <path d="M4.5 10V7a2.5 2.5 0 0 1 2.5-2.5h3M14 4.5h3A2.5 2.5 0 0 1 19.5 7v3M19.5 14v3a2.5 2.5 0 0 1-2.5 2.5h-3M10 19.5H7A2.5 2.5 0 0 1 4.5 17v-3" fill="none" stroke="#ECEEF3" stroke-width="2.5" stroke-linecap="round"/>
+    <circle cx="12" cy="12" r="3.75" fill="#8B93FF"/>
+  </symbol>
+  <!-- Small (16–24px): stroke 3, arm 6, dot r 4, no inner border -->
+  <symbol id="app-sm" viewBox="0 0 24 24">
+    <rect width="24" height="24" rx="5.4" fill="#1B1C20"/>
+    <path d="M4 10V7a3 3 0 0 1 3-3h3M14 4h3a3 3 0 0 1 3 3v3M20 14v3a3 3 0 0 1-3 3h-3M10 20H7a3 3 0 0 1-3-3v-3" fill="none" stroke="#ECEEF3" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="12" cy="12" r="4" fill="#8B93FF"/>
+  </symbol>
+  <!-- Tray / menu bar: monochrome template, no tile. 16-unit grid -->
+  <symbol id="tray" viewBox="0 0 16 16">
+    <path d="M1.5 6V3.5a2 2 0 0 1 2-2H6M10 1.5h2.5a2 2 0 0 1 2 2V6M14.5 10v2.5a2 2 0 0 1-2 2H10M6 14.5H3.5a2 2 0 0 1-2-2V10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+    <circle cx="8" cy="8" r="2.4" fill="currentColor"/>
+  </symbol>
+  <!-- Tray, "capturing / uploading" state: dot becomes a ring -->
+  <symbol id="tray-busy" viewBox="0 0 16 16">
+    <path d="M1.5 6V3.5a2 2 0 0 1 2-2H6M10 1.5h2.5a2 2 0 0 1 2 2V6M14.5 10v2.5a2 2 0 0 1-2 2H10M6 14.5H3.5a2 2 0 0 1-2-2V10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+    <circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.6"/>
+  </symbol>
+</defs></svg>
+
+<div style="display:flex;flex-direction:column;gap:6px">
+  <div style="font-size:22px;font-weight:600;color:#ECEEF3;letter-spacing:-.01em">App icon &amp; tray icon</div>
+  <div class="cap" style="font-size:12px;max-width:900px">Concept: a selection marquee — four corner brackets — around a single accent dot, the "shot". It is the same geometry the overlay already draws (brackets = the selection frame, dot = a handle), so the icon and the UI read as one thing. Everything is a rounded rect, four stroked arcs and a circle, so it rasterizes with the same primitives as the UI and can be regenerated at any size.</div>
+</div>
+
+<!-- Hero + sizes -->
+<div style="display:flex;gap:24px">
+  <div class="card" style="width:400px;align-items:center;justify-content:center;padding:36px">
+    <svg width="256" height="256" role="img" aria-label="rustshot app icon"><use href="#app-lg"/></svg>
+    <div class="cap" style="text-align:center">Primary · periwinkle dot on slate tile</div>
+  </div>
+  <div class="card" style="flex:1">
+    <div class="h2">Size ramp · three tiers of geometry</div>
+    <div class="cap">Large (≥64) uses the 2-unit stroke. Medium (32–48) thickens to 2.5. Small (16–24) goes to 3 with longer arms and a bigger dot so the brackets still read as a frame. Export 512 · 256 · 128 · 64 · 48 · 32 · 24 · 16 for .icns / .ico / hicolor.</div>
+    <div style="display:flex;align-items:flex-end;gap:28px;padding-top:6px">
+      <div class="sz"><svg width="128" height="128" role="img" aria-label="128 px"><use href="#app-lg"/></svg><b>128</b></div>
+      <div class="sz"><svg width="64" height="64" role="img" aria-label="64 px"><use href="#app-lg"/></svg><b>64</b></div>
+      <div class="sz"><svg width="48" height="48" role="img" aria-label="48 px"><use href="#app-md"/></svg><b>48</b></div>
+      <div class="sz"><svg width="32" height="32" role="img" aria-label="32 px"><use href="#app-md"/></svg><b>32</b></div>
+      <div class="sz"><svg width="24" height="24" role="img" aria-label="24 px"><use href="#app-sm"/></svg><b>24</b></div>
+      <div class="sz"><svg width="16" height="16" role="img" aria-label="16 px"><use href="#app-sm"/></svg><b>16</b></div>
+    </div>
+    <div class="h2" style="margin-top:10px">Colorways</div>
+    <div style="display:flex;gap:28px;align-items:flex-start">
+      <div class="sz"><svg width="72" height="72" role="img" aria-label="Primary"><use href="#app-lg"/></svg><b>primary</b></div>
+      <div class="sz"><svg width="72" height="72" role="img" aria-label="Rust colorway"><use href="#app-lg-rust"/></svg><b>alt · rust #E07A4F</b></div>
+      <div class="sz"><svg width="72" height="72" role="img" aria-label="Light tile"><use href="#app-lg-light"/></svg><b>light tile</b></div>
+    </div>
+    <div class="cap">The rust colorway nods to the name without turning the whole icon orange; pick it if you want the icon to be the brand mark and keep periwinkle for the UI. The light tile is optional for GNOME light themes; the dark tile works everywhere.</div>
+  </div>
+</div>
+
+<!-- In context -->
+<div style="display:flex;gap:24px">
+  <div class="card" style="flex:1">
+    <div class="h2">In context · launchers</div>
+    <div style="display:flex;gap:16px">
+      <div style="flex:1;height:120px;border-radius:10px;background:linear-gradient(135deg,#C9D3E8,#E6DCE9);display:flex;align-items:center;justify-content:center;gap:18px;padding:0 16px">
+        <i style="width:56px;height:56px;border-radius:13px;background:#4A90E2;display:block"></i>
+        <i style="width:56px;height:56px;border-radius:13px;background:#F5F6FA;display:block"></i>
+        <svg width="56" height="56" role="img" aria-label="rustshot in macOS dock"><use href="#app-lg"/></svg>
+        <i style="width:56px;height:56px;border-radius:13px;background:#34C759;display:block"></i>
+      </div>
+      <div style="flex:1;height:120px;border-radius:10px;background:#202225;display:flex;align-items:center;justify-content:center;gap:18px;padding:0 16px">
+        <i style="width:40px;height:40px;border-radius:8px;background:#2D7FF9;display:block"></i>
+        <i style="width:40px;height:40px;border-radius:8px;background:#E8EAF0;display:block"></i>
+        <svg width="40" height="40" role="img" aria-label="rustshot in Windows taskbar"><use href="#app-lg"/></svg>
+        <i style="width:40px;height:40px;border-radius:8px;background:#7C3AED;display:block"></i>
+      </div>
+    </div>
+    <div class="cap">macOS dock (left) and a Windows 11 / GNOME dash (right). The slate tile sits comfortably among both the bright macOS squircles and the flatter Windows tiles because its 22.5% radius lands between the two conventions.</div>
+  </div>
+  <div class="card" style="flex:1">
+    <div class="h2">Tray / menu-bar icon · monochrome template</div>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <div class="bar" style="background:#F2F2F6;color:#1B1C20"><span style="flex:1"></span><i style="background:#1B1C20"></i><i style="background:#1B1C20"></i><svg width="16" height="16" style="color:#1B1C20" role="img" aria-label="tray icon, light bar"><use href="#tray"/></svg><i style="background:#1B1C20"></i><span>Fri 5:24 PM</span></div>
+      <div class="bar" style="background:#1D1E22;color:#ECEEF3"><span style="flex:1"></span><i style="background:#ECEEF3"></i><i style="background:#ECEEF3"></i><svg width="16" height="16" style="color:#ECEEF3" role="img" aria-label="tray icon, dark bar"><use href="#tray"/></svg><i style="background:#ECEEF3"></i><span>Fri 5:24 PM</span></div>
+      <div class="bar" style="background:#1D1E22;color:#ECEEF3"><span style="flex:1"></span><i style="background:#ECEEF3"></i><i style="background:#ECEEF3"></i><svg width="16" height="16" style="color:#8B93FF" role="img" aria-label="tray icon, busy"><use href="#tray-busy"/></svg><i style="background:#ECEEF3"></i><span>Fri 5:24 PM</span></div>
+    </div>
+    <div class="cap">16 px (22 px on macOS retina asset, 24 px on KDE), single color tinted by the system: black on light bars, white on dark. Same brackets, dot r 2.4, stroke 1.6. While an upload is running the dot becomes a ring, tinted accent — one glyph swap, no animation needed.</div>
+  </div>
+</div>
+
+<!-- Geometry spec -->
+<div class="card">
+  <div class="h2">Geometry · 24-unit grid (multiply by size ÷ 24)</div>
+  <div style="display:flex;gap:32px">
+    <table style="flex:1">
+      <tr><td class="k">tile</td><td class="m">24 × 24 · r 5.4 (22.5%)</td><td>#1B1C20; 1-unit inner border #FFF @ 10% on ≥64 only</td></tr>
+      <tr><td class="k">brackets ≥64</td><td class="m">inset 5 · arm 5 · r 2 · stroke 2</td><td>#ECEEF3, round caps</td></tr>
+      <tr><td class="k">brackets 32–48</td><td class="m">inset 4.5 · arm 5.5 · r 2.5 · stroke 2.5</td><td></td></tr>
+      <tr><td class="k">brackets 16–24</td><td class="m">inset 4 · arm 6 · r 3 · stroke 3</td><td>No inner border</td></tr>
+      <tr><td class="k">dot</td><td class="m">center · r 3.5 / 3.75 / 4</td><td>#8B93FF (or #E07A4F rust)</td></tr>
+      <tr><td class="k">tray glyph</td><td class="m">16-grid · inset 1.5 · arm 4.5 · stroke 1.6 · dot r 2.4</td><td>currentColor; busy = ring stroke 1.6, r 2.2</td></tr>
+    </table>
+    <div class="cap" style="width:360px">Files to ship: <b style="color:#ECEEF3">icon.svg</b> (24-grid master), <b style="color:#ECEEF3">tray.svg</b> + <b style="color:#ECEEF3">tray-busy.svg</b> (16-grid, `currentColor`), and PNGs at 16/24/32/48/64/128/256/512 wrapped into <b style="color:#ECEEF3">rustshot.icns</b>, <b style="color:#ECEEF3">rustshot.ico</b> and the hicolor tree for Linux. Pixel-snap the bracket strokes at 16 and 32 (odd stroke on integer coordinates) — the SVG here is the shape, not the final hinting.</div>
+  </div>
+</div>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":1080}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {};
+  }
+}
+</script>
+</body>
+</html>
