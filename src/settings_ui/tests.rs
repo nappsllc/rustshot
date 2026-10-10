@@ -83,7 +83,7 @@ fn form_writes_what_changed() {
     assert_eq!((c.shortcuts["tool_pencil"].as_str(), c.shortcuts["copy"].as_str()), ("Shift+K", ""));
     // And it reads back as the same form.
     let back = Form::new(&c, None);
-    assert_eq!((back.theme, back.renderer, back.format, back.quality), (2, cfg!(windows) as usize, 2, 50));
+    assert_eq!((back.theme, back.renderer, back.format, back.quality), (2, 1, 2, 50));
     assert_eq!(back.keys, f.keys);
 }
 
