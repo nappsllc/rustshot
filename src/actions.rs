@@ -51,7 +51,7 @@ pub fn open_path(path: &Path) {
 /// Tray "Check for updates": the update dialog opens at once and shows
 /// the result of the check (store installs: who updates them).
 pub fn check_updates() {
-    match crate::update::managed_install() {
+    match crate::update::update_channel() {
         Some(store) => crate::update_ui::show(DialogState::Managed(store)),
         None => crate::update_ui::check(),
     }

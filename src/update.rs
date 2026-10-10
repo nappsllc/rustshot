@@ -532,7 +532,12 @@ pub fn detect_from(exe: &Path, env: impl Fn(&str) -> Option<String>, p: &Probes)
     let dir = exe.parent().unwrap_or(Path::new(""));
     match p.os {
         Os::Windows => {
-            if (p.exists)(&dir.join("uninstall.exe")) {
+            if scoop_path(exe) {
+                InstallKind::Store(SCOOP)
+            } else if !(p.writable)(dir) {
+                // e.g. Program Files without elevation: open the page.
+                InstallKind::Unknown
+            } else if (p.exists)(&dir.join("uninstall.exe")) {
                 InstallKind::WinInstaller
             } else {
                 InstallKind::WinPortable
@@ -750,6 +755,23 @@ pub fn managed_install() -> Option<&'static str> {
     managed_by(|k| std::env::var(k).ok(), is_msix())
 }
 
+const SCOOP: &str = "Scoop";
+
+/// Installed by Scoop (`...\scoop\apps\<app>\...`, any case or separator):
+/// Scoop updates it.
+fn scoop_path(exe: &Path) -> bool {
+    exe.to_string_lossy().to_ascii_lowercase().replace('/', "\\").contains(r"\scoop\apps\")
+}
+
+/// Who updates this install instead of Rustshot: a store or sandbox
+/// ([`managed_install`]) or, on Windows, Scoop.
+pub fn update_channel() -> Option<&'static str> {
+    managed_install().or_else(|| {
+        let exe = std::env::current_exe().ok()?;
+        (cfg!(windows) && scoop_path(&exe)).then_some(SCOOP)
+    })
+}
+
 #[cfg(windows)]
 fn is_msix() -> bool {
     use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
@@ -826,7 +848,7 @@ pub fn spawn_checker(enabled: bool) -> Option<std::sync::mpsc::Receiver<Release>
     // turned off and on again while it slept) sees it and stops before it
     // checks or writes the day's stamp.
     let generation = CHECKER_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    if !enabled || managed_install().is_some() {
+    if !enabled || update_channel().is_some() {
         return None;
     }
     let (tx, rx) = std::sync::mpsc::channel();
@@ -834,7 +856,16 @@ pub fn spawn_checker(enabled: bool) -> Option<std::sync::mpsc::Receiver<Release>
         let stamp = crate::config::config_dir().join(STAMP_FILE);
         // Also stops when turned off in Settings meanwhile (a new checker
         // starts when it is turned on again).
-        let alive = || CHECKER_GEN.load(Ordering::SeqCst) == generation && crate::config::load().check_updates;
+        // A config that does not read or parse (mid-edit) keeps the last
+        // known setting rather than the defaults.
+        let path = crate::config::config_path();
+        let on = std::cell::Cell::new(true);
+        let alive = || {
+            if let Ok(c) = crate::config::read_at(&path) {
+                on.set(c.is_none_or(|c| c.check_updates));
+            }
+            CHECKER_GEN.load(Ordering::SeqCst) == generation && on.get()
+        };
         let skip = || crate::config::load().skip_version;
         run_checker(alive, &stamp, check_now, std::thread::sleep, |r| tx.send(r).is_ok(), skip);
     });
@@ -1402,6 +1433,20 @@ mod tests {
             InstallKind::WinInstaller
         );
         assert_eq!(run(inst, &no_env, probes(Os::Windows, &[], true), false), InstallKind::WinPortable);
+        // Not writable (e.g. Program Files without elevation): open the page.
+        assert_eq!(run(inst, &no_env, probes(Os::Windows, &[], false), false), InstallKind::Unknown);
+        assert_eq!(
+            run(inst, &no_env, probes(Os::Windows, &["C:/Users/u/AppData/Local/rustshot/uninstall.exe"], false), false),
+            InstallKind::Unknown
+        );
+        // Scoop manages its installs, writable or not, any case or separator.
+        for exe in [
+            r"C:\Users\u\scoop\apps\rustshot\current\rustshot.exe",
+            "D:/Tools/Scoop/Apps/rustshot/0.2.0/rustshot.exe",
+        ] {
+            assert_eq!(run(exe, &no_env, probes(Os::Windows, &[], true), false), InstallKind::Store("Scoop"));
+        }
+        assert!(!scoop_path(Path::new("C:/Users/u/scoop-apps/rustshot.exe")));
         assert_eq!(
             run(inst, &no_env, probes(Os::Windows, &[], true), true),
             InstallKind::Store("Microsoft Store")

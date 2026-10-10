@@ -885,7 +885,7 @@ impl Ui<'_> {
     /// scrolls by wheel, and by Up/Down/PageUp/PageDown/Home/End while
     /// focused. Fills the width; height = `height(..)` or 120. `scroll` is
     /// the offset in logical px, clamped here.
-    #[cfg_attr(not(test), allow(dead_code))] // the dialog uses text_view_styled
+    #[cfg(test)]
     pub fn text_view(&mut self, id: &str, s: &str, scroll: &mut f32) {
         let src: Vec<(&str, bool)> = s.split('\n').map(|l| (l, false)).collect();
         self.text_view_styled(id, &src, scroll);

@@ -16,7 +16,8 @@ pub enum Applied {
     OpenedPage,
 }
 
-/// Overrides `update_dir()` (tests).
+/// Overrides `update_dir()` (tests), honoured only together with
+/// `RUSTSHOT_INSTANCE` (a test instance), never for the user's own daemon.
 pub const DIR_VAR: &str = "RUSTSHOT_UPDATE_DIR";
 /// Set for a relaunched daemon: the PID of the old daemon to wait for.
 pub const WAIT_PID_VAR: &str = "RUSTSHOT_WAIT_PID";
@@ -39,14 +40,14 @@ const RETRY_TRIES: u32 = 80;
 
 /// User-private download dir: `%LOCALAPPDATA%\rustshot\update` on Windows,
 /// `$XDG_CACHE_HOME/rustshot/update` (or `~/.cache/...`) elsewhere;
-/// `RUSTSHOT_UPDATE_DIR` overrides it.
+/// `RUSTSHOT_UPDATE_DIR` overrides it when `RUSTSHOT_INSTANCE` is set too.
 pub fn update_dir() -> PathBuf {
     update_dir_from(|k| std::env::var_os(k))
 }
 
 fn update_dir_from(env: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     let get = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    if let Some(d) = get(DIR_VAR) {
+    if let Some(d) = get(DIR_VAR).filter(|_| get(crate::instance::INSTANCE_VAR).is_some()) {
         return d;
     }
     #[cfg(windows)]
@@ -329,6 +330,8 @@ fn extract_tarball(file: &Path, sha256: [u8; 32]) -> Result<PathBuf, String> {
         .arg(&dir)
         .arg("./rustshot")
         .env("PATH", "/usr/bin:/bin")
+        // GNU tar reads extra options from it: never let it change the extraction.
+        .env_remove("TAR_OPTIONS")
         .stdin(Stdio::null())
         .status()
         .map_err(|e| format!("cannot run tar: {e}"))?;
@@ -843,7 +846,9 @@ mod tests {
         let env = |pairs: &'static [(&'static str, &'static str)]| {
             move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| OsString::from(v))
         };
-        assert_eq!(update_dir_from(env(&[(DIR_VAR, "/x/upd"), ("HOME", "/h")])), PathBuf::from("/x/upd"));
+        assert_eq!(update_dir_from(env(&[(DIR_VAR, "/x/upd"), (crate::instance::INSTANCE_VAR, "t1"), ("HOME", "/h")])), PathBuf::from("/x/upd"));
+        // Without a test instance the override is ignored.
+        assert_ne!(update_dir_from(env(&[(DIR_VAR, "/x/upd"), ("HOME", "/h"), ("LOCALAPPDATA", r"C:\L")])), PathBuf::from("/x/upd"));
         #[cfg(windows)]
         {
             assert_eq!(

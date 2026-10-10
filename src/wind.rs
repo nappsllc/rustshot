@@ -344,6 +344,73 @@ pub(crate) fn forget_tick(hwnd: Hwnd) {
     cadence().forget(win_key(hwnd));
 }
 
+/// Test helper: drives `inner` and closes its window once it has drawn a
+/// frame and `ms` have passed since it was created (smoke tests of the
+/// real Settings window and update dialog).
+#[cfg(all(test, not(target_os = "macos")))]
+pub(crate) struct AutoClose<'a> {
+    inner: &'a mut dyn Driver,
+    hwnd: Hwnd,
+    ms: u64,
+    at: Option<std::time::Instant>,
+    pub frames: u32,
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+impl<'a> AutoClose<'a> {
+    pub fn new(inner: &'a mut dyn Driver, ms: u64) -> Self {
+        AutoClose { inner, hwnd: Hwnd::default(), ms, at: None, frames: 0 }
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+impl Driver for AutoClose<'_> {
+    fn on_create(&mut self, hwnd: Hwnd) {
+        self.hwnd = hwnd;
+        self.at = Some(std::time::Instant::now() + std::time::Duration::from_millis(self.ms));
+        self.inner.on_create(hwnd);
+    }
+    fn on_event(&mut self, ev: Ev) -> bool {
+        let timer = matches!(ev, Ev::Timer);
+        let r = self.inner.on_event(ev);
+        if timer && self.frames > 0 && self.at.is_some_and(|t| std::time::Instant::now() >= t) {
+            close(self.hwnd);
+        }
+        r
+    }
+    fn frame(&mut self) -> Option<&mut PixBuf> {
+        let f = self.inner.frame();
+        if f.is_some() {
+            self.frames += 1;
+        }
+        f
+    }
+    fn damage(&mut self) -> Option<Vec<[i32; 4]>> {
+        self.inner.damage()
+    }
+    #[cfg(windows)]
+    fn paint(&mut self, hdc: windows::Win32::Graphics::Gdi::HDC, rects: &[[i32; 4]]) -> bool {
+        let done = self.inner.paint(hdc, rects);
+        if done {
+            self.frames += 1;
+        }
+        done
+    }
+    fn cursor(&self) -> Cursor {
+        self.inner.cursor()
+    }
+    fn on_quit(&mut self) {
+        self.inner.on_quit();
+    }
+}
+
+/// Whether a window can be opened here (Linux: `$DISPLAY` is set); the
+/// window smoke tests return early without one.
+#[cfg(all(test, not(target_os = "macos")))]
+pub(crate) fn has_display() -> bool {
+    !cfg!(target_os = "linux") || std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

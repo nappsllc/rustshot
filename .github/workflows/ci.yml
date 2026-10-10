@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install X11 headers and validators
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxrandr-dev desktop-file-utils appstream
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxrandr-dev desktop-file-utils appstream xvfb xauth
       - name: Validate desktop entry and AppStream metadata
         run: |
           desktop-file-validate packaging/linux/io.github.nappsllc.rustshot.desktop
@@ -34,6 +34,12 @@ jobs:
             || { echo "::error::regenerate packaging/flatpak/cargo-sources.json (see docs/STORES.md)"; exit 1; }
       - name: Test
         run: cargo test
+      # The X11 windows (run_window, the Settings window, the update dialog)
+      # open for about a second under Xvfb and close themselves.
+      - name: Windows under Xvfb
+        env:
+          RUSTSHOT_TEST_AUTOCLOSE_MS: "1000"
+        run: timeout 300 xvfb-run -a cargo test -- --ignored --test-threads=1 --nocapture interactive_window_renders_rect window_smoke
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Build

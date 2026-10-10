@@ -12,7 +12,6 @@ use std::time::Duration;
 /// size of `dest`, polled while curl runs (total unknown); `progress`
 /// returning false kills curl (error `update::CANCELLED`). A partial file is
 /// deleted on any failure.
-#[allow(dead_code)] // reached through update::fetch_verified (dialog: later task)
 pub fn download_to(
     url: &str,
     dest: &Path,

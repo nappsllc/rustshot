@@ -192,7 +192,7 @@ impl FocusState {
 
     /// Whether any dropdown list is open or a shortcut is being recorded
     /// (a dialog should then not treat Esc/Enter as its own).
-    #[cfg_attr(not(test), allow(dead_code))] // tests drive it; no window needs it yet
+    #[cfg(test)]
     pub fn busy(&self) -> bool {
         self.open.is_some() || self.recording.is_some()
     }

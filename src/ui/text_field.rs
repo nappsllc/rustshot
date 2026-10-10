@@ -29,7 +29,7 @@ impl TextState {
         *self = TextState::new(text);
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // tests drive it; no window needs it yet
+    #[cfg(test)]
     pub fn caret(&self) -> usize {
         self.caret
     }
@@ -49,7 +49,7 @@ impl TextState {
     }
 
     /// Select `range` with the caret at its end (clamped to char boundaries).
-    #[cfg_attr(not(test), allow(dead_code))] // tests drive it; no window needs it yet
+    #[cfg(test)]
     pub fn select(&mut self, range: std::ops::Range<usize>) {
         self.anchor = self.floor(range.start);
         self.caret = self.floor(range.end);
@@ -63,7 +63,7 @@ impl TextState {
         self.anchor = self.caret;
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // tests drive it; no window needs it yet
+    #[cfg(test)]
     fn floor(&self, mut i: usize) -> usize {
         i = i.min(self.text.len());
         while !self.text.is_char_boundary(i) {

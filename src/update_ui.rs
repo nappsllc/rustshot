@@ -615,6 +615,10 @@ fn request(req: Request) {
             DialogState::Managed(s) => eprintln!("Updates for this install come from {s}."),
         };
         match req {
+            // Unasked (the daily check): never open a browser tab.
+            Request::Offer(DialogState::Available(r)) => {
+                eprintln!("Rustshot {} is available — run `rustshot update`", r.version)
+            }
             Request::Show(s) | Request::Offer(s) => out(s),
             Request::Check => {
                 std::thread::spawn(move || out(DialogState::from_check(update::check_now())));
@@ -984,6 +988,28 @@ mod tests {
 
     fn avail() -> Machine {
         Machine::new(DialogState::Available(rel("9.9.9")))
+    }
+
+    /// Smoke (needs a display; CI runs it under `xvfb-run` on Linux): the
+    /// real update dialog opens with release notes, draws and closes after
+    /// about a second. `cargo test window_smoke -- --ignored --test-threads=1`
+    #[cfg(not(target_os = "macos"))] // macOS windows need the main thread
+    #[test]
+    #[ignore = "opens a window"]
+    fn update_dialog_window_smoke() {
+        if !crate::wind::has_display() {
+            eprintln!("no display; skipped");
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (m, acts) = Machine::start(Request::Show(DialogState::Available(rel("9.9.9"))));
+        assert!(acts.is_empty());
+        let mut dlg = Dialog::new(m, crate::theme::resolve(&crate::config::Config::default()), tx, rx);
+        let mut d = crate::wind::AutoClose::new(&mut dlg, 1000);
+        let spec = WindowSpec { title: "Rustshot update".into(), w: W, h: H, resizable: false, min: (W, H) };
+        wind::run_window(spec, &mut d).expect("update dialog");
+        assert!(d.frames > 0, "drew a frame");
+        dlg.cancel();
     }
 
     #[test]

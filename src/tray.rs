@@ -86,7 +86,6 @@ pub fn draw_glyph(fb: &mut crate::uifb::Fb, x: f32, y: f32, size: f32, c: crate:
 /// Monochrome tray glyph as straight-alpha RGBA, `size`x`size`, in colour `rgb`.
 /// Coverage is rasterised white-on-black into an opaque scratch buffer (the
 /// rasterizer assumes an opaque destination) and its red channel becomes alpha.
-#[allow(dead_code)] // Windows today; the macOS/Linux trays reuse it later
 pub fn tray_glyph_rgba(size: u32, rgb: (u8, u8, u8)) -> Vec<u8> {
     use crate::uifb::{C4, Fb};
     let n = size as usize;

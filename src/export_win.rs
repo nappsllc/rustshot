@@ -118,7 +118,6 @@ pub fn copy_text_to_clipboard(text: &str) -> Result<()> {
 }
 
 /// The clipboard's text (CF_UNICODETEXT), if any.
-#[allow(dead_code)] // Settings window (Task 8)
 pub fn clipboard_text() -> Option<String> {
     use windows::Win32::Foundation::HGLOBAL;
     use windows::Win32::System::DataExchange::{GetClipboardData, IsClipboardFormatAvailable};
@@ -431,7 +430,6 @@ const MAX_REDIRECTS: usize = 5;
 /// hop must pass `update::is_allowed_download_hop`. `progress(got, total)`
 /// returning false cancels (error `update::CANCELLED`). A partial file is
 /// deleted on any failure.
-#[allow(dead_code)] // reached through update::fetch_verified (dialog: later task)
 pub fn download_to(
     url: &str,
     dest: &Path,

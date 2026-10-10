@@ -79,7 +79,7 @@ Windows, <kbd>Super</kbd> on Linux, <kbd>⌘</kbd> on macOS) to capture. Quit th
 Or capture directly from a terminal:
 
 ```bash
-rustshot                          # start the background daemon with tray icon (default)
+rustshot                          # start the background daemon (tray icon on Windows; default)
 rustshot gui                      # interactive capture
 rustshot gui --clip               # select, annotate, Enter copies to clipboard
 rustshot full --path ~/Pictures   # whole desktop, no editor
@@ -93,8 +93,10 @@ rustshot --help
 
 ### Settings
 
-Open **Settings…** from the tray menu, or run `rustshot settings` (a running
-daemon opens its window; otherwise the window opens on its own). Three tabs:
+Open **Settings…** from the tray menu (Windows), or run `rustshot settings`
+(a running daemon opens its window; otherwise the window opens on its own;
+on Linux and macOS, where there is no tray icon, this is the way in). On
+Linux the Settings window is *(experimental)*. Three tabs:
 
 - **General:** theme (Auto follows the OS), the overlay renderer
   (Windows), start at login (hidden for store installs), the daily update
@@ -109,7 +111,8 @@ daemon opens its window; otherwise the window opens on its own). Three tabs:
 settings up at once: the next capture uses them and the hotkeys are
 re-registered. A hotkey that cannot be registered (another app uses it,
 or it is not a valid hotkey) is reported once, in the window or as a tray
-notification, and the previous one is kept; while it stays unregistered
+notification (Windows; on Linux and macOS on stderr), and the previous one
+is kept; while it stays unregistered
 the window says so next to its box, and **Apply** tries again. Saving
 rewrites `config.toml`: if the file has comments or keys Rustshot does not
 know, the first save asks before removing them. A `config.toml` with an
@@ -241,7 +244,10 @@ upload_client_id = "313baf0c7b4d3ff"
 
 The daemon checks GitHub for a new release once a day (turn it off in
 Settings › General or with `check_updates = false`); the tray's *Check for
-updates* checks now. A new version opens a dialog with the release notes:
+updates* (Windows) or `rustshot update` (any platform) checks now. A new
+version opens a dialog with the release notes (on Linux the dialog is
+*(experimental)*; on macOS the daily check only announces it on stderr and
+in the next capture, *Rustshot X is available — run `rustshot update`*):
 **Update** downloads it, checks its SHA-256 against the release's
 `SHA256SUMS` (it refuses to install on a mismatch or a missing entry),
 waits for an open capture to close and restarts into the new version;
@@ -254,11 +260,12 @@ How the new version is installed depends on how Rustshot was installed:
 | Install | Update |
 |---|---|
 | Windows installer (also winget) | runs the new `setup.exe` silently; it waits for Rustshot to exit, installs over it and starts it again |
-| Windows portable `.exe` | swaps the new `.exe` in next to the running one and restarts |
+| Windows portable `.exe` (in a writable folder) | swaps the new `.exe` in next to the running one and restarts |
 | AppImage | replaces the `.AppImage` file and restarts |
 | Linux tarball (outside `/usr`, in a writable folder) | replaces the binary and restarts |
-| Microsoft Store, Flathub, Snap, Mac App Store | no daily check (a manual check says the store handles updates) |
-| `.deb`, read-only installs, macOS | opens the release page (macOS in-app updates come once they are tested on a Mac) |
+| Microsoft Store, Scoop, Flathub, Snap, Mac App Store | no daily check (a manual check says the store or package manager handles updates) |
+| `.deb`, read-only installs | opens the release page |
+| macOS | the daily check announces the release on stderr and in the next capture (it never opens the browser); `rustshot update` opens the release page (in-app updates come once they are tested on a Mac) |
 
 Downloads come only from the project's GitHub releases
 (`github.com/nappsllc/rustshot/releases/download/`, following GitHub's

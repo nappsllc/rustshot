@@ -524,7 +524,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Update => {
-            if let Some(channel) = update::managed_install() {
+            if let Some(channel) = update::update_channel() {
                 println!("Rustshot is managed by {channel}; update it there.");
                 return Ok(());
             }

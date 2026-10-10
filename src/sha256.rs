@@ -108,7 +108,7 @@ fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
 }
 
 /// One-shot digest.
-#[allow(dead_code)] // tests; update UI may show digests (later task)
+#[cfg(test)]
 pub fn digest(data: &[u8]) -> [u8; 32] {
     let mut s = Sha256::new();
     s.update(data);
@@ -116,7 +116,7 @@ pub fn digest(data: &[u8]) -> [u8; 32] {
 }
 
 /// Lowercase hex.
-#[allow(dead_code)] // tests; update UI may show digests (later task)
+#[cfg(test)]
 pub fn hex(bytes: &[u8]) -> String {
     const D: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);

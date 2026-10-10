@@ -272,10 +272,15 @@ impl App {
         self.poll_upload();
         if let Some(rx) = &self.updates {
             while let Ok(r) = rx.try_recv() {
+                // macOS has no dialog (windows need the main thread): the
+                // release is announced on stderr and in the next capture.
+                #[cfg(target_os = "macos")]
+                eprintln!("Rustshot {} is available — run `rustshot update`", r.version);
                 self.update_pending = Some(r);
             }
         }
         // Never over a capture in progress: the dialog would take its focus.
+        #[cfg(not(target_os = "macos"))]
         if matches!(self.st, State::Hidden)
             && self.pending.is_none()
             && let Some(r) = self.update_pending.take()
@@ -530,6 +535,12 @@ impl App {
             pressed: None,
             hot_handle: None,
         };
+        #[cfg(target_os = "macos")]
+        if let Some(r) = self.update_pending.take() {
+            let mut t = Toast::new(format!("Rustshot {} is available — run `rustshot update`", r.version), ToastKind::Info);
+            t.ttl = 6000.0;
+            edit.notice = Some(t);
+        }
         if accept_now {
             edit.done = true;
             edit.cancelled = false;

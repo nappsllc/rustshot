@@ -359,16 +359,16 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
             table = name.trim().to_string();
             continue;
         }
-        let Some((key, val)) = line.split_once('=') else {
+        let Some((key, val)) = split_key(line) else {
             return Err(format!("line {}: expected key = value", idx + 1));
         };
         let key = key.trim();
         let val = val.trim();
         let bad = |kind: &str, v: &str| format!("line {}: invalid {kind} for '{key}': {v}", idx + 1);
         if table == "shortcuts" {
-            let key = key.trim_matches('"');
+            let key = if key.starts_with('"') { as_string(key).map_err(|e| bad("key", &e))? } else { key.to_string() };
             let v = as_string(val).map_err(|e| bad("string", &e))?;
-            cfg.shortcuts.insert(key.to_string(), v);
+            cfg.shortcuts.insert(key, v);
             continue;
         }
         if !table.is_empty() {
@@ -510,11 +510,30 @@ pub fn to_toml(c: &Config) -> String {
 [shortcuts]
 ");
         for (k, v) in &c.shortcuts {
+            // A key that is not a bare TOML key (e.g. one with `#` or `[`) is quoted.
+            let bare = !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+            let k = if bare { k.clone() } else { q(k) };
             out.push_str(&format!("{k} = {}
 ", q(v)));
         }
     }
     out
+}
+
+/// Split `key = value` at the first `=` outside a quoted key.
+fn split_key(line: &str) -> Option<(&str, &str)> {
+    let mut esc = false;
+    let mut in_str = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            _ if esc => esc = false,
+            '\\' if in_str => esc = true,
+            '"' => in_str = !in_str,
+            '=' if !in_str => return Some((&line[..i], &line[i + 1..])),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Cut a trailing `# comment`, respecting quotes.
@@ -860,6 +879,18 @@ bogus = 1
         let back = parse_config(&to_toml(&cfg)).unwrap();
         assert_eq!(back.shortcuts, cfg.shortcuts);
         assert!(!to_toml(&Config::default()).contains("[shortcuts]"));
+        // Keys that are not bare TOML keys are quoted and read back.
+        let odd = Config {
+            shortcuts: [("a#b", "X"), ("[c]", "Y"), ("q\"=k", "Z"), ("save", "Ctrl+S")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..Config::default()
+        };
+        let text = to_toml(&odd);
+        assert!(text.contains("\"a#b\" = \"X\"") && text.contains("\"[c]\" = \"Y\"") && text.contains("\nsave = "));
+        assert_eq!(parse_config(&text).unwrap().shortcuts, odd.shortcuts);
+        assert!(!rewrite_loses(&text));
         let w = shortcut_warnings(&cfg);
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("bogus"));

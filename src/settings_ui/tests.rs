@@ -795,3 +795,25 @@ fn row_click_records_then_rebinds() {
     render(&mut s, &DARK, 1.0, &input, &mut focus);
     assert!(s.form.keys.chords(Action::ToolPencil).is_empty());
 }
+
+/// Smoke (needs a display; CI runs it under `xvfb-run` on Linux): the real
+/// Settings window opens, draws and closes after about a second.
+/// `cargo test window_smoke -- --ignored --test-threads=1`
+#[cfg(not(target_os = "macos"))] // macOS windows need the main thread
+#[test]
+#[ignore = "opens a window"]
+fn settings_window_smoke() {
+    if !crate::wind::has_display() {
+        eprintln!("no display; skipped");
+        return;
+    }
+    let dir = scratch("smoke");
+    let s = Settings::new(Config::default(), None, dir.join("config.toml"));
+    let (_tx, rx) = std::sync::mpsc::channel();
+    let mut w = Window::new(s, crate::theme::resolve(&Config::default()), rx);
+    let mut d = crate::wind::AutoClose::new(&mut w, 1000);
+    let spec = WindowSpec { title: "Rustshot Settings".into(), w: W, h: H, resizable: false, min: (W, H) };
+    wind::run_window(spec, &mut d).expect("settings window");
+    assert!(d.frames > 0, "drew a frame");
+    let _ = std::fs::remove_dir_all(&dir);
+}
