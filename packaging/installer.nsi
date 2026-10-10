@@ -105,13 +105,15 @@ Function .onInit
 FunctionEnd
 
 ; "/S /RELAUNCH": start the new daemon after a successful silent install.
+; "--after-update" makes it wait for (never signal) a still-running old
+; daemon, then exit quietly if that one never goes away.
 Function .onInstSuccess
   ${If} ${Silent}
     ${GetParameters} $0
     ClearErrors
     ${GetOptions} $0 "/RELAUNCH" $1
     ${IfNot} ${Errors}
-      Exec '"$INSTDIR\${PRODUCT_EXE}" daemon'
+      Exec '"$INSTDIR\${PRODUCT_EXE}" daemon --after-update'
     ${EndIf}
   ${EndIf}
 FunctionEnd

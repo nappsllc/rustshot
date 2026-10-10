@@ -48,7 +48,9 @@ enum Cmd {
         args: CaptureArgs,
     },
     /// Run in the background and wait for the global capture hotkey.
-    Daemon,
+    /// `after_update`: started by an in-app update (hidden `--after-update`):
+    /// never signal a still-running old daemon.
+    Daemon { after_update: bool },
     /// Check for a newer release and open its download page.
     Update,
     /// Show or validate the config file.
@@ -153,10 +155,11 @@ fn parse_from(args: &[String]) -> Result<Parsed, String> {
             Some(Cmd::Screen { number, args: capture })
         }
         Some("daemon") => {
-            if let Some(a) = rest.first() {
+            let after_update = rest.first().map(String::as_str) == Some(update_install::AFTER_UPDATE_FLAG);
+            if let Some(a) = rest.get(after_update as usize) {
                 return Err(format!("unexpected argument '{a}'"));
             }
-            Some(Cmd::Daemon)
+            Some(Cmd::Daemon { after_update })
         }
         Some("update") => {
             if let Some(a) = rest.first() {
@@ -472,7 +475,7 @@ pub fn memlog(phase: &str) {
 fn run() -> Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let cmd = match parse_from(&argv) {
-        Ok(Parsed::Cmd(c)) => c.unwrap_or(Cmd::Daemon),
+        Ok(Parsed::Cmd(c)) => c.unwrap_or(Cmd::Daemon { after_update: false }),
         Ok(Parsed::Help(h)) => {
             print!("{h}");
             return Ok(());
@@ -520,12 +523,22 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Cmd::Daemon => {
+        Cmd::Daemon { after_update } => {
             // `_solo` keeps a Solo daemon's lock file locked until the process ends.
             let mut _solo = None;
             // After a portable update: let the old daemon exit first (bounded).
-            update_install::wait_for_previous();
-            let guard = match instance::acquire_or_signal() {
+            let waited = update_install::wait_for_previous();
+            // An update relaunch never signals the old daemon (that would
+            // start a capture in it): it retries, then gives up quietly.
+            let inst = match update_install::start_daemon(waited || after_update, instance::try_acquire) {
+                update_install::Start::Run(i) => i,
+                update_install::Start::AcquireOrSignal => instance::acquire_or_signal(),
+                update_install::Start::GiveUp => {
+                    eprintln!("rustshot: the previous daemon is still running after the update; exiting");
+                    exit(0);
+                }
+            };
+            let guard = match inst {
                 instance::Instance::Signalled => exit(0),
                 instance::Instance::Primary(g) => Some(g),
                 instance::Instance::Solo(keep) => {
@@ -679,7 +692,11 @@ mod cli_tests {
     fn config_and_daemon() {
         assert!(matches!(cmd(&["config", "--check"]), Cmd::Config { check: true }));
         assert!(matches!(cmd(&["config"]), Cmd::Config { check: false }));
-        assert!(matches!(cmd(&["daemon"]), Cmd::Daemon));
+        assert!(matches!(cmd(&["daemon"]), Cmd::Daemon { after_update: false }));
+        assert!(matches!(cmd(&["daemon", "--after-update"]), Cmd::Daemon { after_update: true }));
+        assert!(p(&["daemon", "--after-update", "x"]).is_err());
+        assert!(p(&["daemon", "x", "--after-update"]).is_err());
+        assert!(p(&["gui", "--after-update"]).is_err());
     }
 
     #[test]

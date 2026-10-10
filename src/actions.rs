@@ -28,7 +28,7 @@ pub fn open_path(path: &Path) {
         if r.0 as isize <= 32 {
             // No association (e.g. for .toml): fall back to Notepad.
             if let Some(exe) = crate::proc_win::system_exe("notepad.exe") {
-                let _ = crate::proc_win::spawn_detached(&exe, &[path.as_os_str()]);
+                let _ = crate::proc_win::spawn_detached(&exe, &[path.as_os_str()], &[]);
             }
         }
     }

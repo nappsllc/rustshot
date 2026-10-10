@@ -16,6 +16,13 @@ pub fn acquire_or_signal() -> Instance {
     imp::acquire_or_signal()
 }
 
+/// Become the primary without ever signalling: `None` while another daemon
+/// holds the instance (used after an update, where the holder is the old
+/// daemon and must not be asked to capture).
+pub fn try_acquire() -> Option<Instance> {
+    imp::try_acquire()
+}
+
 /// Env var naming a separate daemon instance (own mutex/window class or
 /// socket), so tests can run a daemon beside the user's.
 pub const INSTANCE_VAR: &str = "RUSTSHOT_INSTANCE";
@@ -164,6 +171,16 @@ mod imp {
     }
 
     pub fn acquire_or_signal() -> Instance {
+        acquire(true).expect("signal mode always decides")
+    }
+
+    pub fn try_acquire() -> Option<Instance> {
+        acquire(false)
+    }
+
+    /// `signal`: when the mutex is held, signal its owner (`Signalled`);
+    /// otherwise return `None` without signalling.
+    fn acquire(signal: bool) -> Option<Instance> {
         unsafe {
             let name: Vec<u16> = match super::instance_name() {
                 Some(n) => format!("Local\\rustshot-daemon-{n}"),
@@ -175,15 +192,18 @@ mod imp {
             let mutex = match CreateMutexW(None, true, PCWSTR(name.as_ptr())) {
                 Ok(h) => h,
                 // Cannot tell; behave as the sole instance without a guard.
-                Err(_) => return Instance::Solo(Keep),
+                Err(_) => return Some(Instance::Solo(Keep)),
             };
             if GetLastError() == ERROR_ALREADY_EXISTS {
                 let _ = CloseHandle(mutex);
+                if !signal {
+                    return None;
+                }
                 // The primary may still be creating its window; retry briefly.
                 for _ in 0..20 {
                     if let Ok(hwnd) = FindWindowW(super::tray_class(), PCWSTR::null()) {
                         let _ = PostMessageW(Some(hwnd), WM_CAPTURE, WPARAM(0), LPARAM(0));
-                        return Instance::Signalled;
+                        return Some(Instance::Signalled);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
@@ -195,9 +215,9 @@ mod imp {
                     "warning: could not create the tray window; running without tray or single-instance signalling"
                 );
                 let _ = CloseHandle(mutex);
-                return Instance::Solo(Keep);
+                return Some(Instance::Solo(Keep));
             };
-            Instance::Primary(super::Guard(Inner { mutex, thread_id, thread: Some(thread) }))
+            Some(Instance::Primary(super::Guard(Inner { mutex, thread_id, thread: Some(thread) })))
         }
     }
 }
@@ -335,6 +355,12 @@ mod imp {
 
     /// `None` = another primary exists but could not be signalled.
     pub fn acquire_at(path: &Path) -> Option<Instance> {
+        acquire_mode(path, true)
+    }
+
+    /// `may_signal` false: `None` whenever another primary holds the lock, and
+    /// it is never signalled.
+    fn acquire_mode(path: &Path, may_signal: bool) -> Option<Instance> {
         match try_lock(&lock_path(path)) {
             Lock::Held(lock) => {
                 // We are the primary: any socket file is stale.
@@ -346,6 +372,7 @@ mod imp {
                     Err(e) => solo(e, Some(lock)),
                 }
             }
+            Lock::Busy if !may_signal => None,
             Lock::Busy => {
                 // The primary may still be binding; retry briefly.
                 for _ in 0..20 {
@@ -358,6 +385,16 @@ mod imp {
             }
             Lock::Unavailable(e) => solo(e, None),
         }
+    }
+
+    pub fn try_acquire() -> Option<Instance> {
+        acquire_mode(&default_path(), false)
+    }
+
+    /// `try_acquire` on an explicit socket path (tests).
+    #[cfg(test)]
+    pub fn try_acquire_at(path: &Path) -> Option<Instance> {
+        acquire_mode(path, false)
     }
 
     pub fn acquire_or_signal() -> Instance {
@@ -404,6 +441,22 @@ mod imp {
             // A stale socket file is replaced.
             drop(UnixListener::bind(&path).unwrap());
             assert!(matches!(acquire_at(&path), Some(Instance::Primary(_))));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn try_acquire_never_signals_a_held_instance() {
+            let dir = std::env::temp_dir().join(format!("rustshot-tryacq-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("t.sock");
+            let _ = std::fs::remove_file(&path);
+            let Some(Instance::Primary(g)) = try_acquire_at(&path) else { panic!("free: must be primary") };
+            let (tx, rx) = mpsc::channel();
+            g.listen(tx);
+            assert!(try_acquire_at(&path).is_none(), "held: must not become primary or signal");
+            assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "the holder was signalled");
+            drop(g);
+            assert!(matches!(try_acquire_at(&path), Some(Instance::Primary(_))));
             let _ = std::fs::remove_dir_all(&dir);
         }
 

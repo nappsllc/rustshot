@@ -67,16 +67,61 @@ pub fn command_line(exe: &Path, args: &[&OsStr]) -> Result<Vec<u16>, String> {
     Ok(cmd)
 }
 
+/// A `CreateProcessW` environment block (`CREATE_UNICODE_ENVIRONMENT`):
+/// `base` with `extra` added (replacing names that match case-insensitively),
+/// as `NAME=VALUE\0` entries sorted by name (case-insensitive, as Windows
+/// requires) and ended by an extra NUL.
+pub fn env_block<I>(base: I, extra: &[(&OsStr, &OsStr)]) -> Result<Vec<u16>, String>
+where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    let wide = |s: &OsStr| s.encode_wide().collect::<Vec<u16>>();
+    let upper = |k: &[u16]| k.iter().map(|&c| if (0x61..=0x7a).contains(&c) { c - 0x20 } else { c }).collect::<Vec<u16>>();
+    let mut vars: Vec<(Vec<u16>, Vec<u16>)> = Vec::new();
+    for (k, v) in extra {
+        let (k, v) = (wide(k), wide(v));
+        // A leading '=' is allowed (the hidden per-drive "=C:" entries).
+        if k.is_empty() || k[1..].contains(&(b'=' as u16)) || k.contains(&0) || v.contains(&0) {
+            return Err("invalid environment variable".into());
+        }
+        vars.retain(|(n, _)| upper(n) != upper(&k));
+        vars.push((k, v));
+    }
+    for (k, v) in base {
+        let (k, v) = (wide(&k), wide(&v));
+        if k.is_empty() || k.contains(&0) || v.contains(&0) || vars.iter().any(|(n, _)| upper(n) == upper(&k)) {
+            continue;
+        }
+        vars.push((k, v));
+    }
+    vars.sort_by_cached_key(|(k, _)| upper(k));
+    let mut block = Vec::new();
+    for (k, v) in vars {
+        block.extend(k);
+        block.push(b'=' as u16);
+        block.extend(v);
+        block.push(0);
+    }
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    Ok(block)
+}
+
 /// Start `exe args...` detached from us (no console, own process group, no
-/// inherited handles; the environment is inherited) and forget it. `exe`
-/// must be an absolute path: it is passed as the application name, so no
-/// search path (and no current directory) is involved.
-pub fn spawn_detached(exe: &Path, args: &[&OsStr]) -> Result<(), String> {
+/// inherited handles) and forget it. The child gets our environment plus
+/// `extra_env` (passed as an explicit block; our own environment is not
+/// changed). `exe` must be an absolute path: it is passed as the application
+/// name, so no search path (and no current directory) is involved.
+pub fn spawn_detached(exe: &Path, args: &[&OsStr], extra_env: &[(&OsStr, &OsStr)]) -> Result<(), String> {
+    use windows::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
     if !exe.is_absolute() {
         return Err(format!("not an absolute path: {}", exe.display()));
     }
     let mut cmd = command_line(exe, args)?;
     let app: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+    let env = if extra_env.is_empty() { None } else { Some(env_block(std::env::vars_os(), extra_env)?) };
     let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
     let mut pi = PROCESS_INFORMATION::default();
     unsafe {
@@ -86,8 +131,8 @@ pub fn spawn_detached(exe: &Path, args: &[&OsStr]) -> Result<(), String> {
             None,
             None,
             false,
-            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-            None,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
+            env.as_ref().map(|b| b.as_ptr() as *const std::ffi::c_void),
             PCWSTR::null(),
             &si,
             &mut pi,
@@ -176,7 +221,7 @@ mod tests {
         assert!(command_line(Path::new("a\"b.exe"), &[]).is_err());
         assert!(command_line(Path::new(""), &[]).is_err());
         assert!(command_line(Path::new(r"C:\a.exe"), &[OsStr::new("x\0y")]).is_err());
-        assert!(spawn_detached(Path::new("cmd.exe"), &[]).is_err(), "relative paths are refused");
+        assert!(spawn_detached(Path::new("cmd.exe"), &[], &[]).is_err(), "relative paths are refused");
     }
 
     #[test]
@@ -185,11 +230,29 @@ mod tests {
         // valid) pid returns promptly.
         let cmd = system_exe("cmd.exe").unwrap();
         assert!(cmd.is_file());
-        spawn_detached(&cmd, &[OsStr::new("/c"), OsStr::new("exit 0")]).unwrap();
+        spawn_detached(&cmd, &[OsStr::new("/c"), OsStr::new("exit 0")], &[]).unwrap();
+        spawn_detached(&cmd, &[OsStr::new("/c"), OsStr::new("exit 0")], &[(OsStr::new("RUSTSHOT_X"), OsStr::new("1"))])
+            .unwrap();
         let t = std::time::Instant::now();
         wait_pid(0, 10_000);
         wait_pid(u32::MAX - 2, 10_000);
         assert!(t.elapsed() < std::time::Duration::from_secs(2));
-        assert!(spawn_detached(&cmd.with_file_name("rustshot-no-such.exe"), &[]).is_err());
+        assert!(spawn_detached(&cmd.with_file_name("rustshot-no-such.exe"), &[], &[]).is_err());
+    }
+
+    #[test]
+    fn env_block_is_sorted_double_nul_terminated_and_overrides() {
+        let os = |s: &str| OsString::from(s);
+        let base = vec![(os("Path"), os(r"C:\x")), (os("b"), os("2")), (os("rustshot_wait_pid"), os("old")), (os("A"), os("1"))];
+        let block = env_block(base, &[(OsStr::new("RUSTSHOT_WAIT_PID"), OsStr::new("42"))]).unwrap();
+        assert_eq!(&block[block.len() - 2..], &[0, 0]);
+        let text = String::from_utf16(&block[..block.len() - 2]).unwrap();
+        let entries: Vec<&str> = text.split('\0').collect();
+        assert_eq!(entries, ["A=1", "b=2", r"Path=C:\x", "RUSTSHOT_WAIT_PID=42"]);
+        // An empty environment is still a valid (double-NUL) block.
+        assert_eq!(env_block(Vec::new(), &[]).unwrap(), [0, 0]);
+        for (k, v) in [("", "v"), ("A=B", "v"), ("A\0", "v"), ("A", "v\0")] {
+            assert!(env_block(Vec::new(), &[(OsStr::new(k), OsStr::new(v))]).is_err(), "{k:?}={v:?}");
+        }
     }
 }

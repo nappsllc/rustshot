@@ -23,8 +23,19 @@ pub const WAIT_PID_VAR: &str = "RUSTSHOT_WAIT_PID";
 /// Longest a relaunched daemon waits for the old one.
 const WAIT_MS: u32 = 10_000;
 /// Subdirectory of the update dir a tarball is extracted into.
-#[cfg_attr(not(unix), allow(dead_code))]
 const EXTRACT_DIR: &str = "extract";
+/// Created inside `EXTRACT_DIR` by us; cleanup removes only a dir that has it.
+const EXTRACT_MARKER: &str = ".rustshot-extract";
+/// Name of the private copy of the tarball inside `EXTRACT_DIR`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const TARBALL_COPY: &str = "update.tar.gz";
+/// Hidden `daemon` flag for a daemon started by an update (the NSIS
+/// installer and `relaunch` pass it): it never signals the old daemon.
+pub const AFTER_UPDATE_FLAG: &str = "--after-update";
+/// After the wait for the old daemon, keep trying to become the primary
+/// for this long (`RETRY_TRIES` x `RETRY_MS`) before exiting quietly.
+const RETRY_MS: u64 = 250;
+const RETRY_TRIES: u32 = 80;
 
 /// User-private download dir: `%LOCALAPPDATA%\rustshot\update` on Windows,
 /// `$XDG_CACHE_HOME/rustshot/update` (or `~/.cache/...`) elsewhere;
@@ -80,10 +91,11 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 
 /// The file a portable update replaces: the AppImage itself when running
 /// from one, otherwise this exe.
+/// `$APPIMAGE` counts only when it is ours (`update::own_appimage`).
 fn swap_target() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
-    if let Some(a) = std::env::var_os("APPIMAGE").filter(|a| !a.is_empty()) {
-        return Some(a.into());
+    if let Some(a) = update::own_appimage() {
+        return Some(a);
     }
     std::env::current_exe().ok()
 }
@@ -96,15 +108,18 @@ pub fn cleanup_previous() {
 }
 
 fn cleanup(dir: &Path, target: Option<&Path>) {
-    if let Ok(rd) = std::fs::read_dir(dir) {
+    if dir_is_private(dir)
+        && let Ok(rd) = std::fs::read_dir(dir)
+    {
         for e in rd.flatten() {
             let name = e.file_name();
-            let name = name.to_string_lossy();
-            // Only names we create: the dir may be overridden.
-            if name == update::SUMS_NAME || name.starts_with("rustshot-") {
+            let Some(name) = name.to_str() else { continue };
+            // Only exact names we create: the dir may be overridden.
+            let Ok(meta) = std::fs::symlink_metadata(e.path()) else { continue };
+            if is_our_file(name) && !meta.is_dir() {
                 let _ = std::fs::remove_file(e.path());
             } else if name == EXTRACT_DIR {
-                let _ = std::fs::remove_dir_all(e.path());
+                remove_extract_dir(&e.path());
             }
         }
     }
@@ -114,10 +129,64 @@ fn cleanup(dir: &Path, target: Option<&Path>) {
     }
 }
 
+/// A file name we put in the update dir: a release asset
+/// (`rustshot-<version><known suffix>`), `SHA256SUMS`, or either with `.part`.
+fn is_our_file(name: &str) -> bool {
+    let n = name.strip_suffix(".part").unwrap_or(name);
+    if n == update::SUMS_NAME {
+        return true;
+    }
+    let Some(rest) = n.strip_prefix("rustshot-") else { return false };
+    update::ASSET_SUFFIXES.iter().any(|suf| {
+        rest.strip_suffix(suf).is_some_and(|v| {
+            (1..=64).contains(&v.len())
+                && v.starts_with(|c: char| c.is_ascii_digit())
+                && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'+')
+        })
+    })
+}
+
+/// Remove `dir` (recursively) only if it is a real directory (not a link)
+/// holding our marker file. Returns whether it is gone.
+fn remove_extract_dir(dir: &Path) -> bool {
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Ok(m) if m.is_dir() && std::fs::symlink_metadata(dir.join(EXTRACT_MARKER)).is_ok_and(|m| m.is_file()) => {
+            std::fs::remove_dir_all(dir).is_ok()
+        }
+        _ => false,
+    }
+}
+
+/// The update dir may be cleaned: on Unix it must be a real directory owned
+/// by us with mode 0700 (what `ensure_private_dir` makes); elsewhere a dir.
+fn dir_is_private(dir: &Path) -> bool {
+    let Ok(m) = std::fs::symlink_metadata(dir) else { return false };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+        }
+        m.is_dir() && m.uid() == unsafe { geteuid() } && m.mode() & 0o777 == 0o700
+    }
+    #[cfg(not(unix))]
+    m.is_dir()
+}
+
 /// Swap `new` in for `current`: `current` → `current.old`, `new` →
 /// `current`. If the second rename fails the first is undone. Renaming a
 /// running exe is allowed on Windows and Unix.
 pub fn swap_in_place(current: &Path, new: &Path) -> Result<(), String> {
+    swap_with(current, new, &|a, b| std::fs::rename(a, b))
+}
+
+/// `swap_in_place` with the rename injected (tests make it fail).
+fn swap_with(
+    current: &Path,
+    new: &Path,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<(), String> {
     let old = sibling(current, ".old");
     match std::fs::remove_file(&old) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -125,9 +194,9 @@ pub fn swap_in_place(current: &Path, new: &Path) -> Result<(), String> {
         }
         _ => {}
     }
-    std::fs::rename(current, &old).map_err(|e| format!("rename {}: {e}", current.display()))?;
-    if let Err(e) = std::fs::rename(new, current) {
-        return Err(match std::fs::rename(&old, current) {
+    rename(current, &old).map_err(|e| format!("rename {}: {e}", current.display()))?;
+    if let Err(e) = rename(new, current) {
+        return Err(match rename(&old, current) {
             Ok(()) => format!("install {}: {e}", current.display()),
             Err(e2) => format!(
                 "install {}: {e}; restoring it from {} also failed: {e2}",
@@ -174,16 +243,18 @@ fn copy_exclusive(src: &Path, dst: &Path) -> Result<(), String> {
     out.sync_all().map_err(|e| format!("write {}: {e}", dst.display()))
 }
 
-/// Start `exe daemon`, telling it to wait for `wait_pid` to exit first.
+/// Start `exe daemon --after-update`, telling it to wait for `wait_pid` to
+/// exit first. Our own environment is not changed.
 fn relaunch(exe: &Path, wait_pid: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
-        // SAFETY: `set_var`/`remove_var` are always safe on Windows (std
-        // docs). The child inherits our environment, so it sees the value.
-        unsafe { std::env::set_var(WAIT_PID_VAR, wait_pid.to_string()) };
-        let r = crate::proc_win::spawn_detached(exe, &[std::ffi::OsStr::new("daemon")]);
-        unsafe { std::env::remove_var(WAIT_PID_VAR) };
-        r
+        use std::ffi::OsStr;
+        let pid = wait_pid.to_string();
+        crate::proc_win::spawn_detached(
+            exe,
+            &[OsStr::new("daemon"), OsStr::new(AFTER_UPDATE_FLAG)],
+            &[(OsStr::new(WAIT_PID_VAR), OsStr::new(&pid))],
+        )
     }
     #[cfg(unix)]
     {
@@ -191,6 +262,7 @@ fn relaunch(exe: &Path, wait_pid: u32) -> Result<(), String> {
         use std::process::{Command, Stdio};
         Command::new(exe)
             .arg("daemon")
+            .arg(AFTER_UPDATE_FLAG)
             .env(WAIT_PID_VAR, wait_pid.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -225,24 +297,38 @@ fn run_installer(file: &Path, sha256: [u8; 32]) -> Result<Applied, String> {
         .open(file)
         .map_err(|e| format!("open {}: {e}", file.display()))?;
     update::verify_file(file, sha256)?;
-    crate::proc_win::spawn_detached(file, &[OsStr::new("/S"), OsStr::new("/RELAUNCH")])?;
+    crate::proc_win::spawn_detached(file, &[OsStr::new("/S"), OsStr::new("/RELAUNCH")], &[])?;
     Ok(Applied::RestartingNow)
 }
 
-/// Extract `./rustshot` from a release tarball into `<dir of file>/extract`.
+/// Extract `./rustshot` from a release tarball. The tarball is first copied
+/// into a fresh private `<dir of file>/extract` (with our marker), the copy
+/// is verified, and only the copy is untarred, by `/usr/bin/tar` (or
+/// `/bin/tar`) with a fixed `PATH` (tar runs `gzip` for `-z`).
 #[cfg(target_os = "linux")]
 fn extract_tarball(file: &Path, sha256: [u8; 32]) -> Result<PathBuf, String> {
     use std::process::{Command, Stdio};
     let dir = file.parent().unwrap_or(Path::new(".")).join(EXTRACT_DIR);
-    let _ = std::fs::remove_dir_all(&dir);
+    if !remove_extract_dir(&dir) {
+        return Err(format!("{} exists and is not ours; refusing to use it", dir.display()));
+    }
     ensure_private_dir(&dir)?;
-    update::verify_file(file, sha256)?;
-    let st = Command::new("tar")
+    copy_exclusive(Path::new("/dev/null"), &dir.join(EXTRACT_MARKER))?;
+    let copy = dir.join(TARBALL_COPY);
+    copy_exclusive(file, &copy)?;
+    update::verify_file(&copy, sha256)?;
+    let tar = ["/usr/bin/tar", "/bin/tar"]
+        .into_iter()
+        .map(Path::new)
+        .find(|p| p.is_file())
+        .ok_or("tar was not found in /usr/bin or /bin")?;
+    let st = Command::new(tar)
         .arg("-xzf")
-        .arg(file)
+        .arg(&copy)
         .arg("-C")
         .arg(&dir)
         .arg("./rustshot")
+        .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::null())
         .status()
         .map_err(|e| format!("cannot run tar: {e}"))?;
@@ -281,7 +367,7 @@ pub fn apply(kind: &InstallKind, file: &Path, sha256: [u8; 32]) -> Result<Applie
             let bin = extract_tarball(file, sha256)?;
             let digest = crate::sha256::file_digest(&bin).map_err(|e| e.to_string())?;
             let r = apply_portable(&exe, &bin, digest, std::process::id());
-            let _ = std::fs::remove_dir_all(bin.parent().unwrap_or(&bin));
+            remove_extract_dir(bin.parent().unwrap_or(&bin));
             r
         }
         // deb/rpm, stores, macOS (until tested on a Mac), unknown.
@@ -310,15 +396,64 @@ fn parse_wait_pid(s: &str, own: u32) -> Option<u32> {
 /// For a relaunched daemon: wait (at most 10 s) for the old daemon named in
 /// `RUSTSHOT_WAIT_PID` to exit, so the single-instance lock is free. Invalid
 /// values are ignored; the variable is removed so children don't inherit it.
+/// Returns whether a valid PID was given (this is an update relaunch).
 /// Call on the main thread before any other thread exists.
-pub fn wait_for_previous() {
-    let Some(v) = std::env::var_os(WAIT_PID_VAR) else { return };
+pub fn wait_for_previous() -> bool {
+    let Some(v) = std::env::var_os(WAIT_PID_VAR) else { return false };
     // SAFETY: called at daemon start, before the daemon spawns threads (and
     // always safe on Windows).
     unsafe { std::env::remove_var(WAIT_PID_VAR) };
-    if let Some(pid) = v.to_str().and_then(|s| parse_wait_pid(s, std::process::id())) {
-        wait_pid(pid, WAIT_MS);
+    match v.to_str().and_then(|s| parse_wait_pid(s, std::process::id())) {
+        Some(pid) => {
+            wait_pid(pid, WAIT_MS);
+            true
+        }
+        None => false,
     }
+}
+
+/// How a starting daemon proceeds.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Start<T> {
+    /// We own the instance: run with it.
+    Run(T),
+    /// A normal launch: take the usual acquire-or-signal path (a running
+    /// daemon is asked to capture).
+    AcquireOrSignal,
+    /// An update relaunch whose old daemon still holds the instance after
+    /// the retries: exit quietly, never signalling it.
+    GiveUp,
+}
+
+/// Pure start-up decision. A normal launch (`update_relaunch` false) never
+/// calls `try_acquire`. An update relaunch calls it up to `tries` times,
+/// with `pause()` between attempts, and never signals.
+pub fn decide_start<T>(
+    update_relaunch: bool,
+    mut try_acquire: impl FnMut() -> Option<T>,
+    tries: u32,
+    mut pause: impl FnMut(),
+) -> Start<T> {
+    if !update_relaunch {
+        return Start::AcquireOrSignal;
+    }
+    for i in 0..tries {
+        if i > 0 {
+            pause();
+        }
+        if let Some(t) = try_acquire() {
+            return Start::Run(t);
+        }
+    }
+    Start::GiveUp
+}
+
+/// `decide_start` with the real retry policy (every 250 ms for 20 s after
+/// the bounded wait, so about 30 s in all).
+pub fn start_daemon<T>(update_relaunch: bool, try_acquire: impl FnMut() -> Option<T>) -> Start<T> {
+    decide_start(update_relaunch, try_acquire, RETRY_TRIES, || {
+        std::thread::sleep(std::time::Duration::from_millis(RETRY_MS))
+    })
 }
 
 #[cfg(windows)]
@@ -394,6 +529,34 @@ mod tests {
         assert!(err.starts_with("install "), "{err}");
         assert_eq!(read(&cur), b"old");
         assert!(!t.0.join("rustshot.exe.old").exists());
+    }
+
+    #[test]
+    fn swap_reports_when_rollback_also_fails() {
+        let t = Tmp::new("rollback2");
+        let cur = t.0.join("rustshot.exe");
+        let new = t.0.join("rustshot.exe.new");
+        std::fs::write(&cur, b"old").unwrap();
+        std::fs::write(&new, b"new").unwrap();
+        // The first rename works; the install and the rollback both fail.
+        let calls = std::cell::Cell::new(0);
+        let rename = |a: &Path, b: &Path| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                std::fs::rename(a, b)
+            } else {
+                Err(std::io::Error::other("injected"))
+            }
+        };
+        let err = swap_with(&cur, &new, &rename).unwrap_err();
+        assert_eq!(calls.get(), 3);
+        assert!(err.starts_with("install "), "{err}");
+        assert!(err.contains("also failed: injected"), "{err}");
+        // The old exe is left at `.old` (named in the error), `new` untouched.
+        assert!(err.contains("rustshot.exe.old"), "{err}");
+        assert_eq!(read(&t.0.join("rustshot.exe.old")), b"old");
+        assert_eq!(read(&new), b"new");
+        assert!(!cur.exists());
     }
 
     #[test]
@@ -474,7 +637,7 @@ mod tests {
         assert!(std::fs::OpenOptions::new().write(true).open(&exe).is_err());
         assert!(std::fs::rename(&exe, t.0.join("moved.exe")).is_err());
         update::verify_file(&exe, crate::sha256::file_digest(&exe).unwrap()).unwrap();
-        crate::proc_win::spawn_detached(&exe, &[std::ffi::OsStr::new("/c"), std::ffi::OsStr::new("exit 0")])
+        crate::proc_win::spawn_detached(&exe, &[std::ffi::OsStr::new("/c"), std::ffi::OsStr::new("exit 0")], &[])
             .unwrap();
         drop(hold);
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -499,25 +662,180 @@ mod tests {
     }
 
     #[test]
+    fn our_file_names() {
+        for ok in [
+            "SHA256SUMS",
+            "SHA256SUMS.part",
+            "rustshot-0.1.2-setup.exe",
+            "rustshot-0.1.2-setup.exe.part",
+            "rustshot-0.1.2-windows-x86_64.exe",
+            "rustshot-0.1.2-x86_64.AppImage",
+            "rustshot-0.1.2-linux-x86_64.tar.gz",
+            "rustshot-0.1.2-macos-universal.zip",
+            "rustshot-1.0.0-rc.1+b5-setup.exe",
+        ] {
+            assert!(is_our_file(ok), "{ok}");
+        }
+        for bad in [
+            "notes.txt",
+            "rustshot-stale.part",
+            "rustshot-.exe",
+            "rustshot--setup.exe",
+            "rustshot-x-setup.exe",
+            "rustshot-1.0-setup.exe.bak",
+            "rustshot-1.0/x-setup.exe",
+            "rustshot-1.0-setup.EXE",
+            "sha256sums",
+            "extract",
+            "rustshot-1.0-setup.exe.part.part",
+        ] {
+            assert!(!is_our_file(bad), "{bad}");
+        }
+        // Every asset name `pick_asset` can choose is recognised.
+        for suf in update::ASSET_SUFFIXES {
+            assert!(is_our_file(&format!("rustshot-0.1.2{suf}")), "{suf}");
+        }
+    }
+
+    /// An update dir as `ensure_private_dir` makes it.
+    fn private_update_dir(t: &Tmp) -> PathBuf {
+        let dir = t.0.join("update");
+        ensure_private_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
     fn cleanup_removes_only_our_leftovers() {
         let t = Tmp::new("cleanup");
-        let dir = t.0.join("update");
+        let dir = private_update_dir(&t);
         std::fs::create_dir_all(dir.join(EXTRACT_DIR)).unwrap();
+        std::fs::write(dir.join(EXTRACT_DIR).join(EXTRACT_MARKER), b"").unwrap();
         std::fs::write(dir.join(EXTRACT_DIR).join("rustshot"), b"x").unwrap();
         std::fs::write(dir.join("SHA256SUMS"), b"x").unwrap();
         std::fs::write(dir.join("rustshot-9.9.9-setup.exe"), b"x").unwrap();
+        std::fs::write(dir.join("rustshot-9.9.9-setup.exe.part"), b"x").unwrap();
+        std::fs::write(dir.join("rustshot-notes.txt"), b"keep").unwrap();
         std::fs::write(dir.join("notes.txt"), b"keep").unwrap();
+        // A directory with an asset-like name is not removed.
+        std::fs::create_dir_all(dir.join("rustshot-1.0-setup.exe")).unwrap();
         let exe = t.0.join("rustshot.exe");
         std::fs::write(&exe, b"exe").unwrap();
         std::fs::write(t.0.join("rustshot.exe.old"), b"old").unwrap();
         std::fs::write(t.0.join("rustshot.exe.new"), b"new").unwrap();
         cleanup(&dir, Some(&exe));
-        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
-        assert_eq!(left, ["notes.txt"]);
+        let mut left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        left.sort();
+        assert_eq!(left, ["notes.txt", "rustshot-1.0-setup.exe", "rustshot-notes.txt"]);
         assert!(exe.exists());
         assert!(!t.0.join("rustshot.exe.old").exists());
         assert!(!t.0.join("rustshot.exe.new").exists());
         cleanup(&t.0.join("absent"), None); // no dir: nothing to do
+    }
+
+    #[test]
+    fn cleanup_keeps_an_extract_dir_without_our_marker() {
+        let t = Tmp::new("nomarker");
+        let dir = private_update_dir(&t);
+        std::fs::create_dir_all(dir.join(EXTRACT_DIR).join("sub")).unwrap();
+        std::fs::write(dir.join(EXTRACT_DIR).join("sub").join("data"), b"keep").unwrap();
+        cleanup(&dir, None);
+        assert!(dir.join(EXTRACT_DIR).join("sub").join("data").exists());
+        assert!(!remove_extract_dir(&dir.join(EXTRACT_DIR)));
+        assert!(remove_extract_dir(&dir.join("absent")), "a missing dir counts as removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_skips_a_dir_that_is_not_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = Tmp::new("notpriv");
+        let dir = private_update_dir(&t);
+        std::fs::write(dir.join("SHA256SUMS"), b"x").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cleanup(&dir, None);
+        assert!(dir.join("SHA256SUMS").exists(), "0755 dir must not be cleaned");
+        // A symlink to a private dir is not followed either.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = t.0.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        cleanup(&link, None);
+        assert!(dir.join("SHA256SUMS").exists(), "symlinked dir must not be cleaned");
+        cleanup(&dir, None);
+        assert!(!dir.join("SHA256SUMS").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn extract_tarball_unpacks_a_verified_copy() {
+        let t = Tmp::new("tgz");
+        let stage = t.0.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("rustshot"), b"new linux build").unwrap();
+        std::fs::write(stage.join("README"), b"other").unwrap();
+        let dir = private_update_dir(&t);
+        let tgz = dir.join("rustshot-9.9.9-linux-x86_64.tar.gz");
+        let st = std::process::Command::new("/usr/bin/tar")
+            .arg("-czf")
+            .arg(&tgz)
+            .arg("-C")
+            .arg(&stage)
+            .arg("./rustshot")
+            .arg("./README")
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let sha = crate::sha256::file_digest(&tgz).unwrap();
+        let bin = extract_tarball(&tgz, sha).unwrap();
+        assert_eq!(bin, dir.join(EXTRACT_DIR).join("rustshot"));
+        assert_eq!(read(&bin), b"new linux build");
+        assert!(!dir.join(EXTRACT_DIR).join("README").exists(), "only ./rustshot is extracted");
+        assert!(dir.join(EXTRACT_DIR).join(TARBALL_COPY).exists());
+        // A second run replaces our own extract dir.
+        assert!(extract_tarball(&tgz, sha).is_ok());
+        // A mismatching download is refused before tar runs.
+        assert!(extract_tarball(&tgz, [0; 32]).unwrap_err().contains("SHA-256"));
+        // An extract dir without our marker is never deleted or used.
+        assert!(remove_extract_dir(&dir.join(EXTRACT_DIR)));
+        std::fs::create_dir_all(dir.join(EXTRACT_DIR)).unwrap();
+        std::fs::write(dir.join(EXTRACT_DIR).join("theirs"), b"x").unwrap();
+        assert!(extract_tarball(&tgz, sha).unwrap_err().contains("not ours"));
+        assert!(dir.join(EXTRACT_DIR).join("theirs").exists());
+        cleanup(&dir, None);
+        assert!(!tgz.exists());
+        assert!(dir.join(EXTRACT_DIR).join("theirs").exists());
+    }
+
+    #[test]
+    fn normal_launch_takes_the_signal_path_without_trying() {
+        let mut tried = 0;
+        let r: Start<u8> = decide_start(false, || {
+            tried += 1;
+            Some(1)
+        }, 80, || {});
+        assert_eq!(r, Start::AcquireOrSignal);
+        assert_eq!(tried, 0);
+    }
+
+    #[test]
+    fn update_relaunch_never_signals() {
+        // (acquire results in order, tries) -> (outcome, attempts, pauses)
+        let run = |results: &[Option<u8>], tries: u32| {
+            let (mut i, mut pauses) = (0, 0);
+            let r = decide_start(true, || {
+                i += 1;
+                results.get(i - 1).copied().flatten()
+            }, tries, || pauses += 1);
+            (r, i, pauses)
+        };
+        assert_eq!(run(&[Some(7)], 80), (Start::Run(7), 1, 0));
+        assert_eq!(run(&[None, None, Some(7)], 80), (Start::Run(7), 3, 2));
+        // Still held after every try: give up quietly, never signal.
+        assert_eq!(run(&[], 80), (Start::GiveUp, 80, 79));
+        assert_eq!(run(&[None, None, None, Some(7)], 3), (Start::GiveUp, 3, 2));
+        assert_eq!(run(&[None, None, Some(7)], 3), (Start::Run(7), 3, 2));
+        assert_eq!(run(&[Some(7)], 0), (Start::GiveUp, 0, 0));
+        // The real policy: 80 x 250 ms = 20 s after the 10 s wait.
+        assert_eq!(RETRY_TRIES as u64 * RETRY_MS + WAIT_MS as u64, 30_000);
     }
 
     #[test]
@@ -605,7 +923,8 @@ mod tests {
             "check_updates = false\ncapture_hotkey = \"Ctrl+Alt+Shift+F9\"\nquit_hotkey = \"Ctrl+Alt+Shift+F10\"\n",
         )
         .unwrap();
-        std::fs::write(upd.join("rustshot-stale.part"), b"x").unwrap();
+        std::fs::write(upd.join("rustshot-0.0.1-windows-x86_64.exe.part"), b"x").unwrap();
+        std::fs::write(upd.join("keep.txt"), b"x").unwrap();
         let exe = app.join("rustshot.exe");
         std::fs::copy(&src, &exe).unwrap();
         // The "new version": the same exe with a marker appended (PE overlay).
@@ -694,7 +1013,8 @@ mod tests {
         assert_eq!(image.canonicalize().unwrap(), exe.canonicalize().unwrap());
         assert_eq!(crate::sha256::file_digest(&exe).unwrap(), sha);
         assert!(wait(5000, &|| !sibling(&exe, ".old").exists()), ".old not removed");
-        assert!(!upd.join("rustshot-stale.part").exists(), "update dir not cleaned");
+        assert!(!upd.join("rustshot-0.0.1-windows-x86_64.exe.part").exists(), "update dir not cleaned");
+        assert!(upd.join("keep.txt").exists(), "a foreign file was deleted");
         drop(kill);
         assert!(owner().is_none());
     }

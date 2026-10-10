@@ -466,6 +466,49 @@ pub struct Probes<'a> {
     pub msix: bool,
     pub exists: &'a dyn Fn(&Path) -> bool,
     pub writable: &'a dyn Fn(&Path) -> bool,
+    /// A regular file (following links).
+    pub is_file: &'a dyn Fn(&Path) -> bool,
+    /// `canonicalize`, `None` on error.
+    pub canonical: &'a dyn Fn(&Path) -> Option<PathBuf>,
+}
+
+/// `$APPIMAGE`, only when it is ours: an existing absolute file, while this
+/// exe lies inside the AppImage's mount (`$APPDIR`, both canonicalised).
+/// Anything else (e.g. a variable inherited from another AppImage) is ignored.
+pub fn trusted_appimage(exe: &Path, env: &dyn Fn(&str) -> Option<String>, p: &Probes) -> Option<PathBuf> {
+    let img = PathBuf::from(env("APPIMAGE").filter(|a| !a.is_empty())?);
+    let appdir = PathBuf::from(env("APPDIR").filter(|a| !a.is_empty())?);
+    if !img.is_absolute() || !appdir.is_absolute() || !(p.is_file)(&img) {
+        return None;
+    }
+    let (exe, appdir) = ((p.canonical)(exe)?, (p.canonical)(&appdir)?);
+    (exe.starts_with(&appdir) && exe != appdir).then_some(img)
+}
+
+/// Real-filesystem probes for this machine.
+fn real_probes() -> Probes<'static> {
+    let os = if cfg!(windows) {
+        Os::Windows
+    } else if cfg!(target_os = "macos") {
+        Os::Mac
+    } else {
+        Os::Linux
+    };
+    Probes {
+        os,
+        msix: is_msix(),
+        exists: &|p: &Path| p.exists(),
+        writable: &dir_writable,
+        is_file: &|p: &Path| p.is_file(),
+        canonical: &|p: &Path| p.canonicalize().ok(),
+    }
+}
+
+/// `trusted_appimage` for this process.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn own_appimage() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    trusted_appimage(&exe, &|k| std::env::var(k).ok(), &real_probes())
 }
 
 /// Pure install-kind detection from the exe path, environment and probes.
@@ -483,8 +526,8 @@ pub fn detect_from(exe: &Path, env: impl Fn(&str) -> Option<String>, p: &Probes)
             }
         }
         Os::Linux => {
-            if let Some(a) = env("APPIMAGE").filter(|a| !a.is_empty()) {
-                InstallKind::AppImage(a.into())
+            if let Some(a) = trusted_appimage(exe, &env, p) {
+                InstallKind::AppImage(a)
             } else if exe.starts_with("/usr") || !(p.writable)(dir) {
                 InstallKind::LinuxManaged
             } else {
@@ -522,33 +565,29 @@ fn dir_writable(dir: &Path) -> bool {
 #[allow(dead_code)] // used by the update dialog (later task)
 pub fn detect_install() -> InstallKind {
     let exe = std::env::current_exe().unwrap_or_default();
-    let os = if cfg!(windows) {
-        Os::Windows
-    } else if cfg!(target_os = "macos") {
-        Os::Mac
-    } else {
-        Os::Linux
-    };
-    let probes =
-        Probes { os, msix: is_msix(), exists: &|p: &Path| p.exists(), writable: &dir_writable };
-    detect_from(&exe, |k| std::env::var(k).ok(), &probes)
+    detect_from(&exe, |k| std::env::var(k).ok(), &real_probes())
 }
 
 /// The release asset that updates an install of `kind`, matched by exact
 /// name (`rustshot-<version>-...`) against the release's asset list.
 #[allow(dead_code)] // used by the update dialog (later task)
 pub fn pick_asset<'a>(kind: &InstallKind, rel: &'a Release) -> Option<&'a Asset> {
-    let v = &rel.version;
-    let want = match kind {
-        InstallKind::WinInstaller => format!("rustshot-{v}-setup.exe"),
-        InstallKind::WinPortable => format!("rustshot-{v}-windows-x86_64.exe"),
-        InstallKind::AppImage(_) => format!("rustshot-{v}-x86_64.AppImage"),
-        InstallKind::Tarball => format!("rustshot-{v}-linux-x86_64.tar.gz"),
-        InstallKind::MacApp(_) => format!("rustshot-{v}-macos-universal.zip"),
+    let suffix = match kind {
+        InstallKind::WinInstaller => ASSET_SUFFIXES[0],
+        InstallKind::WinPortable => ASSET_SUFFIXES[1],
+        InstallKind::AppImage(_) => ASSET_SUFFIXES[2],
+        InstallKind::Tarball => ASSET_SUFFIXES[3],
+        InstallKind::MacApp(_) => ASSET_SUFFIXES[4],
         InstallKind::LinuxManaged | InstallKind::Store(_) | InstallKind::Unknown => return None,
     };
+    let want = format!("rustshot-{}{suffix}", rel.version);
     rel.assets.iter().find(|a| a.name == want)
 }
+
+/// Release asset names are `rustshot-<version><suffix>` with one of these
+/// (installer, portable exe, AppImage, tarball, macOS zip).
+pub const ASSET_SUFFIXES: [&str; 5] =
+    ["-setup.exe", "-windows-x86_64.exe", "-x86_64.AppImage", "-linux-x86_64.tar.gz", "-macos-universal.zip"];
 
 // --- Integrity --------------------------------------------------------------
 
@@ -821,7 +860,7 @@ pub fn open_url(url: &str) {
     {
         use std::ffi::OsStr;
         if let Some(exe) = crate::proc_win::system_exe("rundll32.exe") {
-            let _ = crate::proc_win::spawn_detached(&exe, &[OsStr::new("url.dll,FileProtocolHandler"), OsStr::new(url)]);
+            let _ = crate::proc_win::spawn_detached(&exe, &[OsStr::new("url.dll,FileProtocolHandler"), OsStr::new(url)], &[]);
         }
     }
     #[cfg(target_os = "macos")]
@@ -1201,7 +1240,9 @@ mod tests {
                    msix: bool| {
             let ex = |p: &Path| exists.iter().any(|e| p == Path::new(e));
             let wr = |_: &Path| writable;
-            detect_from(Path::new(exe), env, &Probes { os, msix, exists: &ex, writable: &wr })
+            let file = |p: &Path| p == Path::new("/home/u/Apps/rustshot.AppImage");
+            let canon = |p: &Path| Some(p.to_path_buf());
+            detect_from(Path::new(exe), env, &Probes { os, msix, exists: &ex, writable: &wr, is_file: &file, canonical: &canon })
         };
         let inst = "C:/Users/u/AppData/Local/rustshot/rustshot.exe";
         assert_eq!(
@@ -1213,10 +1254,21 @@ mod tests {
             run(inst, &no_env, probes(Os::Windows, &[], true), true),
             InstallKind::Store("Microsoft Store")
         );
-        let appimage = |k: &str| (k == "APPIMAGE").then(|| "/home/u/Apps/rustshot.AppImage".to_string());
+        let appimage = |k: &str| match k {
+            "APPIMAGE" => Some("/home/u/Apps/rustshot.AppImage".to_string()),
+            "APPDIR" => Some("/tmp/.mount_x".to_string()),
+            _ => None,
+        };
+        #[cfg(unix)] // "/tmp/..." is not an absolute path on Windows
         assert_eq!(
             run("/tmp/.mount_x/usr/bin/rustshot", &appimage, probes(Os::Linux, &[], false), false),
             InstallKind::AppImage("/home/u/Apps/rustshot.AppImage".into())
+        );
+        // $APPIMAGE inherited from another AppImage (exe outside $APPDIR) is
+        // not trusted: this is a plain (non-writable here) install.
+        assert_eq!(
+            run("/home/u/bin/rustshot", &appimage, probes(Os::Linux, &[], false), false),
+            InstallKind::LinuxManaged
         );
         assert_eq!(run("/usr/bin/rustshot", &no_env, probes(Os::Linux, &[], true), false), InstallKind::LinuxManaged);
         assert_eq!(run("/opt/rustshot/rustshot", &no_env, probes(Os::Linux, &[], false), false), InstallKind::LinuxManaged);
@@ -1234,6 +1286,54 @@ mod tests {
         assert_eq!(run("/usr/local/bin/rustshot", &no_env, probes(Os::Mac, &[], true), false), InstallKind::Unknown);
         let mas = |k: &str| (k == "APP_SANDBOX_CONTAINER_ID").then(|| "x".to_string());
         assert_eq!(run(mac, &mas, probes(Os::Mac, &[], true), false), InstallKind::Store("Mac App Store"));
+    }
+
+    #[test]
+    fn appimage_trust() {
+        // Absolute on this OS ("C:" prefix on Windows); the logic is the same.
+        let abs = |s: &str| if s.starts_with('/') && cfg!(windows) { format!("C:{s}") } else { s.to_string() };
+        let img = abs("/home/u/Apps/rustshot.AppImage");
+        let file = |p: &Path| p == Path::new(&img);
+        // The mount is reached through a symlink: canonicalised, it matches.
+        let canon = |p: &Path| {
+            let s = p.to_string_lossy().replace("/link_mnt", "/tmp/.mount_x");
+            (!s.contains("missing")).then(|| PathBuf::from(s))
+        };
+        let probes = Probes {
+            os: Os::Linux,
+            msix: false,
+            exists: &|_| false,
+            writable: &|_| false,
+            is_file: &file,
+            canonical: &canon,
+        };
+        let check = |exe: &str, image: Option<&str>, appdir: Option<&str>| {
+            let (image, appdir) = (image.map(abs), appdir.map(abs));
+            let env = |k: &str| match k {
+                "APPIMAGE" => image.clone(),
+                "APPDIR" => appdir.clone(),
+                _ => None,
+            };
+            trusted_appimage(Path::new(&abs(exe)), &env, &probes)
+        };
+        let exe = "/tmp/.mount_x/usr/bin/rustshot";
+        let img_s = "/home/u/Apps/rustshot.AppImage";
+        assert_eq!(check(exe, Some(img_s), Some("/tmp/.mount_x")), Some(PathBuf::from(&img)));
+        assert_eq!(check(exe, Some(img_s), Some("/link_mnt")), Some(PathBuf::from(&img)));
+        for (image, appdir, why) in [
+            (Some(img_s), None, "no APPDIR"),
+            (None, Some("/tmp/.mount_x"), "no APPIMAGE"),
+            (Some(""), Some("/tmp/.mount_x"), "empty APPIMAGE"),
+            (Some("rel.AppImage"), Some("/tmp/.mount_x"), "relative APPIMAGE"),
+            (Some("/home/u/other"), Some("/tmp/.mount_x"), "APPIMAGE is not a file"),
+            (Some(img_s), Some("/tmp/.mount_y"), "exe outside APPDIR"),
+            (Some(img_s), Some("/tmp/.mount"), "a string prefix is not a parent"),
+            (Some(img_s), Some("/missing"), "APPDIR cannot be canonicalised"),
+            (Some(img_s), Some("rel"), "relative APPDIR"),
+        ] {
+            assert_eq!(check(exe, image, appdir), None, "{why}");
+        }
+        assert_eq!(check("/home/u/bin/rustshot", Some(img_s), Some("/tmp/.mount_x")), None, "exe not in the mount");
     }
 
     #[test]
