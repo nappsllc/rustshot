@@ -864,7 +864,7 @@ impl App {
                 return;
             }
             let p = Pt::new(x as f32, y as f32);
-            let mods = Mods::current();
+            let mods = drag_mods();
             let img = (edit.shot.size.0 as f32, edit.shot.size.1 as f32);
             match &mut edit.interact {
                 Interact::None => {}
@@ -875,6 +875,9 @@ impl App {
                         *moved = true;
                     }
                     if *moved {
+                        // A pointer past the shot edge (captured drag) stops
+                        // at the edge instead of pushing the rect back in.
+                        let p = Pt::new(p.x.clamp(0.0, img.0), p.y.clamp(0.0, img.1));
                         let cur = if mods.shift {
                             constrain_square(anchor, p)
                         } else {
@@ -1180,6 +1183,21 @@ impl Driver for App {
 /// capture): Windows `gdi` keeps the pixels in GDI bitmaps and leaves
 /// `shot.image` empty; `software` (and Linux/macOS) reads them into memory.
 fn grab(cfg: &Config, th: &Theme, screen: Option<u32>) -> anyhow::Result<(Shot, Option<gdi::GdiScreen>)> {
+    // Tests never capture the screen: they hand `begin_capture` a shot.
+    #[cfg(test)]
+    {
+        let _ = (cfg, th, screen);
+        FAKE_GRAB
+            .with(|g| g.borrow_mut().take())
+            .unwrap_or_else(|| Err(anyhow::anyhow!("no test shot queued")))
+            .map(|s| (s, None))
+    }
+    #[cfg(not(test))]
+    grab_screen(cfg, th, screen)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn grab_screen(cfg: &Config, th: &Theme, screen: Option<u32>) -> anyhow::Result<(Shot, Option<gdi::GdiScreen>)> {
     #[cfg(windows)]
     if cfg.use_gdi() {
         let shot = capture::plan_edit(screen, cfg.capture_active_monitor)?;
@@ -1189,6 +1207,24 @@ fn grab(cfg: &Config, th: &Theme, screen: Option<u32>) -> anyhow::Result<(Shot, 
     }
     let _ = th;
     Ok((capture::grab_edit(screen, cfg.capture_active_monitor)?, None))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: what the next `grab` returns (none queued: an error).
+    static FAKE_GRAB: std::cell::RefCell<Option<anyhow::Result<Shot>>> = const { std::cell::RefCell::new(None) };
+    /// Tests: the modifiers a drag sees (the real keyboard is not read).
+    static FAKE_MODS: std::cell::Cell<Option<Mods>> =
+        const { std::cell::Cell::new(Some(Mods { shift: false, ctrl: false, alt: false })) };
+}
+
+/// Modifiers held during a drag (Shift/Ctrl constraints).
+fn drag_mods() -> Mods {
+    #[cfg(test)]
+    if let Some(m) = FAKE_MODS.with(|m| m.get()) {
+        return m;
+    }
+    Mods::current()
 }
 
 /// Esc: drop the current tool / draft / palette, or cancel the capture.
@@ -1946,13 +1982,16 @@ fn pick_area(monitors: &[capture::IRect], sel: Option<FRect>, pointer: Pt) -> FR
 }
 
 #[cfg(test)]
+mod state_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     // ---- developer preview (renders overlay frames to PNG; no display) ----
 
     /// 2400x900 desktop: a shorter, offset left monitor and a taller right one.
-    fn two_monitor_shot() -> Shot {
+    pub(super) fn two_monitor_shot() -> Shot {
         let mut shot = synthetic_shot();
         let (w, h) = (2400u32, 900u32);
         let mut img = PixBuf::from_pixel(w, h, [30, 34, 44, 255]);
@@ -1971,7 +2010,7 @@ mod tests {
         shot
     }
 
-    fn synthetic_shot() -> Shot {
+    pub(super) fn synthetic_shot() -> Shot {
         let (w, h) = (1440u32, 900u32);
         let mut img = PixBuf::from_pixel(w, h, [0, 0, 0, 255]);
         let mut put = |x0: u32, y0: u32, x1: u32, y1: u32, c: [u8; 3]| {
@@ -2007,7 +2046,7 @@ mod tests {
         }
     }
 
-    fn preview_app(th: Theme, sel: Option<FRect>) -> App {
+    pub(super) fn preview_app(th: Theme, sel: Option<FRect>) -> App {
         preview_app_with(th, sel, synthetic_shot())
     }
 
@@ -2029,7 +2068,7 @@ mod tests {
     }
 
     /// An upload still in flight keeps the daemon from being idle.
-    fn upload_in_flight(app: &App) -> std::sync::mpsc::Sender<Result<String, String>> {
+    pub(super) fn upload_in_flight(app: &App) -> std::sync::mpsc::Sender<Result<String, String>> {
         let (tx, rx) = std::sync::mpsc::channel();
         *app.upload_slot.lock().unwrap() = Some(rx);
         tx
@@ -2113,7 +2152,7 @@ mod tests {
         assert!(!app.restart_due(), "upload in flight");
     }
 
-    fn preview_app_with(th: Theme, sel: Option<FRect>, shot: Shot) -> App {
+    pub(super) fn preview_app_with(th: Theme, sel: Option<FRect>, shot: Shot) -> App {
         let theme_name = if th == theme::DARK { "dark" } else { "light" };
         let cfg = Config { theme: theme_name.into(), ..Config::default() };
         let font = AnnotFont::load();
@@ -2185,7 +2224,7 @@ mod tests {
         }
     }
 
-    fn edit_of(app: &mut App) -> &mut Edit {
+    pub(super) fn edit_of(app: &mut App) -> &mut Edit {
         match &mut app.st {
             State::Edit(e) => e,
             _ => unreachable!(),

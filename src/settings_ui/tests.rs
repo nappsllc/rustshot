@@ -807,6 +807,7 @@ fn settings_window_smoke() {
         eprintln!("no display; skipped");
         return;
     }
+    let _guard = crate::wind::test_window_lock();
     let dir = scratch("smoke");
     let s = Settings::new(Config::default(), None, dir.join("config.toml"));
     let (_tx, rx) = std::sync::mpsc::channel();

@@ -1001,6 +1001,7 @@ mod tests {
             eprintln!("no display; skipped");
             return;
         }
+        let _guard = crate::wind::test_window_lock();
         let (tx, rx) = std::sync::mpsc::channel();
         let (m, acts) = Machine::start(Request::Show(DialogState::Available(rel("9.9.9"))));
         assert!(acts.is_empty());

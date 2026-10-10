@@ -34,12 +34,17 @@ jobs:
             || { echo "::error::regenerate packaging/flatpak/cargo-sources.json (see docs/STORES.md)"; exit 1; }
       - name: Test
         run: cargo test
-      # The X11 windows (run_window, the Settings window, the update dialog)
-      # open for about a second under Xvfb and close themselves.
-      - name: Windows under Xvfb
+      # X11 under Xvfb: the live capture tests read the virtual screen; the
+      # windows (the overlay, run_window, the Settings window, the update
+      # dialog) open for about a second and close themselves.
+      - name: X11 capture and windows under Xvfb
         env:
           RUSTSHOT_TEST_AUTOCLOSE_MS: "1000"
-        run: timeout 300 xvfb-run -a cargo test -- --ignored --test-threads=1 --nocapture interactive_window_renders_rect window_smoke
+        run: >-
+          timeout 300 xvfb-run -a -s "-screen 0 1600x900x24"
+          cargo test --bin rustshot -- --ignored --test-threads=1 --nocapture
+          live_monitor_capture live_desktop_capture live_window_lifecycle
+          interactive_window_renders_rect window_smoke
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Build
@@ -56,6 +61,36 @@ jobs:
             dist/*.tar.gz
             dist/*.deb
             dist/*.AppImage
+
+  # Line coverage per file into the job summary (no threshold yet).
+  coverage:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install X11 headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxrandr-dev
+      - name: Coverage
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo llvm-cov --summary-only | tee "$RUNNER_TEMP/coverage.txt"
+          {
+            echo "### Line coverage ($RUNNER_OS)"
+            echo
+            echo '```text'
+            sed -n '/^Filename/,$p' "$RUNNER_TEMP/coverage.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   flatpak:
     runs-on: ubuntu-latest
@@ -177,13 +212,32 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Test
-        # Live/display tests and the message-driven e2e suite stay local
-        # (they need an interactive session): cargo test -- --ignored
         run: cargo test
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Build
         run: cargo build --release
+      # The runner has an interactive desktop: the live capture, window,
+      # tray and clipboard tests run here (not the benchmarks, previews,
+      # network or pick-a-folder ones).
+      - name: Live desktop tests
+        env:
+          RUSTSHOT_TEST_AUTOCLOSE_MS: "1000"
+        run: >-
+          cargo test --bin rustshot -- --ignored --test-threads=1 --nocapture
+          live_monitor_capture live_desktop_capture live_window_lifecycle
+          interactive_window_renders_rect window_smoke present_colors_round_trip
+          live_icon_added_and_removed live_clipboard_roundtrip
+      # The e2e suite drives the release exe with posted input. Its daemons
+      # use their own instance name, and every launch its own APPDATA.
+      - name: End-to-end
+        env:
+          RUSTSHOT_INSTANCE: ci-e2e-${{ github.run_id }}
+          RUSTSHOT_E2E_BIN: ${{ github.workspace }}/target/release/rustshot.exe
+          APPDATA: ${{ runner.temp }}/e2e-appdata
+        run: |
+          New-Item -ItemType Directory -Force $env:APPDATA | Out-Null
+          cargo test --test e2e -- --include-ignored --test-threads=1 --nocapture
       - name: Installer
         run: |
           choco install nsis -y --no-progress

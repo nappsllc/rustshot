@@ -233,34 +233,63 @@ fn text_tool_types_and_accepts() {
 #[ignore = "live display access"]
 fn daemon_stays_alive() {
     if daemon_running() {
-        // A second daemon would signal it (open a capture) and exit.
+        // Belt and braces: never start a daemon beside the user's.
         println!("skipped: another Rustshot daemon is running in this session");
         return;
     }
     let root = config_root("daemon", &renderer());
+    // Its own instance and unusual hotkeys: nothing it does can reach
+    // another daemon (or take the user's hotkeys) even if one starts meanwhile.
+    std::fs::write(
+        root.join("rustshot").join("config.toml"),
+        format!(
+            "renderer = \"{}\"\ncheck_updates = false\ncapture_hotkey = \"Ctrl+Alt+Shift+F11\"\nquit_hotkey = \"Ctrl+Alt+Shift+F10\"\n",
+            renderer()
+        ),
+    )
+    .unwrap();
+    let instance = format!("e2e-dmn-{}", std::process::id());
     let mut child = rustshot(&root)
+        .env("RUSTSHOT_INSTANCE", &instance)
         .arg("daemon")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn daemon");
-    std::thread::sleep(Duration::from_secs(2));
-    match child.try_wait().expect("try_wait") {
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        Some(st) => panic!("daemon exited early: {st:?}"),
+    // Up once it holds its instance mutex; then it must keep running.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut up = false;
+    while !up && Instant::now() < deadline && matches!(child.try_wait(), Ok(None)) {
+        up = mutex_held(Some(&instance));
+        std::thread::sleep(Duration::from_millis(50));
     }
+    if up {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let status = child.try_wait().expect("try_wait");
+    let _ = child.kill(); // only the daemon this test started
+    let _ = child.wait();
+    assert!(up, "the daemon never took its instance (exit: {status:?})");
+    assert!(status.is_none(), "daemon exited early: {status:?}");
 }
 
-/// Whether a rustshot daemon holds the single-instance mutex (opened,
-/// never created, so nothing is signalled).
+/// Whether the user's (default-instance) daemon is running.
 fn daemon_running() -> bool {
-    use windows::core::w;
+    mutex_held(None)
+}
+
+/// Whether a daemon holds the single-instance mutex of `instance` (`None`:
+/// the default one); opened, never created, so nothing is signalled.
+fn mutex_held(instance: Option<&str>) -> bool {
+    use windows::core::PCWSTR;
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
-    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, w!("Local\\rustshot-daemon")) } {
+    let name = match instance {
+        Some(n) => format!("Local\\rustshot-daemon-{n}"),
+        None => "Local\\rustshot-daemon".to_string(),
+    };
+    let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(wide.as_ptr())) } {
         Ok(h) => {
             let _ = unsafe { CloseHandle(h) };
             true

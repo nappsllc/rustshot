@@ -76,8 +76,8 @@ impl Guard {
 #[cfg(windows)]
 mod imp {
     use super::{HotEvent, Instance};
-    use std::sync::Mutex;
     use std::sync::mpsc::{self, Sender};
+    use std::sync::{Arc, Mutex};
     use windows::Win32::Foundation::{
         CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
     };
@@ -98,7 +98,28 @@ mod imp {
         }
     }
 
-    static TX: Mutex<Option<Sender<HotEvent>>> = Mutex::new(None);
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(Some(0)).collect()
+    }
+
+    /// The daemon mutex of instance `name` (`None`: the default one).
+    fn mutex_name(name: Option<&str>) -> Vec<u16> {
+        wide(&match name {
+            Some(n) => format!("Local\\rustshot-daemon-{n}"),
+            None => "Local\\rustshot-daemon".into(),
+        })
+    }
+
+    /// The tray window class of instance `name` (as `super::tray_class`).
+    fn class_name(name: Option<&str>) -> Vec<u16> {
+        wide(&match name {
+            Some(n) => format!("rustshot_tray_{n}"),
+            None => "rustshot_tray".into(),
+        })
+    }
+
+    /// Where one window's `WM_CAPTURE` goes (set by `listen`).
+    type Slot = Mutex<Option<Sender<HotEvent>>>;
 
     /// Nothing to keep alive on Windows.
     pub struct Keep;
@@ -107,11 +128,12 @@ mod imp {
         mutex: HANDLE,
         thread_id: u32,
         thread: Option<std::thread::JoinHandle<()>>,
+        slot: Arc<Slot>,
     }
 
     impl Inner {
         pub fn listen(&self, tx: Sender<HotEvent>) {
-            *TX.lock().unwrap() = Some(tx);
+            *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
         }
     }
 
@@ -129,30 +151,41 @@ mod imp {
                     let _ = CloseHandle(self.mutex);
                 }
             }
-            *TX.lock().unwrap() = None;
+            *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
             crate::tray_win::clear();
         }
     }
 
     unsafe extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-        if let Some(r) = crate::tray_win::handle(h, m, w, l) {
-            return r;
-        }
-        if m == WM_CAPTURE {
-            if let Some(tx) = TX.lock().unwrap().as_ref() {
-                let _ = tx.send(HotEvent::Capture);
+        unsafe {
+            if m == WM_NCCREATE {
+                // The window's own slot, alive for as long as its thread runs.
+                let cs = &*(l.0 as *const CREATESTRUCTW);
+                SetWindowLongPtrW(h, GWLP_USERDATA, cs.lpCreateParams as isize);
             }
-            return LRESULT(0);
+            if let Some(r) = crate::tray_win::handle(h, m, w, l) {
+                return r;
+            }
+            if m == WM_CAPTURE {
+                let slot = GetWindowLongPtrW(h, GWLP_USERDATA) as *const Slot;
+                if let Some(slot) = slot.as_ref()
+                    && let Some(tx) = slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+                {
+                    let _ = tx.send(HotEvent::Capture);
+                }
+                return LRESULT(0);
+            }
+            if m == WM_SETTINGS {
+                crate::settings_ui::show();
+                return LRESULT(0);
+            }
+            DefWindowProcW(h, m, w, l)
         }
-        if m == WM_SETTINGS {
-            crate::settings_ui::show();
-            return LRESULT(0);
-        }
-        unsafe { DefWindowProcW(h, m, w, l) }
     }
 
-    /// Hidden top-level window on its own thread; returns the thread id once created.
-    fn spawn_window() -> Option<(u32, std::thread::JoinHandle<()>)> {
+    /// Hidden top-level window of class `class` on its own thread, its
+    /// `WM_CAPTURE` going to `slot`; returns the thread id once created.
+    fn spawn_window(class: Vec<u16>, slot: Arc<Slot>) -> Option<(u32, std::thread::JoinHandle<()>)> {
         let (tx, rx) = mpsc::channel::<Option<u32>>();
         let handle = std::thread::spawn(move || unsafe {
             let hinst = GetModuleHandleW(PCWSTR::null()).unwrap_or_default();
@@ -160,11 +193,11 @@ mod imp {
             wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
             wc.lpfnWndProc = Some(wndproc);
             wc.hInstance = hinst.into();
-            wc.lpszClassName = super::tray_class();
+            wc.lpszClassName = PCWSTR(class.as_ptr());
             let _ = RegisterClassExW(&wc);
             let hwnd = CreateWindowExW(
                 WS_EX_TOOLWINDOW,
-                super::tray_class(),
+                PCWSTR(class.as_ptr()),
                 w!("rustshot"),
                 WS_POPUP,
                 0,
@@ -174,7 +207,7 @@ mod imp {
                 None,
                 None,
                 Some(hinst.into()),
-                None,
+                Some(Arc::as_ptr(&slot) as *const core::ffi::c_void),
             );
             let Ok(hwnd) = hwnd else {
                 let _ = tx.send(None);
@@ -188,31 +221,37 @@ mod imp {
             }
             crate::tray_win::remove(hwnd);
             let _ = DestroyWindow(hwnd);
+            drop(slot); // only now: the window reads it until destroyed
         });
         let id = rx.recv().ok().flatten()?;
         Some((id, handle))
     }
 
     pub fn acquire_or_signal() -> Instance {
-        acquire(true).expect("signal mode always decides")
+        acquire(super::instance_name(), true).unwrap_or_else(|| {
+            eprintln!("error: another Rustshot is starting but not responding");
+            std::process::exit(1);
+        })
     }
 
     pub fn try_acquire() -> Option<Instance> {
-        acquire(false)
+        acquire(super::instance_name(), false)
     }
 
-    /// `signal`: when the mutex is held, signal its owner (`Signalled`);
-    /// otherwise return `None` without signalling.
-    fn acquire(signal: bool) -> Option<Instance> {
+    /// `acquire` for an explicit instance name (tests).
+    #[cfg(test)]
+    pub fn acquire_named(name: &str, signal: bool) -> Option<Instance> {
+        acquire(Some(name), signal)
+    }
+
+    /// Become instance `name`'s primary. While its mutex is held: with
+    /// `signal`, ask the owner to capture (`Signalled`; `None` when it never
+    /// shows its window); without, `None` and nothing is sent.
+    fn acquire(name: Option<&str>, signal: bool) -> Option<Instance> {
         unsafe {
-            let name: Vec<u16> = match super::instance_name() {
-                Some(n) => format!("Local\\rustshot-daemon-{n}"),
-                None => "Local\\rustshot-daemon".into(),
-            }
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
-            let mutex = match CreateMutexW(None, true, PCWSTR(name.as_ptr())) {
+            let mname = mutex_name(name);
+            let class = class_name(name);
+            let mutex = match CreateMutexW(None, true, PCWSTR(mname.as_ptr())) {
                 Ok(h) => h,
                 // Cannot tell; behave as the sole instance without a guard.
                 Err(_) => return Some(Instance::Solo(Keep)),
@@ -224,23 +263,43 @@ mod imp {
                 }
                 // The primary may still be creating its window; retry briefly.
                 for _ in 0..20 {
-                    if let Ok(hwnd) = FindWindowW(super::tray_class(), PCWSTR::null()) {
+                    if let Ok(hwnd) = FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) {
                         let _ = PostMessageW(Some(hwnd), WM_CAPTURE, WPARAM(0), LPARAM(0));
                         return Some(Instance::Signalled);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-                eprintln!("error: another Rustshot is starting but not responding");
-                std::process::exit(1);
+                return None;
             }
-            let Some((thread_id, thread)) = spawn_window() else {
+            let slot = Arc::new(Slot::new(None));
+            let Some((thread_id, thread)) = spawn_window(class, slot.clone()) else {
                 eprintln!(
                     "warning: could not create the tray window; running without tray or single-instance signalling"
                 );
                 let _ = CloseHandle(mutex);
                 return Some(Instance::Solo(Keep));
             };
-            Some(Instance::Primary(super::Guard(Inner { mutex, thread_id, thread: Some(thread) })))
+            Some(Instance::Primary(super::Guard(Inner { mutex, thread_id, thread: Some(thread), slot })))
+        }
+    }
+
+    /// Instance `name`'s mutex held with no window (a primary that never
+    /// came up); closed on drop (tests).
+    #[cfg(test)]
+    pub struct BareLock(HANDLE);
+
+    #[cfg(test)]
+    impl BareLock {
+        pub fn new(name: &str) -> BareLock {
+            let n = mutex_name(Some(name));
+            BareLock(unsafe { CreateMutexW(None, true, PCWSTR(n.as_ptr())) }.expect("mutex"))
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for BareLock {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseHandle(self.0) };
         }
     }
 }
@@ -269,6 +328,11 @@ mod imp {
     }
 
     fn default_path() -> PathBuf {
+        path_for(super::instance_name())
+    }
+
+    /// The socket of instance `name` (`None`: the default one).
+    pub fn path_for(name: Option<&str>) -> PathBuf {
         unsafe extern "C" {
             fn getuid() -> u32;
         }
@@ -279,9 +343,33 @@ mod imp {
             uid,
             cfg!(target_os = "macos"),
         );
-        match super::instance_name() {
+        match name {
             Some(n) => named(&p, n),
             None => p,
+        }
+    }
+
+    /// `acquire_or_signal` (`signal`) / `try_acquire` for an explicit
+    /// instance name (tests).
+    #[cfg(test)]
+    pub fn acquire_named(name: &str, signal: bool) -> Option<Instance> {
+        acquire_mode(&path_for(Some(name)), signal)
+    }
+
+    /// Instance `name`'s lock held with no socket listening (a primary
+    /// that never came up); released on drop (tests).
+    #[cfg(test)]
+    pub struct BareLock(#[allow(dead_code)] File);
+
+    #[cfg(test)]
+    impl BareLock {
+        pub fn new(name: &str) -> BareLock {
+            let path = path_for(Some(name));
+            let _ = std::fs::remove_file(&path);
+            match try_lock(&lock_path(&path)) {
+                Lock::Held(f) => BareLock(f),
+                _ => panic!("lock of {name} busy"),
+            }
         }
     }
 
@@ -548,17 +636,164 @@ mod name_tests {
     }
 }
 
-#[cfg(all(test, windows))]
+/// Every platform: named instances (unique per test, so the tests run in
+/// parallel beside each other and beside the user's daemon), second-launch
+/// signalling, and recovery from a holder that died.
+#[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Instance, imp};
+    use crate::hotkey::HotEvent;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// A fresh instance name (valid: at most 32 of `[A-Za-z0-9_-]`).
+    fn unique(tag: &str) -> String {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let name = format!("t{}-{tag}{n}", std::process::id());
+        assert!(super::valid_instance_name(&name), "{name}");
+        name
+    }
+
+    fn primary(name: &str) -> super::Guard {
+        match imp::acquire_named(name, true) {
+            Some(Instance::Primary(g)) => g,
+            Some(Instance::Signalled) => panic!("{name}: signalled, not primary"),
+            Some(Instance::Solo(_)) => panic!("{name}: solo"),
+            None => panic!("{name}: held"),
+        }
+    }
+
+    const WAIT: Duration = Duration::from_secs(10);
 
     #[test]
-    #[ignore = "uses the real per-user daemon mutex; fails if a daemon is running"]
-    fn second_acquire_is_signalled() {
-        let Instance::Primary(g) = acquire_or_signal() else { panic!("first must be primary") };
-        let (tx, rx) = std::sync::mpsc::channel();
+    fn second_launch_signals_the_primary() {
+        let name = unique("sig");
+        let g = primary(&name);
+        let (tx, rx) = mpsc::channel();
         g.listen(tx);
-        assert!(matches!(acquire_or_signal(), Instance::Signalled));
-        assert!(matches!(rx.recv_timeout(std::time::Duration::from_secs(2)), Ok(HotEvent::Capture)));
+        for i in 0..3 {
+            assert!(matches!(imp::acquire_named(&name, true), Some(Instance::Signalled)), "launch {i}");
+            assert!(matches!(rx.recv_timeout(WAIT), Ok(HotEvent::Capture)), "capture {i} delivered");
+        }
+        assert!(rx.try_recv().is_err(), "one capture per launch");
+        drop(g);
+        // Released: the next launch is the primary again.
+        let _g = primary(&name);
+    }
+
+    #[test]
+    fn try_acquire_never_signals_the_holder() {
+        let name = unique("try");
+        let g = primary(&name);
+        let (tx, rx) = mpsc::channel();
+        g.listen(tx);
+        assert!(imp::acquire_named(&name, false).is_none(), "held: no second primary");
+        // A real signal after it: exactly one capture arrives, so the try
+        // above sent none (delivery is in order).
+        assert!(matches!(imp::acquire_named(&name, true), Some(Instance::Signalled)));
+        assert!(matches!(rx.recv_timeout(WAIT), Ok(HotEvent::Capture)));
+        assert!(rx.try_recv().is_err(), "the try sent nothing");
+        drop(g);
+        assert!(matches!(imp::acquire_named(&name, false), Some(Instance::Primary(_))));
+    }
+
+    #[test]
+    fn instances_are_independent() {
+        let (a, b) = (unique("a"), unique("b"));
+        let ga = primary(&a);
+        let gb = primary(&b);
+        let (ta, ra) = mpsc::channel();
+        let (tb, rb) = mpsc::channel();
+        ga.listen(ta);
+        gb.listen(tb);
+        assert!(matches!(imp::acquire_named(&b, true), Some(Instance::Signalled)));
+        assert!(matches!(rb.recv_timeout(WAIT), Ok(HotEvent::Capture)));
+        // Then one to `a`: had `b`'s gone there too, it would be first.
+        assert!(matches!(imp::acquire_named(&a, true), Some(Instance::Signalled)));
+        assert!(matches!(ra.recv_timeout(WAIT), Ok(HotEvent::Capture)));
+        assert!(ra.try_recv().is_err() && rb.try_recv().is_err(), "one capture each");
+    }
+
+    /// A holder whose signalling endpoint never came up: a launch gives up
+    /// (`None`; the caller exits) instead of hanging or becoming primary.
+    #[test]
+    fn unresponsive_holder_is_not_taken_over() {
+        let name = unique("bare");
+        let lock = imp::BareLock::new(&name);
+        let t = Instant::now();
+        assert!(imp::acquire_named(&name, true).is_none());
+        assert!(t.elapsed() < WAIT, "bounded retry");
+        assert!(imp::acquire_named(&name, false).is_none());
+        drop(lock);
+        let _g = primary(&name);
+    }
+
+    /// Run by `stale_lock_after_the_holder_dies` as a child process: hold
+    /// instance `RUSTSHOT_TEST_HOLD`, say so, and wait to be killed.
+    #[test]
+    #[ignore = "helper: run as a child process by stale_lock_after_the_holder_dies"]
+    fn holder_child() {
+        let Ok(name) = std::env::var("RUSTSHOT_TEST_HOLD") else { return };
+        let _g = primary(&name);
+        println!("held {name}");
+        let _ = std::io::stdin().lines().count(); // until killed (or stdin closes)
+    }
+
+    /// The primary process is killed: its lock goes with it (the kernel
+    /// closes the mutex / releases the flock) and its leftover socket file
+    /// is replaced, so the next launch becomes the primary and answers.
+    #[test]
+    fn stale_lock_after_the_holder_dies() {
+        let name = unique("dead");
+        let here = module_path!().split_once("::").map_or(module_path!(), |m| m.1);
+        let test = format!("{here}::holder_child");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([test.as_str(), "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+            .env("RUSTSHOT_TEST_HOLD", &name)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the holder");
+        let want = format!("held {name}");
+        // Read on a thread so a child that never says "held" fails the
+        // test after WAIT instead of hanging it.
+        let out = BufReader::new(child.stdout.take().unwrap());
+        let (said, heard) = mpsc::channel();
+        std::thread::spawn(move || {
+            // libtest may print "test ... " on the same line first.
+            if out.lines().map_while(Result::ok).any(|l| l.trim_end().ends_with(&want)) {
+                let _ = said.send(());
+            }
+        });
+        let held = heard.recv_timeout(WAIT).is_ok();
+        let checked = std::panic::catch_unwind(|| {
+            assert!(held, "the child took the instance");
+            assert!(imp::acquire_named(&name, false).is_none(), "held by the child");
+        });
+        let _ = child.kill(); // only the child this test started
+        let _ = child.wait();
+        if let Err(e) = checked {
+            std::panic::resume_unwind(e);
+        }
+        #[cfg(unix)]
+        assert!(imp::path_for(Some(&name)).exists(), "the killed holder left its socket file");
+        // The kernel drops a dead process' handles as it exits: a bounded
+        // poll on the condition, not a fixed sleep.
+        let deadline = Instant::now() + WAIT;
+        let g = loop {
+            match imp::acquire_named(&name, false) {
+                Some(Instance::Primary(g)) => break g,
+                None if Instant::now() < deadline => std::thread::yield_now(),
+                _ => panic!("the dead holder's lock was never released"),
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+        g.listen(tx);
+        assert!(matches!(imp::acquire_named(&name, true), Some(Instance::Signalled)));
+        assert!(matches!(rx.recv_timeout(WAIT), Ok(HotEvent::Capture)), "the new primary answers");
     }
 }

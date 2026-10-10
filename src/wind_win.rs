@@ -81,6 +81,10 @@ unsafe fn y_of(lp: LPARAM) -> i32 {
 
 /// Ask for a repaint of the window's client area.
 pub fn invalidate(hwnd: HWND) {
+    // A null handle would invalidate every window on the desktop.
+    if hwnd.is_invalid() {
+        return;
+    }
     unsafe {
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
@@ -88,6 +92,9 @@ pub fn invalidate(hwnd: HWND) {
 
 /// Invalidate rects `[x0, y0, x1, y1]` of the client area (no erase).
 pub fn invalidate_rects(hwnd: HWND, rects: &[[i32; 4]]) {
+    if hwnd.is_invalid() {
+        return;
+    }
     for r in rects {
         let rc = RECT { left: r[0], top: r[1], right: r[2], bottom: r[3] };
         unsafe {
@@ -324,6 +331,9 @@ fn present(hdc: windows::Win32::Graphics::Gdi::HDC, fb: &mut PixBuf) {
 
 /// Position + show the overlay at an exact physical rect and take focus.
 pub fn show_at(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
+    if hwnd.is_invalid() {
+        return;
+    }
     unsafe {
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_SHOWWINDOW);
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -734,12 +744,7 @@ mod tests {
     /// Every `(hwnd, ms)` the backend's `retime` was asked for.
     pub(super) static RETIMES: std::sync::Mutex<Vec<(isize, u64)>> = std::sync::Mutex::new(Vec::new());
 
-    /// Serialises the window-creating tests (object counts, timers).
-    static WINDOWS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn windows_lock() -> std::sync::MutexGuard<'static, ()> {
-        WINDOWS.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    use crate::wind::test_window_lock as windows_lock;
 
     /// Resize factors applied to the initial outer rect (pairwise distinct,
     /// DPI independent: `min` is 1x1 in the test spec).
@@ -855,13 +860,12 @@ mod tests {
 
     /// `run_window` on a non-main thread: the loop survives an ignored
     /// WM_CLOSE, ends when the driver closes, paints at least once, and
-    /// repeated windows leave the GDI/USER object counts where they were
-    /// (retried: other tests in this process may hold objects meanwhile).
+    /// repeated windows leave the GDI/USER object counts where they were.
+    /// The counts are per process and every other test in this one may
+    /// create GDI objects at any time, so they are taken in a child
+    /// process running only `window_leak_probe`.
     #[test]
     fn run_window_closes_on_request_without_leaks() {
-        use windows::Win32::System::Threading::{
-            GetGuiResources, OpenProcess, GR_GDIOBJECTS, GR_USEROBJECTS, PROCESS_QUERY_INFORMATION,
-        };
         let _guard = windows_lock();
         std::thread::spawn(|| {
             let d = run_closer();
@@ -878,27 +882,50 @@ mod tests {
             assert!(d.quit, "on_quit ran");
             assert!(d.frames > RESIZES.len() as u32, "painted after every resize: {} frames", d.frames);
             assert!(unsafe { !IsWindow(Some(d.hwnd)).as_bool() }, "window destroyed");
-            // A real handle: the GetCurrentProcess pseudo handle reads 0.
-            let me = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, false, std::process::id()) }
-                .expect("process handle");
-            let count = || unsafe { (GetGuiResources(me, GR_GDIOBJECTS), GetGuiResources(me, GR_USEROBJECTS)) };
-            let mut seen = Vec::new();
-            let ok = (0..3).any(|_| {
-                let before = count();
-                for _ in 0..5 {
-                    let d = run_closer();
-                    assert_eq!(d.resizes, 1 + RESIZES.len() as u32);
-                }
-                let after = count();
-                seen.push((before, after));
-                after.0 <= before.0 && after.1 <= before.1
-            });
-            let _ = unsafe { windows::Win32::Foundation::CloseHandle(me) };
-            println!("(gdi, user) objects before -> after 5 windows: {seen:?}");
-            assert!(ok, "GDI/USER objects grew over 5 windows ((gdi, user) before -> after): {seen:?}");
         })
         .join()
         .expect("window thread");
+        let here = module_path!().split_once("::").map_or(module_path!(), |m| m.1);
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([&format!("{here}::window_leak_probe"), "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+            .env("RUSTSHOT_LEAK_PROBE", "1")
+            .output()
+            .expect("run the leak probe");
+        let text = String::from_utf8_lossy(&out.stdout);
+        println!("{text}");
+        assert!(out.status.success(), "leak probe failed:\n{text}\n{}", String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("1 passed"), "the probe ran:\n{text}");
+    }
+
+    /// Run alone in a child process by the test above: five windows in a
+    /// row leave the GDI/USER object counts where they were (three rounds:
+    /// the first window may allocate process-wide caches).
+    #[test]
+    #[ignore = "helper: run as a child process by run_window_closes_on_request_without_leaks"]
+    fn window_leak_probe() {
+        use windows::Win32::System::Threading::{
+            GetGuiResources, OpenProcess, GR_GDIOBJECTS, GR_USEROBJECTS, PROCESS_QUERY_INFORMATION,
+        };
+        if std::env::var_os("RUSTSHOT_LEAK_PROBE").is_none() {
+            return;
+        }
+        // A real handle: the GetCurrentProcess pseudo handle reads 0.
+        let me = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, false, std::process::id()) }.expect("process handle");
+        let count = || unsafe { (GetGuiResources(me, GR_GDIOBJECTS), GetGuiResources(me, GR_USEROBJECTS)) };
+        let mut seen = Vec::new();
+        let ok = (0..3).any(|_| {
+            let before = count();
+            for _ in 0..5 {
+                let d = run_closer();
+                assert_eq!(d.resizes, 1 + RESIZES.len() as u32);
+            }
+            let after = count();
+            seen.push((before, after));
+            after.0 <= before.0 && after.1 <= before.1
+        });
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(me) };
+        println!("(gdi, user) objects before -> after 5 windows: {seen:?}");
+        assert!(ok, "GDI/USER objects grew over 5 windows ((gdi, user) before -> after): {seen:?}");
     }
 
     /// Two `run_window` threads at once: the "overlay-style" window goes
@@ -1065,6 +1092,7 @@ mod tests {
             .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
         let mut d = Rect { hwnd: HWND::default(), fb: PixBuf::new(1, 1), deadline, sampled: None, painted: false };
         let spec = WindowSpec { title: "rustshot window test".into(), w: 400, h: 300, resizable: true, min: (200, 150) };
+        let _guard = windows_lock();
         run_window(spec, &mut d).expect("window loop");
         assert!(d.painted);
         if deadline.is_some() {

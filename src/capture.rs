@@ -156,12 +156,13 @@ pub fn grab_edit(screen: Option<u32>, active_monitor_only: bool) -> Result<Shot>
 
 /// Global rect (virtual-screen physical) of a monitor or `all`.
 pub fn region_of(spec: &str) -> Result<(i32, i32, u32, u32)> {
-    let mons = monitors()?;
+    // A geometry needs no display; only "all" / "screenN" ask for the monitors.
     if spec == "all" {
-        return Ok(union_rect(&mons));
+        return Ok(union_rect(&monitors()?));
     }
     if let Some(n) = spec.strip_prefix("screen") {
         let n: usize = n.parse().context("bad screen number")?;
+        let mons = monitors()?;
         let m = mons
             .get(n)
             .ok_or_else(|| anyhow!("monitor index {n} out of range"))?;
@@ -283,5 +284,32 @@ mod tests {
         assert_eq!(shot.size, (mons[0].w, mons[0].h));
         assert_eq!(shot.image.dimensions(), shot.size);
         assert!(shot.scale >= 0.25);
+    }
+
+    /// The editor's capture paths on the live display (X11 under Xvfb in
+    /// CI): the whole desktop, `--region all`/`screenN`, a global crop.
+    #[test]
+    #[ignore = "live display access"]
+    fn live_desktop_capture_and_regions() {
+        enable_dpi_awareness();
+        let mons = monitors().expect("monitors");
+        let all = region_of("all").expect("all");
+        assert_eq!(all, union_rect(&mons));
+        assert_eq!(region_of("screen0").unwrap(), (mons[0].x, mons[0].y, mons[0].w, mons[0].h));
+        assert!(region_of(&format!("screen{}", mons.len())).is_err(), "past the last monitor");
+        assert!(region_of("screenX").is_err());
+        let shot = grab_edit(None, false).expect("desktop");
+        assert_eq!(shot.image.dimensions(), shot.size);
+        if uniform_scale(&mons).is_some() {
+            assert_eq!((shot.origin, shot.size), ((all.0, all.1), (all.2, all.3)), "the whole span");
+            assert_eq!(shot.monitors, monitors_in_shot(&mons, (all.0, all.1), (all.2, all.3)));
+        } else {
+            assert!(mons.iter().any(|m| (shot.origin, shot.size) == ((m.x, m.y), (m.w, m.h))), "one monitor");
+        }
+        let one = grab_edit(Some(0), false).expect("monitor 0");
+        assert_eq!((one.origin, one.size), ((mons[0].x, mons[0].y), (mons[0].w, mons[0].h)));
+        let crop = crop_global(&shot, (shot.origin.0 + 1, shot.origin.1 + 2, 10, 5)).expect("crop");
+        assert_eq!(crop.dimensions(), (10, 5));
+        assert_eq!(crop.as_raw()[..4], shot.image.as_raw()[(2 * shot.size.0 as usize + 1) * 4..][..4]);
     }
 }

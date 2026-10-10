@@ -131,6 +131,16 @@ Other:
   -V, --version          Print version
 ";
 
+/// `argv` without the program name: non-UTF-8 arguments are an error
+/// (instead of the panic `std::env::args` would raise).
+fn parse_args(argv: &[std::ffi::OsString]) -> Result<Parsed, String> {
+    let args = argv
+        .iter()
+        .map(|a| a.to_str().map(str::to_owned).ok_or_else(|| format!("invalid UTF-8 in argument {a:?}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    parse_from(&args)
+}
+
 /// Hand-rolled argument parser (replaces clap for binary size).
 fn parse_from(args: &[String]) -> Result<Parsed, String> {
     if args.iter().any(|a| a == "-h" || a == "--help")
@@ -344,6 +354,52 @@ fn parse_region(spec: &str) -> Result<(i32, i32, u32, u32)> {
     capture::region_of(spec)
 }
 
+/// What a capture command does, decided before anything touches the screen.
+enum Plan {
+    /// Open the editor on this capture.
+    Editor(Pending),
+    /// Grab and export without the editor: one monitor (`screen`), else
+    /// the desktop cropped to `region`.
+    Direct {
+        screen: Option<u32>,
+        region: Option<(i32, i32, u32, u32)>,
+    },
+}
+
+/// The plan for `gui`/`full`/`screen` (`None` for the other commands):
+/// `gui` opens the editor unless `--noedit`, `full`/`screen` capture
+/// directly unless `--edit`. A bad `--region` is an error here.
+fn plan_capture(cmd: &Cmd) -> Result<Option<Plan>> {
+    let (args, screen, edit) = match cmd {
+        Cmd::Gui(a) => (a, None, !a.noedit),
+        Cmd::Full(a) => (a, None, a.edit),
+        Cmd::Screen { number, args } => (args, Some(*number), args.edit),
+        _ => return Ok(None),
+    };
+    // `screen` captures the whole monitor: no region.
+    let region = match (&args.region, screen) {
+        (Some(spec), None) => Some(parse_region(spec).map_err(|e| anyhow!("{e:#}"))?),
+        _ => None,
+    };
+    if !edit {
+        return Ok(Some(Plan::Direct { screen, region }));
+    }
+    let mut pending = Pending::editor();
+    pending.tasks = tasks_from(args);
+    pending.screen = screen;
+    pending.region = region;
+    pending.filename = args.filename.clone();
+    Ok(Some(Plan::Editor(pending)))
+}
+
+/// The delay before a capture command grabs (0 for the others).
+fn delay_of(cmd: &Cmd) -> u32 {
+    match cmd {
+        Cmd::Gui(a) | Cmd::Full(a) | Cmd::Screen { args: a, .. } => a.delay,
+        _ => 0,
+    }
+}
+
 /// Direct (no UI) capture: grab, optionally crop, run tasks, wait for upload.
 fn run_direct(cfg: &Config, args: &CaptureArgs, shot: Shot, region: Option<(i32, i32, u32, u32)>) -> i32 {
     let mut tasks = tasks_from(args);
@@ -486,8 +542,8 @@ pub fn memlog(phase: &str) {
 }
 
 fn run() -> Result<()> {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = match parse_from(&argv) {
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let cmd = match parse_args(&argv) {
         Ok(Parsed::Cmd(c)) => c.unwrap_or(Cmd::Daemon { after_update: false }),
         Ok(Parsed::Help(h)) => {
             print!("{h}");
@@ -578,59 +634,21 @@ fn run() -> Result<()> {
                 }
             exit(code);
         }
-        Cmd::Gui(args) => {
+        Cmd::Gui(ref args) | Cmd::Full(ref args) | Cmd::Screen { ref args, .. } => {
+            let plan = plan_capture(&cmd)?.expect("a capture command");
             let cfg = config::load();
-            delayed(args.delay);
-            let tasks = tasks_from(&args);
-            let region = match &args.region {
-                Some(spec) => Some(parse_region(spec).map_err(|e| anyhow!("{e:#}"))?),
-                None => None,
-            };
-            if args.noedit {
-                let shot = capture::grab_edit(None, cfg.capture_active_monitor)
+            delayed(delay_of(&cmd));
+            match plan {
+                Plan::Editor(pending) => exit(editor_main(cfg, RunKind::OneShot, pending)),
+                Plan::Direct { screen, region } => {
+                    let shot = match screen {
+                        Some(n) => capture::grab_monitor(n as usize),
+                        None => capture::grab_edit(None, cfg.capture_active_monitor),
+                    }
                     .map_err(|e| anyhow!("{e:#}"))?;
-                exit(run_direct(&cfg, &args, shot, region));
+                    exit(run_direct(&cfg, args, shot, region));
+                }
             }
-            let mut pending = Pending::editor();
-            pending.tasks = tasks;
-            pending.region = region;
-            pending.filename = args.filename.clone();
-            let code = editor_main(cfg, RunKind::OneShot, pending);
-            exit(code);
-        }
-        Cmd::Full(args) => {
-            let cfg = config::load();
-            delayed(args.delay);
-            let region = match &args.region {
-                Some(spec) => Some(parse_region(spec).map_err(|e| anyhow!("{e:#}"))?),
-                None => None,
-            };
-            if args.edit {
-                let mut pending = Pending::editor();
-                pending.tasks = tasks_from(&args);
-                pending.region = region;
-                pending.filename = args.filename.clone();
-                let code = editor_main(cfg, RunKind::OneShot, pending);
-                exit(code);
-            }
-            let shot = capture::grab_edit(None, cfg.capture_active_monitor)
-                .map_err(|e| anyhow!("{e:#}"))?;
-            exit(run_direct(&cfg, &args, shot, region));
-        }
-        Cmd::Screen { number, args } => {
-            let cfg = config::load();
-            delayed(args.delay);
-            if args.edit {
-                let mut pending = Pending::editor();
-                pending.screen = Some(number);
-                pending.tasks = tasks_from(&args);
-                pending.filename = args.filename.clone();
-                let code = editor_main(cfg, RunKind::OneShot, pending);
-                exit(code);
-            }
-            let shot =
-                capture::grab_monitor(number as usize).map_err(|e| anyhow!("{e:#}"))?;
-            exit(run_direct(&cfg, &args, shot, None));
         }
     }
 }
@@ -747,5 +765,182 @@ mod cli_tests {
             Parsed::Help(h) => assert!(h.contains(env!("CARGO_PKG_VERSION"))),
             _ => panic!("expected version"),
         }
+    }
+
+    fn err(args: &[&str]) -> String {
+        match p(args) {
+            Err(e) => e,
+            Ok(_) => panic!("{args:?} should not parse"),
+        }
+    }
+
+    fn capture_args(c: Cmd) -> CaptureArgs {
+        match c {
+            Cmd::Gui(a) | Cmd::Full(a) | Cmd::Screen { args: a, .. } => a,
+            _ => panic!("not a capture command"),
+        }
+    }
+
+    /// Every capture flag, long and short, on every capture command.
+    #[test]
+    fn every_capture_flag() {
+        for name in ["gui", "full", "screen"] {
+            let a = capture_args(cmd(&[
+                name, "--path", "a.png", "--clip", "--raw", "--geometry", "--upload", "--delay", "250", "--filename",
+                "%F", "--region", "all", "--noedit", "--edit",
+            ]));
+            assert_eq!(a.path.as_deref(), Some(std::path::Path::new("a.png")), "{name}");
+            assert!(a.clip && a.raw && a.geometry && a.upload && a.noedit && a.edit, "{name}");
+            assert_eq!((a.delay, a.filename.as_deref(), a.region.as_deref()), (250, Some("%F"), Some("all")));
+            let a = capture_args(cmd(&[name, "-p", "dir", "-c", "-d", "7", "-f", "x_%T"]));
+            assert_eq!(a.path.as_deref(), Some(std::path::Path::new("dir")));
+            assert!(a.clip && !a.raw && !a.upload);
+            assert_eq!((a.delay, a.filename.as_deref()), (7, Some("x_%T")));
+            let a = capture_args(cmd(&[name, "--delay=9", "--filename=n", "--region=screen1", "-pout.jpg"]));
+            assert_eq!((a.delay, a.filename.as_deref(), a.region.as_deref()), (9, Some("n"), Some("screen1")));
+            assert_eq!(a.path.as_deref(), Some(std::path::Path::new("out.jpg")));
+            let a = capture_args(cmd(&[name]));
+            assert!(a.path.is_none() && !a.clip && a.delay == 0 && a.region.is_none(), "defaults");
+        }
+        // `-n` belongs to `screen` only, in every spelling.
+        for args in [&["screen", "-n3"][..], &["screen", "--number", "3"], &["screen", "-c", "--number=3"]] {
+            assert!(matches!(cmd(args), Cmd::Screen { number: 3, .. }), "{args:?}");
+        }
+        assert!(p(&["gui", "-n", "1"]).is_err());
+    }
+
+    #[test]
+    fn flag_errors_name_the_problem() {
+        assert_eq!(err(&["gui", "--clip=yes"]), "unexpected value for --clip");
+        assert_eq!(err(&["gui", "--path"]), "missing value for --path");
+        assert_eq!(err(&["gui", "-p"]), "missing value for -p");
+        assert_eq!(err(&["gui", "-d", "-1"]), "invalid value for --delay: '-1'");
+        assert_eq!(err(&["gui", "--delay=soon"]), "invalid value for --delay: 'soon'");
+        assert_eq!(err(&["gui", "-x"]), "unexpected argument '-x'");
+        assert_eq!(err(&["gui", "-cx"]), "unexpected argument '-x'");
+        assert_eq!(err(&["gui", "stray"]), "unexpected argument 'stray'");
+        assert_eq!(err(&["full", "--bogus=1"]), "unexpected argument '--bogus'");
+        assert_eq!(err(&["screen", "-n"]), "missing value for -n");
+        assert_eq!(err(&["screen", "--number=x"]), "invalid value for --number: 'x'");
+        assert_eq!(err(&["screen", "-nx"]), "invalid value for -n: 'x'");
+        assert_eq!(err(&["-c"]), "unexpected argument '-c'");
+        assert_eq!(err(&["capture"]), "unrecognized command 'capture'");
+        assert_eq!(err(&["config", "--fix"]), "unexpected argument '--fix'");
+        assert_eq!(err(&["settings", "now"]), "unexpected argument 'now'");
+        assert_eq!(err(&["update", "--check"]), "unexpected argument '--check'");
+        // `-V` only as the first argument; help wins anywhere.
+        assert!(p(&["gui", "-V"]).is_err());
+        assert!(matches!(p(&["-V"]).unwrap(), Parsed::Help(_)));
+        assert!(matches!(p(&["screen", "-n", "1", "--help"]).unwrap(), Parsed::Help(h) if h == HELP));
+    }
+
+    #[test]
+    fn os_string_arguments() {
+        use std::ffi::OsString;
+        let os = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(matches!(parse_args(&os(&["full", "-c"])), Ok(Parsed::Cmd(Some(Cmd::Full(a)))) if a.clip));
+        assert!(matches!(parse_args(&[]), Ok(Parsed::Cmd(None))));
+        #[cfg(windows)]
+        let bad = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0x61, 0xD800])
+        };
+        #[cfg(unix)]
+        let bad = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0x61, 0xFF])
+        };
+        let e = parse_args(&[OsString::from("gui"), OsString::from("-p"), bad]).err().expect("not UTF-8");
+        assert!(e.starts_with("invalid UTF-8 in argument"), "{e}");
+    }
+
+    #[test]
+    fn tasks_follow_the_output_flags_in_order() {
+        let a = capture_args(cmd(&["full", "--upload", "-c", "--raw", "--geometry", "-p", "x.png"]));
+        let t = tasks_from(&a);
+        assert!(
+            matches!(&t[..], [Task::Save { path: Some(p), ask: false }, Task::Copy, Task::Raw, Task::Geometry, Task::Upload] if p.as_os_str() == "x.png"),
+            "{t:?}"
+        );
+        assert!(tasks_from(&CaptureArgs::default()).is_empty());
+    }
+
+    fn plan(args: &[&str]) -> Plan {
+        plan_capture(&cmd(args)).expect("plans").expect("a capture command")
+    }
+
+    /// Dispatch: which capture commands open the editor, and with what.
+    #[test]
+    fn capture_commands_plan_editor_or_direct() {
+        match plan(&["gui", "--region", "100x50+10+20", "-c", "-f", "n"]) {
+            Plan::Editor(p) => {
+                assert_eq!((p.region, p.screen, p.filename.as_deref()), (Some((10, 20, 100, 50)), None, Some("n")));
+                assert!(matches!(p.tasks[..], [Task::Copy]) && !p.accept_on_select);
+            }
+            Plan::Direct { .. } => panic!("gui opens the editor"),
+        }
+        assert!(matches!(plan(&["gui", "--noedit"]), Plan::Direct { screen: None, region: None }));
+        assert!(matches!(
+            plan(&["gui", "--noedit", "--region", "4x3+-5+6"]),
+            Plan::Direct { screen: None, region: Some((-5, 6, 4, 3)) }
+        ));
+        assert!(matches!(plan(&["full"]), Plan::Direct { screen: None, region: None }));
+        assert!(matches!(plan(&["full", "--region", "2x2+0+0"]), Plan::Direct { region: Some((0, 0, 2, 2)), .. }));
+        match plan(&["full", "--edit", "--raw"]) {
+            Plan::Editor(p) => assert!(p.screen.is_none() && matches!(p.tasks[..], [Task::Raw])),
+            Plan::Direct { .. } => panic!("--edit opens the editor"),
+        }
+        assert!(matches!(plan(&["screen", "-n", "2"]), Plan::Direct { screen: Some(2), region: None }));
+        // `screen` grabs the whole monitor: a region is not used (nor parsed).
+        assert!(matches!(plan(&["screen", "--region", "junk"]), Plan::Direct { screen: Some(0), region: None }));
+        match plan(&["screen", "-n1", "--edit", "-f", "m"]) {
+            Plan::Editor(p) => assert_eq!((p.screen, p.region, p.filename.as_deref()), (Some(1), None, Some("m"))),
+            Plan::Direct { .. } => panic!("--edit opens the editor"),
+        }
+        // A bad region fails before anything is captured.
+        for args in [&["gui", "--region", "bogus"][..], &["full", "--noedit", "--region", "4x4+a+b"]] {
+            assert!(plan_capture(&cmd(args)).is_err(), "{args:?}");
+        }
+        // The other commands are not captures.
+        for args in [&["daemon"][..], &["update"], &["settings"], &["config"], &["config", "--check"]] {
+            assert!(plan_capture(&cmd(args)).unwrap().is_none(), "{args:?}");
+            assert_eq!(delay_of(&cmd(args)), 0);
+        }
+        assert_eq!(delay_of(&cmd(&["screen", "-d", "40"])), 40);
+    }
+
+    fn shot() -> capture::Shot {
+        capture::Shot {
+            origin: (-100, 50),
+            size: (64, 48),
+            scale: 1.0,
+            image: crate::pixbuf::PixBuf::from_pixel(64, 48, [10, 20, 30, 255]),
+            monitors: vec![(0, 0, 64, 48)],
+        }
+    }
+
+    /// `run_direct`: crops to the region, saves where `--path` says, and
+    /// fails (code 1) when a task fails.
+    #[test]
+    fn direct_capture_crops_and_saves() {
+        let dir = std::env::temp_dir().join(format!("rustshot-direct-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("c.png");
+        let cfg = Config::default();
+        let args = CaptureArgs { path: Some(out.clone()), geometry: true, ..CaptureArgs::default() };
+        assert_eq!(run_direct(&cfg, &args, shot(), Some((-90, 60, 20, 10))), 0);
+        let reader = png::Decoder::new(std::fs::File::open(&out).expect("saved")).read_info().unwrap();
+        assert_eq!((reader.info().width, reader.info().height), (20, 10));
+        // The whole shot when no region is given.
+        let whole = dir.join("w.png");
+        let args = CaptureArgs { path: Some(whole.clone()), ..CaptureArgs::default() };
+        assert_eq!(run_direct(&cfg, &args, shot(), None), 0);
+        let reader = png::Decoder::new(std::fs::File::open(&whole).unwrap()).read_info().unwrap();
+        assert_eq!((reader.info().width, reader.info().height), (64, 48));
+        std::fs::write(dir.join("f"), b"x").unwrap();
+        let args = CaptureArgs { path: Some(dir.join("f").join("x.png")), ..CaptureArgs::default() };
+        assert_eq!(run_direct(&cfg, &args, shot(), None), 1, "save failed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

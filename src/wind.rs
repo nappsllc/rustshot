@@ -404,6 +404,14 @@ impl Driver for AutoClose<'_> {
     }
 }
 
+/// Serialises the tests that open windows: they share the process-wide
+/// timer cadence and (Windows) GDI/USER object counts.
+#[cfg(test)]
+pub(crate) fn test_window_lock() -> std::sync::MutexGuard<'static, ()> {
+    static WINDOWS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    WINDOWS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Whether a window can be opened here (Linux: `$DISPLAY` is set); the
 /// window smoke tests return early without one.
 #[cfg(all(test, not(target_os = "macos")))]
@@ -440,6 +448,7 @@ mod tests {
     #[test]
     #[ignore = "live display access"]
     fn live_window_lifecycle() {
+        let _guard = test_window_lock();
         let mut d = QuitSoon { created: false, fb: PixBuf::new(320, 240) };
         let code = run(&mut d);
         assert!(d.created);
@@ -536,6 +545,7 @@ Xft.dpi:	144
             .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
         let mut d = Rect { hwnd: Hwnd::default(), fb: PixBuf::new(1, 1), deadline, painted: false };
         let spec = WindowSpec { title: "rustshot window test".into(), w: 400, h: 300, resizable: true, min: (200, 150) };
+        let _guard = test_window_lock();
         run_window(spec, &mut d).expect("window loop");
         assert!(d.painted);
     }
