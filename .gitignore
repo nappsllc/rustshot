@@ -3,3 +3,4 @@ _flameshot/
 *.pdb
 dist/
 target-*/
+.claude/worktrees/

@@ -337,6 +337,10 @@ impl<'a> Surf<'a> {
 /// buffer, and a running prefix sum yields per-pixel coverage. This is the
 /// font-rs / ab_glyph_rasterizer algorithm (same arithmetic, so glyphs
 /// come out as they did with ab_glyph); used for the baked UI font.
+///
+/// Derived from font-rs (Copyright 2015 Google Inc.) as modified in
+/// ab_glyph_rasterizer (Copyright 2020 Alex Butler), Apache License 2.0;
+/// adapted here to rustshot's buffers and outline format.
 pub struct Coverage {
     w: usize,
     h: usize,
