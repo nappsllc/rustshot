@@ -71,7 +71,10 @@ fn form_writes_what_changed() {
     f.keys.set(Action::ToolPencil, vec![Chord::parse("Shift+K").unwrap()]);
     f.keys.set(Action::Copy, vec![]);
     let c = f.apply(&cfg, &cfg);
-    assert_eq!((c.theme.as_str(), c.renderer.as_str(), c.check_updates), ("light", "software", false));
+    // The renderer choice only exists on Windows; elsewhere the form already
+    // starts at "software", so the default spelling is kept.
+    let renderer = if cfg!(windows) { "software" } else { "gdi" };
+    assert_eq!((c.theme.as_str(), c.renderer.as_str(), c.check_updates), ("light", renderer, false));
     assert_eq!((c.capture_hotkey.as_str(), c.quit_hotkey.as_str()), ("Ctrl+Alt+F9", ""));
     assert_eq!((c.save_path.as_str(), c.save_subfolder, c.subfolder_pattern.as_str()), (r"E:\caps", false, "%Y"));
     assert_eq!((c.save_format.as_str(), c.jpeg_quality, c.save_dialog), ("bmp", 50, true));
@@ -575,7 +578,9 @@ fn render(s: &mut Settings, th: &Theme, k: f32, input: &Input, focus: &mut Focus
 }
 
 fn preview_cfg() -> Config {
-    Config { save_path: r"C:\Users\denis\Pictures\rustshot".into(), ..Config::default() }
+    // An absolute path on every platform, so no folder note shifts the layout.
+    let save_path = if cfg!(windows) { r"C:\Users\denis\Pictures\rustshot" } else { "/home/denis/Pictures/rustshot" };
+    Config { save_path: save_path.into(), ..Config::default() }
 }
 
 fn sample() -> Settings {
