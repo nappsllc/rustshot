@@ -1,15 +1,21 @@
 //! The update dialog: "Rustshot X is available (you have Y)" with the
 //! release notes and Update / Skip this version / Cancel, a progress bar
 //! while downloading, then install and restart; also "up to date", check
-//! errors (Retry / Close) and store-managed installs. Shown by the daemon's
-//! daily check and by the tray's "Check for updates".
+//! errors (Retry / Close) and store-managed installs. Opened by the
+//! daemon's daily check ([`offer`]) and by the tray's "Check for updates"
+//! ([`check`], [`show`]).
 //!
 //! The dialog is a [`Machine`] (pure: events in, actions out, unit-tested)
 //! drawn with the `ui` kit in a `wind::run_window` window on its own
 //! thread. Network and disk work runs on worker threads that report back
 //! through a channel the window drains on its timer. One dialog at a time:
-//! [`show`] while it is open replaces its content (unless a download or
+//! a request while it is open replaces its content (unless a download or
 //! install is running) and brings it to the front.
+//!
+//! A dialog the user did not ask for (the daily check) has no default
+//! button: Enter does nothing there, so typing into another window when it
+//! pops up never starts an update. After any content change Enter is also
+//! ignored for [`ENTER_GRACE`].
 //!
 //! macOS opens windows only on the main thread (the daemon's overlay loop),
 //! so there the dialog is not shown: an available release opens its page.
@@ -25,22 +31,29 @@ use crate::update::{self, Release};
 use crate::update_install::{self, Applied};
 use crate::wind::{self, Cursor, Driver, Ev, Hwnd, WindowSpec};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// This build's version.
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 /// Release-notes lines shown (the box scrolls when they don't fit).
 const NOTES_LINES: usize = 12;
-/// Window size, logical px: with release notes / message only.
+/// Window size, logical px (every state: the window never resizes).
 const W: u32 = 440;
-const H_FULL: u32 = 300;
-const H_SHORT: u32 = 184;
+const H: u32 = 300;
 const PAD: f32 = 20.0;
 const ICON: f32 = 24.0;
+/// Title row height.
+const TITLE_H: f32 = 32.0;
+/// Indent of text under the title (past the icon).
+const TEXT_X: f32 = ICON + 4.0 + crate::ui::layout::GAP;
+/// Enter is ignored this long after the window opens or its content changes.
+pub const ENTER_GRACE: Duration = Duration::from_millis(500);
 
-/// What the dialog opens with.
+/// What the dialog shows when opened.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DialogState {
     Available(Release),
@@ -60,6 +73,17 @@ impl DialogState {
             Err(e) => DialogState::Error(e),
         }
     }
+}
+
+/// A request to open (or re-target) the dialog.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Request {
+    /// The user asked for this (tray).
+    Show(DialogState),
+    /// Unasked (daily check): no default button.
+    Offer(DialogState),
+    /// The user asked to check now: "Checking…", then the result.
+    Check,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,7 +123,7 @@ impl Btn {
 /// What the dialog shows.
 #[derive(Clone, Debug, PartialEq)]
 enum Screen {
-    /// Retry after a failed check: waiting for `check_now`.
+    /// Waiting for `check_now` (tray check, Retry).
     Checking,
     Available(Release),
     UpToDate,
@@ -109,7 +133,8 @@ enum Screen {
     Downloading { rel: Release, got: u64, total: Option<u64> },
     /// Download complete; its SHA-256 is being checked.
     Verifying(Release),
-    /// Cancel pressed; waiting for the download to stop and clean up.
+    /// Cancel pressed; the download stops and cleans up (Close hides the
+    /// window meanwhile).
     Cancelling(Release),
     /// The installer / swap runs; nothing can be cancelled any more.
     Installing(Release),
@@ -136,17 +161,17 @@ pub enum In {
     Click(Btn),
     /// The window's close button, Alt+F4 or Esc.
     Dismiss,
-    /// Enter not taken by a focused control: the primary button.
+    /// Enter not taken by a focused control: the default button, if any.
     Enter,
     Checked(Result<Option<Release>, String>),
     Progress(u64, Option<u64>),
-    /// The download finished and passed its SHA-256 check (Err: it failed
-    /// or was cancelled; the files are gone either way).
+    /// The download finished, passed its SHA-256 check and the install
+    /// starts (Err: it failed or was cancelled; the files are gone either way).
     Fetched(Result<(), String>),
     Installed(Result<Applied, String>),
     Skipped(Result<(), String>),
-    /// [`show`] while the dialog is open.
-    Show(DialogState),
+    /// A request while the dialog is open.
+    Open(Request),
 }
 
 /// What the [`Machine`] asks its driver to do.
@@ -155,25 +180,37 @@ pub enum Act {
     Close,
     /// Run `update::check_now` on a worker (→ `In::Checked`).
     Check,
-    /// Download, verify and install on a worker (→ `Progress`, `Fetched`, `Installed`).
+    /// Download, verify and install on a worker (→ `Progress`, `Fetched`,
+    /// `Installed`; the worker ends the daemon itself when the new version
+    /// is starting).
     Download(Release),
     /// Abort the running download.
     Cancel,
     /// Write `skip_version` (→ `In::Skipped`).
     Skip(String),
-    /// The new version is starting: end the daemon now.
-    QuitDaemon,
 }
 
 /// The dialog's state machine.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Machine {
     screen: Screen,
+    /// The content was not asked for (daily check): Enter does nothing.
+    unsolicited: bool,
 }
 
 impl Machine {
+    /// A dialog the user opened with `s`.
     pub fn new(s: DialogState) -> Machine {
-        Machine { screen: s.into() }
+        Machine { screen: s.into(), unsolicited: false }
+    }
+
+    /// The dialog a request opens, and what to do first.
+    pub fn start(req: Request) -> (Machine, Vec<Act>) {
+        match req {
+            Request::Show(s) => (Machine::new(s), vec![]),
+            Request::Offer(s) => (Machine { screen: s.into(), unsolicited: true }, vec![]),
+            Request::Check => (Machine { screen: Screen::Checking, unsolicited: false }, vec![Act::Check]),
+        }
     }
 
     /// A download or install is running (new content is not taken).
@@ -193,28 +230,41 @@ impl Machine {
             Screen::CheckFailed(_) | Screen::InstallFailed { .. } => (&[Retry, Close], Some(Retry)),
             Screen::SaveFailed(_) => (&[Close], Some(Close)),
             Screen::Checking | Screen::Downloading { .. } | Screen::Verifying(_) => (&[Cancel], None),
-            Screen::Cancelling(_) | Screen::Installing(_) => (&[Cancel], None),
+            Screen::Cancelling(_) => (&[Close], None),
+            Screen::Installing(_) => (&[Cancel], None),
         }
     }
 
     /// The buttons that react (the others are drawn disabled).
     fn enabled(&self) -> bool {
-        !matches!(self.screen, Screen::Cancelling(_) | Screen::Installing(_))
+        !matches!(self.screen, Screen::Installing(_))
+    }
+
+    /// The button Enter presses: none in an unsolicited dialog.
+    fn default_button(&self) -> Option<Btn> {
+        if self.unsolicited { None } else { self.buttons().1 }
     }
 
     /// Advance on `ev`; returns what the driver must do, in order.
     pub fn on(&mut self, ev: In) -> Vec<Act> {
         use Screen as S;
-        if let In::Show(st) = ev {
-            if !self.busy() {
-                self.screen = st.into();
+        if let In::Open(req) = ev {
+            if self.busy() {
+                return Vec::new();
             }
-            return Vec::new();
+            return match req {
+                Request::Check if self.screen == S::Checking => Vec::new(),
+                req => {
+                    let acts;
+                    (*self, acts) = Machine::start(req);
+                    acts
+                }
+            };
         }
-        // The button the event stands for (Enter = the primary one).
+        // The button the event stands for.
         let btn = match &ev {
             In::Click(b) => Some(*b),
-            In::Enter => self.buttons().1,
+            In::Enter => self.default_button(),
             _ => None,
         };
         let busy = self.busy();
@@ -245,13 +295,14 @@ impl Machine {
             | (S::Downloading { rel, .. } | S::Verifying(rel), _, Some(Btn::Cancel)) => {
                 (S::Cancelling(rel), vec![Act::Cancel])
             }
-            // Verified before the cancel reached the worker: it installs now.
+            // Committed to installing before the cancel reached the worker.
             (S::Cancelling(rel), In::Fetched(Ok(())), _) => (S::Installing(rel), vec![]),
             (s @ S::Cancelling(_), In::Fetched(Err(_)), _) => (s, vec![Act::Close]),
-            (s @ S::Installing(_), In::Installed(Ok(Applied::RestartingNow)), _) => {
-                (s, vec![Act::QuitDaemon, Act::Close])
+            // Don't wait for a stalled download: the worker cleans up alone.
+            (s @ S::Cancelling(_), In::Dismiss, _) | (s @ S::Cancelling(_), _, Some(Btn::Close)) => {
+                (s, vec![Act::Close])
             }
-            (s @ S::Installing(_), In::Installed(Ok(Applied::OpenedPage)), _) => (s, vec![Act::Close]),
+            (s @ S::Installing(_), In::Installed(Ok(_)), _) => (s, vec![Act::Close]),
             (S::Installing(rel), In::Installed(Err(msg)), _) => (S::InstallFailed { rel, msg }, vec![]),
             (S::InstallFailed { rel, .. }, _, Some(Btn::Retry)) => {
                 (S::Downloading { rel: rel.clone(), got: 0, total: None }, vec![Act::Download(rel)])
@@ -272,15 +323,15 @@ impl Machine {
 struct View {
     /// Release-notes scroll offset (logical px).
     scroll: f32,
-    /// `notes_excerpt` of `notes_of`'s body.
-    notes: String,
+    /// `notes_lines` of `notes_of`'s body: (text, heading).
+    notes: Vec<(String, bool)>,
     notes_of: Option<String>,
 }
 
 impl View {
-    fn notes(&mut self, rel: &Release) -> &str {
+    fn notes(&mut self, rel: &Release) -> &[(String, bool)] {
         if self.notes_of.as_deref() != Some(&rel.version) {
-            self.notes = update::notes_excerpt(&rel.notes, NOTES_LINES);
+            self.notes = update::notes_lines(&rel.notes, NOTES_LINES);
             self.notes_of = Some(rel.version.clone());
             self.scroll = 0.0;
         }
@@ -298,97 +349,162 @@ enum Mark {
     Icon(&'static str, C4),
 }
 
-/// One frame of the dialog; returns the clicked button.
-fn paint(ui: &mut Ui, m: &Machine, v: &mut View) -> Option<Btn> {
-    let th = ui.theme;
-    let b = ui.bounds();
+/// What a screen shows: heading, release notes, message, progress line.
+struct Content<'a> {
+    mark: Mark,
+    title: String,
+    notes: Option<&'a Release>,
+    text: Option<String>,
+    /// Label and bar fraction while a download / install runs.
+    progress: Option<(String, f32)>,
+}
+
+fn content<'a>(m: &'a Machine, th: &Theme) -> Content<'a> {
     let available = |r: &Release| format!("Rustshot {} is available (you have {CURRENT})", r.version);
-    let (mark, title, rel, text): (Mark, String, Option<&Release>, Option<String>) = match &m.screen {
-        Screen::Checking => (Mark::App, "Checking for updates…".into(), None, None),
-        Screen::Available(r) => (Mark::App, available(r), Some(r), None),
-        Screen::Downloading { rel, .. }
-        | Screen::Verifying(rel)
-        | Screen::Cancelling(rel)
-        | Screen::Installing(rel) => (Mark::App, available(rel), Some(rel), None),
-        Screen::UpToDate => (
-            Mark::Icon("okc", th.success),
-            "Rustshot is up to date".into(),
-            None,
-            Some(format!("You have the latest version, {CURRENT}.")),
-        ),
-        Screen::Managed(store) => (
-            Mark::Icon("info", th.accent_fg),
-            format!("Rustshot {CURRENT}"),
-            None,
-            Some(format!("Updates for this install come from {store}.")),
-        ),
-        Screen::CheckFailed(e) => (Mark::Icon("alert", th.error), "Could not check for updates".into(), None, Some(e.clone())),
-        Screen::InstallFailed { rel, msg } => (
-            Mark::Icon("alert", th.error),
-            format!("Rustshot {} could not be installed", rel.version),
-            None,
-            Some(msg.clone()),
-        ),
-        Screen::SaveFailed(e) => {
-            (Mark::Icon("alert", th.error), "Could not save the setting".into(), None, Some(e.clone()))
-        }
+    let msg = |mark, title: String, text: &str| Content {
+        mark,
+        title,
+        notes: None,
+        text: Some(text.to_string()),
+        progress: None,
     };
-    let inner = b.w - 2.0 * PAD;
-    let btn_y = b.h - PAD - crate::ui::layout::H;
-    // Title line.
-    ui.area(FRect { x: PAD, y: PAD, w: inner, h: 32.0 }, |ui| {
-        ui.row(|ui| {
-            match mark {
-                Mark::App => {
-                    let r = ui.alloc(Some(ICON), crate::ui::layout::H);
-                    let s = ui.px(ICON);
-                    let c = th.accent;
-                    crate::tray::draw_glyph(&mut ui.fb, r.x, (r.y + (r.h - s) / 2.0).round(), s, c);
-                }
-                Mark::Icon(name, c) => ui.icon(name, ICON, c),
-            }
-            ui.space(4.0);
-            ui.heading(&title);
-        })
-    });
-    let top = PAD + 32.0 + 12.0;
-    // Progress line while a download / install runs.
-    let progress = match &m.screen {
-        Screen::Downloading { got, total, .. } => {
+    let busy = |rel, label: String, f: f32| Content {
+        mark: Mark::App,
+        title: available(rel),
+        notes: Some(rel),
+        text: None,
+        progress: Some((label, f)),
+    };
+    match &m.screen {
+        Screen::Checking => Content {
+            mark: Mark::App,
+            title: "Checking for updates…".into(),
+            notes: None,
+            text: Some(format!("You have {CURRENT}.")),
+            progress: None,
+        },
+        Screen::Available(r) => Content { mark: Mark::App, title: available(r), notes: Some(r), text: None, progress: None },
+        Screen::Downloading { rel, got, total } => {
             let s = match total {
                 Some(t) => format!("Downloading… {} of {}", mb(*got), mb(*t)),
                 None if *got > 0 => format!("Downloading… {}", mb(*got)),
                 None => "Downloading…".into(),
             };
-            Some((s, total.map_or(0.0, |t| *got as f32 / t.max(1) as f32)))
+            busy(rel, s, total.map_or(0.0, |t| *got as f32 / t.max(1) as f32))
         }
-        Screen::Verifying(_) => Some(("Verifying the download…".into(), 1.0)),
-        Screen::Cancelling(_) => Some(("Cancelling…".into(), 0.0)),
-        Screen::Installing(_) => Some(("Installing… Rustshot will restart.".into(), 1.0)),
-        _ => None,
-    };
-    let body_bottom = btn_y - 16.0 - if progress.is_some() { 40.0 } else { 0.0 };
-    if let Some(r) = rel {
-        let notes = v.notes(r).to_string();
-        let notes = if notes.is_empty() { "No release notes.".to_string() } else { notes };
+        Screen::Verifying(rel) => busy(rel, "Verifying the download…".into(), 1.0),
+        Screen::Cancelling(rel) => busy(rel, "Cancelling…".into(), 0.0),
+        Screen::Installing(rel) => busy(rel, "Installing… Rustshot will restart.".into(), 1.0),
+        Screen::UpToDate => msg(
+            Mark::Icon("okc", th.success),
+            "Rustshot is up to date".into(),
+            &format!("You have the latest version, {CURRENT}."),
+        ),
+        Screen::Managed(store) => msg(
+            Mark::Icon("info", th.accent_fg),
+            format!("Rustshot {CURRENT}"),
+            &format!("Updates for this install come from {store}."),
+        ),
+        Screen::CheckFailed(e) => msg(Mark::Icon("alert", th.error), "Could not check for updates".into(), e),
+        Screen::InstallFailed { rel, msg: e } => Content {
+            mark: Mark::Icon("alert", th.error),
+            title: format!("Rustshot {} could not be installed", rel.version),
+            notes: Some(rel),
+            text: Some(e.clone()),
+            progress: None,
+        },
+        Screen::SaveFailed(e) => msg(Mark::Icon("alert", th.error), "Could not save the setting".into(), e),
+    }
+}
+
+/// Where each part of a screen goes (logical px).
+#[derive(Clone, Copy, Debug)]
+struct Lay {
+    title: FRect,
+    text: Option<FRect>,
+    notes: Option<FRect>,
+    progress: Option<FRect>,
+    buttons: FRect,
+}
+
+/// Lay out `c` in the window: title on top, buttons at the bottom; release
+/// notes fill the space between (a failure message sits above them, the
+/// progress line below them). Screens without notes centre their title
+/// and message vertically above the buttons.
+fn layout(ui: &Ui, c: &Content) -> Lay {
+    let b = ui.bounds();
+    let inner = b.w - 2.0 * PAD;
+    let btn_y = b.h - PAD - crate::ui::layout::H;
+    let buttons = FRect { x: PAD, y: btn_y, w: inner, h: crate::ui::layout::H };
+    let bottom = btn_y - 16.0;
+    let text_w = inner - TEXT_X;
+    let text_h = |t: &str, max: f32| ui.paragraph_height(t, text_w).min(max.max(0.0));
+    let progress = c.progress.as_ref().map(|_| FRect { x: PAD, y: bottom - 32.0, w: inner, h: 32.0 });
+    let body_bottom = progress.map_or(bottom, |p| p.y - 12.0);
+    let mut lay = Lay { title: buttons, text: None, notes: None, progress, buttons };
+    if c.notes.is_some() {
+        lay.title = FRect { x: PAD, y: PAD, w: inner, h: TITLE_H };
+        let mut top = PAD + TITLE_H + 12.0;
+        if let Some(t) = &c.text {
+            // A failure: up to three lines of message, then the notes.
+            let r = FRect { x: PAD + TEXT_X, y: PAD + TITLE_H + 2.0, w: text_w, h: text_h(t, 60.0) };
+            top = r.y1() + 12.0;
+            lay.text = Some(r);
+        }
+        lay.notes = Some(FRect { x: PAD, y: top, w: inner, h: (body_bottom - top).max(40.0) });
+    } else {
+        let room = body_bottom - PAD;
+        let th = c.text.as_ref().map_or(0.0, |t| text_h(t, room - TITLE_H - 2.0));
+        let block = TITLE_H + if c.text.is_some() { 2.0 + th } else { 0.0 };
+        let y = PAD + ((room - block) / 2.0).max(0.0).floor();
+        lay.title = FRect { x: PAD, y, w: inner, h: TITLE_H };
+        lay.text = c.text.as_ref().map(|_| FRect { x: PAD + TEXT_X, y: y + TITLE_H + 2.0, w: text_w, h: th });
+    }
+    lay
+}
+
+/// One frame of the dialog; returns the clicked button.
+fn paint(ui: &mut Ui, m: &Machine, v: &mut View) -> Option<Btn> {
+    let th = ui.theme;
+    let c = content(m, th);
+    let lay = layout(ui, &c);
+    // Title line.
+    ui.area(lay.title, |ui| {
+        ui.row(|ui| {
+            match c.mark {
+                Mark::App => {
+                    let r = ui.alloc(Some(ICON), crate::ui::layout::H);
+                    let s = ui.px(ICON);
+                    let col = th.accent;
+                    crate::tray::draw_glyph(&mut ui.fb, r.x, (r.y + (r.h - s) / 2.0).round(), s, col);
+                }
+                Mark::Icon(name, col) => ui.icon(name, ICON, col),
+            }
+            ui.space(4.0);
+            ui.heading(&c.title);
+        })
+    });
+    if let (Some(t), Some(r)) = (&c.text, lay.text) {
+        ui.area(r, |ui| ui.height(r.h).paragraph(t, true));
+    }
+    if let (Some(rel), Some(r)) = (c.notes, lay.notes) {
+        v.notes(rel); // refresh for this release (resets the scroll)
         let mut scroll = v.scroll;
-        ui.place(FRect { x: PAD, y: top, w: inner, h: (body_bottom - top).max(40.0) }).text_view(
-            "notes",
-            &notes,
-            &mut scroll,
-        );
+        let notes = &v.notes;
+        let src: Vec<(&str, bool)> = if notes.is_empty() {
+            vec![("No release notes.", true)]
+        } else {
+            // Headings in the primary text colour, the rest secondary.
+            notes.iter().map(|(l, heading)| (l.as_str(), !heading)).collect()
+        };
+        ui.place(r).text_view_styled("notes", &src, &mut scroll);
         v.scroll = scroll;
     }
-    if let Some(t) = &text {
-        ui.area(FRect { x: PAD + ICON + 4.0 + 8.0, y: top - 8.0, w: inner - ICON - 12.0, h: btn_y - top }, |ui| {
-            ui.height(btn_y - 12.0 - (top - 8.0)).paragraph(t, true);
-        });
-    }
-    if let Some((s, f)) = progress {
-        ui.area(FRect { x: PAD, y: body_bottom + 10.0, w: inner, h: 40.0 }, |ui| {
+    if let (Some((s, f)), Some(r)) = (&c.progress, lay.progress) {
+        ui.area(r, |ui| {
             ui.lay.gap = 6.0;
-            ui.note(&s);
-            ui.progress(f);
+            ui.note(s);
+            ui.progress(*f);
         });
     }
     // Buttons, right-aligned.
@@ -396,9 +512,9 @@ fn paint(ui: &mut Ui, m: &Machine, v: &mut View) -> Option<Btn> {
     let gap = crate::ui::layout::GAP;
     let total: f32 = btns.iter().map(|b| ui.button_width(b.label())).sum::<f32>() + gap * (btns.len() as f32 - 1.0);
     let mut clicked = None;
-    ui.area(FRect { x: PAD, y: btn_y, w: inner, h: crate::ui::layout::H }, |ui| {
+    ui.area(lay.buttons, |ui| {
         ui.row(|ui| {
-            ui.space(inner - total);
+            ui.space(lay.buttons.w - total);
             ui.enabled = m.enabled();
             for &bt in btns {
                 if ui.button(bt.id(), bt.label(), Some(bt) == primary) {
@@ -413,10 +529,13 @@ fn paint(ui: &mut Ui, m: &Machine, v: &mut View) -> Option<Btn> {
 
 // --- Window -----------------------------------------------------------------
 
-/// The open dialog's inbox (`show` while open), if any.
+/// The open dialog's inbox, if any.
 static OPEN: Mutex<Option<Sender<In>>> = Mutex::new(None);
 /// The daemon's event sender: `Quit` after an update restarts us.
 static QUIT: Mutex<Option<Sender<HotEvent>>> = Mutex::new(None);
+/// Held by the download worker for its whole run: a new download waits
+/// until a cancelled one has cleaned up its files.
+static WORKER: Mutex<()> = Mutex::new(());
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -427,63 +546,93 @@ pub fn set_quit_sender(tx: Sender<HotEvent>) {
     *lock(&QUIT) = Some(tx);
 }
 
-/// End the daemon cleanly (tray icon removed, instance released); the
-/// relaunched version waits for this process to exit.
+/// End the daemon cleanly (tray icon removed, instance released; a capture
+/// in progress is finished first); the relaunched version waits for this
+/// process to exit.
 fn quit_daemon() {
     if let Some(tx) = lock(&QUIT).as_ref()
-        && tx.send(HotEvent::Quit).is_ok()
+        && tx.send(HotEvent::Restart).is_ok()
     {
         return;
     }
     std::process::exit(0);
 }
 
-/// Open the dialog with `state` on its own thread, or, when it is already
-/// open, hand it the new content and bring it to the front.
+/// Open the dialog with `state` (the user asked), or hand it to the open one.
 pub fn show(state: DialogState) {
+    request(Request::Show(state));
+}
+
+/// Open the dialog with `state` unasked (the daily check): no default button.
+pub fn offer(state: DialogState) {
+    request(Request::Offer(state));
+}
+
+/// Tray "Check for updates": the dialog opens at once ("Checking…") and
+/// shows the result; while a check runs, another one just raises it.
+pub fn check() {
+    request(Request::Check);
+}
+
+fn request(req: Request) {
     #[cfg(target_os = "macos")]
     {
-        match state {
+        let out = |state| match state {
             DialogState::Available(r) => update::open_url(&r.url),
             DialogState::UpToDate => eprintln!("Rustshot is up to date"),
             DialogState::Error(e) => eprintln!("update check failed: {e}"),
             DialogState::Managed(s) => eprintln!("Updates for this install come from {s}."),
+        };
+        match req {
+            Request::Show(s) | Request::Offer(s) => out(s),
+            Request::Check => {
+                std::thread::spawn(move || out(DialogState::from_check(update::check_now())));
+            }
         }
     }
     #[cfg(not(target_os = "macos"))]
     {
         let mut open = lock(&OPEN);
         if let Some(tx) = open.as_ref()
-            && tx.send(In::Show(state.clone())).is_ok()
+            && tx.send(In::Open(req.clone())).is_ok()
         {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
         *open = Some(tx.clone());
         drop(open);
-        std::thread::spawn(move || run_dialog(state, tx, rx));
+        std::thread::spawn(move || run_dialog(req, tx, rx));
     }
 }
 
-fn run_dialog(state: DialogState, tx: Sender<In>, rx: Receiver<In>) {
-    let h = if matches!(state, DialogState::Available(_)) { H_FULL } else { H_SHORT };
+fn run_dialog(req: Request, tx: Sender<In>, rx: Receiver<In>) {
     let th = crate::theme::resolve(&crate::config::load());
-    let mut d = Dialog::new(Machine::new(state), th, tx, rx);
-    let spec = WindowSpec { title: "Rustshot update".into(), w: W, h, resizable: false, min: (W, h) };
+    let (m, acts) = Machine::start(req);
+    let mut d = Dialog::new(m, th, tx, rx);
+    for a in acts {
+        d.perform(a);
+    }
+    let spec = WindowSpec { title: "Rustshot update".into(), w: W, h: H, resizable: false, min: (W, H) };
     if let Err(e) = wind::run_window(spec, &mut d) {
         eprintln!("rustshot: update dialog: {e:#}");
     }
-    d.cancel.store(true, Ordering::SeqCst);
-    // A `show` that raced the close still gets its dialog.
+    d.cancel();
+    // A request that raced the close still gets its dialog.
     let mut open = lock(&OPEN);
-    let late = d.rx.try_iter().filter_map(|e| if let In::Show(s) = e { Some(s) } else { None }).last();
+    let late = d.rx.try_iter().filter_map(|e| if let In::Open(r) = e { Some(r) } else { None }).last();
     *open = None;
     drop(open);
     drop(d);
-    if let Some(s) = late {
-        show(s);
+    if let Some(r) = late {
+        request(r);
     }
 }
+
+/// Download worker phases (shared with the dialog).
+const RUNNING: u8 = 0;
+const CANCELLED: u8 = 1;
+/// Verified and committed to installing: a cancel comes too late.
+const COMMITTED: u8 = 2;
 
 /// The `wind` driver: renders on every input event into `canvas` (the
 /// controls are immediate-mode), steps the machine and runs its actions.
@@ -499,10 +648,14 @@ struct Dialog {
     tx: Sender<In>,
     rx: Receiver<In>,
     queue: VecDeque<In>,
-    /// Abort flag of the running download.
-    cancel: Arc<AtomicBool>,
+    /// Phase of the running download (`RUNNING`, `CANCELLED`, `COMMITTED`).
+    phase: Arc<AtomicU8>,
     /// `Act::Close` seen: the window closes at the end of the callback.
     closing: bool,
+    /// The file "Skip this version" writes.
+    config: PathBuf,
+    /// When the window opened or its content last changed (Enter grace).
+    changed_at: Instant,
 }
 
 impl Dialog {
@@ -519,9 +672,21 @@ impl Dialog {
             tx,
             rx,
             queue: VecDeque::new(),
-            cancel: Arc::new(AtomicBool::new(false)),
+            phase: Arc::new(AtomicU8::new(CANCELLED)),
             closing: false,
+            config: crate::config::config_path(),
+            changed_at: Instant::now(),
         }
+    }
+
+    /// Stop the running download unless it already committed to installing.
+    fn cancel(&self) {
+        let _ = self.phase.compare_exchange(RUNNING, CANCELLED, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// Enter may press the default button (not right after a change).
+    fn enter_ready(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.changed_at) >= ENTER_GRACE
     }
 
     /// Feed queued events to the machine and run its actions.
@@ -529,11 +694,17 @@ impl Dialog {
         let mut any = false;
         while let Some(ev) = self.queue.pop_front() {
             any = true;
-            if matches!(ev, In::Show(_)) && !cfg!(test) {
+            let open = matches!(ev, In::Open(_));
+            if open && !cfg!(test) {
                 #[cfg(windows)]
                 wind::raise(self.hwnd);
             }
-            for a in self.m.on(ev) {
+            let before = (std::mem::discriminant(&self.m.screen), self.m.busy());
+            let acts = self.m.on(ev);
+            if (open && !before.1) || std::mem::discriminant(&self.m.screen) != before.0 {
+                self.changed_at = Instant::now();
+            }
+            for a in acts {
                 self.perform(a);
             }
         }
@@ -550,16 +721,16 @@ impl Dialog {
                 });
             }
             Act::Download(rel) => {
-                self.cancel = Arc::new(AtomicBool::new(false));
-                let (tx, cancel) = (self.tx.clone(), self.cancel.clone());
-                std::thread::spawn(move || download(rel, tx, cancel));
+                self.phase = Arc::new(AtomicU8::new(RUNNING));
+                let (tx, phase) = (self.tx.clone(), self.phase.clone());
+                std::thread::spawn(move || download(rel, tx, phase));
             }
-            Act::Cancel => self.cancel.store(true, Ordering::SeqCst),
+            Act::Cancel => self.cancel(),
             Act::Skip(v) => {
-                let r = crate::config::save_skip_version(&v).map_err(|e| format!("{}: {e}", crate::config::config_path().display()));
+                let r = crate::config::save_skip_version_at(&self.config, &v)
+                    .map_err(|e| format!("{}: {e}", self.config.display()));
                 self.queue.push_back(In::Skipped(r));
             }
-            Act::QuitDaemon => quit_daemon(),
         }
     }
 
@@ -587,7 +758,7 @@ impl Dialog {
                 self.queue.push_back(In::Click(b));
             } else if out.escape {
                 self.queue.push_back(In::Dismiss);
-            } else if out.enter {
+            } else if out.enter && self.enter_ready(Instant::now()) {
                 self.queue.push_back(In::Enter);
             }
             if !self.process() && !out.redraw {
@@ -605,19 +776,27 @@ impl Dialog {
 }
 
 /// Worker: pick the asset for this install, download and verify it, then
-/// install. No asset for this kind of install: open the release page.
-fn download(rel: Release, tx: Sender<In>, cancel: Arc<AtomicBool>) {
+/// install. No asset for this kind of install: open the release page. The
+/// dialog may close meanwhile (a cancel it no longer waits for): then
+/// nobody reads the reports, and the cleanup still happens here.
+fn download(rel: Release, tx: Sender<In>, phase: Arc<AtomicU8>) {
+    let _one = lock(&WORKER);
+    let commit = || phase.compare_exchange(RUNNING, COMMITTED, Ordering::SeqCst, Ordering::SeqCst).is_ok();
     let kind = update::detect_install();
     let Some(asset) = update::pick_asset(&kind, &rel).cloned() else {
-        update::open_url(&rel.url);
-        let _ = tx.send(In::Fetched(Ok(())));
-        let _ = tx.send(In::Installed(Ok(Applied::OpenedPage)));
+        if commit() {
+            update::open_url(&rel.url);
+            let _ = tx.send(In::Fetched(Ok(())));
+            let _ = tx.send(In::Installed(Ok(Applied::OpenedPage)));
+        } else {
+            let _ = tx.send(In::Fetched(Err(update::CANCELLED.into())));
+        }
         return;
     };
     let dir = match update_install::ensure_update_dir() {
         Ok(d) => d,
         Err(e) => {
-            let _ = tx.send(In::Fetched(Err(e)));
+            let _ = tx.send(In::Fetched(Err(format!("Download failed: {e}"))));
             return;
         }
     };
@@ -628,13 +807,16 @@ fn download(rel: Release, tx: Sender<In>, cancel: Arc<AtomicBool>) {
             last.set(got);
             let _ = tx.send(In::Progress(got, total));
         }
-        !cancel.load(Ordering::SeqCst)
+        phase.load(Ordering::SeqCst) != CANCELLED
     };
     match update::fetch_verified(&rel, &asset, &dir, &progress) {
-        Err(e) => {
+        Err(e) if e == update::CANCELLED => {
             let _ = tx.send(In::Fetched(Err(e)));
         }
-        Ok((file, _)) if cancel.load(Ordering::SeqCst) => {
+        Err(e) => {
+            let _ = tx.send(In::Fetched(Err(format!("Download failed: {e}"))));
+        }
+        Ok((file, _)) if !commit() => {
             let _ = std::fs::remove_file(&file);
             let _ = tx.send(In::Fetched(Err(update::CANCELLED.into())));
         }
@@ -644,7 +826,11 @@ fn download(rel: Release, tx: Sender<In>, cancel: Arc<AtomicBool>) {
             if r.is_err() {
                 let _ = std::fs::remove_file(&file);
             }
-            let _ = tx.send(In::Installed(r));
+            if r == Ok(Applied::RestartingNow) {
+                // Even when the dialog is gone: the new version waits for us.
+                quit_daemon();
+            }
+            let _ = tx.send(In::Installed(r.map_err(|e| format!("Install failed: {e}"))));
         }
     }
 }
@@ -652,6 +838,7 @@ fn download(rel: Release, tx: Sender<In>, cancel: Arc<AtomicBool>) {
 impl Driver for Dialog {
     fn on_create(&mut self, hwnd: Hwnd) {
         self.hwnd = hwnd;
+        self.changed_at = Instant::now();
     }
 
     fn on_event(&mut self, ev: Ev) -> bool {
@@ -706,7 +893,7 @@ impl Driver for Dialog {
     }
 
     fn on_quit(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
+        self.cancel();
     }
 }
 
@@ -720,7 +907,7 @@ mod tests {
         Release {
             version: v.into(),
             url: format!("https://github.com/nappsllc/rustshot/releases/tag/v{v}"),
-            notes: "## Highlights\n\n- Save straight into a dated folder (`%F`) with **Ctrl+S**\n- Shortcuts are configurable; conflicts are reported in Settings\n- In-app updates: download, verify the SHA-256 and restart\n\n## Fixes\n\n- The tray icon follows the taskbar theme\n- Text annotations use the system font renderer for every script\n- Faster overlay on multi-monitor setups\n- Smaller binary\n".into(),
+            notes: "## Highlights\n\n- Save straight into a dated folder (`%F`) with **Ctrl+S**\n- Shortcuts are configurable; conflicts are reported in Settings\n- In-app updates: download, verify the SHA-256 and restart\n\n\n\n## Fixes\n\n- The tray icon follows the taskbar theme\n- Text annotations use the system font renderer for every script\n- Faster overlay on multi-monitor setups\n- Smaller binary\n".into(),
             assets: vec![Asset { name: format!("rustshot-{v}-setup.exe"), url: "u".into(), size: 3_400_000 }],
         }
     }
@@ -743,9 +930,11 @@ mod tests {
         assert!(matches!(m.screen, Screen::Installing(_)));
         assert_eq!(m.on(In::Dismiss), vec![]);
         assert_eq!(m.on(In::Click(Btn::Cancel)), vec![]);
-        m.on(In::Show(DialogState::UpToDate));
+        m.on(In::Open(Request::Show(DialogState::UpToDate)));
+        m.on(In::Open(Request::Check));
         assert!(matches!(m.screen, Screen::Installing(_)));
-        assert_eq!(m.on(In::Installed(Ok(Applied::RestartingNow))), vec![Act::QuitDaemon, Act::Close]);
+        // The worker has already asked the daemon to quit; the dialog closes.
+        assert_eq!(m.on(In::Installed(Ok(Applied::RestartingNow))), vec![Act::Close]);
     }
 
     #[test]
@@ -761,18 +950,55 @@ mod tests {
     }
 
     #[test]
+    fn unsolicited_dialog_has_no_default_button() {
+        let (mut m, acts) = Machine::start(Request::Offer(DialogState::Available(rel("9.9.9"))));
+        assert_eq!(acts, vec![]);
+        assert_eq!(m.on(In::Enter), vec![], "Enter never updates");
+        assert_eq!(m.screen, Screen::Available(rel("9.9.9")));
+        // Clicks (and Tab + Enter on a focused button, which is a click) work.
+        assert_eq!(m.clone().on(In::Click(Btn::Update)), vec![Act::Download(rel("9.9.9"))]);
+        assert_eq!(m.clone().on(In::Dismiss), vec![Act::Close]);
+        // Offered onto a dialog the user opened: unsolicited from then on.
+        let mut m = Machine::new(DialogState::UpToDate);
+        m.on(In::Open(Request::Offer(DialogState::Available(rel("9.9.9")))));
+        assert_eq!(m.on(In::Enter), vec![]);
+        // Shown by the user again: Enter is the primary button again.
+        m.on(In::Open(Request::Show(DialogState::Available(rel("9.9.9")))));
+        assert_eq!(m.on(In::Enter), vec![Act::Download(rel("9.9.9"))]);
+    }
+
+    #[test]
+    fn tray_check_opens_checking_and_repeats_only_raise() {
+        let (mut m, acts) = Machine::start(Request::Check);
+        assert_eq!((m.screen.clone(), acts), (Screen::Checking, vec![Act::Check]));
+        // A second click while checking: no second check.
+        assert_eq!(m.on(In::Open(Request::Check)), vec![]);
+        m.on(In::Checked(Ok(Some(rel("9.9.9")))));
+        assert_eq!(m.screen, Screen::Available(rel("9.9.9")));
+        assert_eq!(m.on(In::Enter), vec![Act::Download(rel("9.9.9"))], "the user asked: Enter updates");
+        // A click on a finished result checks again.
+        let mut m = Machine::new(DialogState::UpToDate);
+        assert_eq!(m.on(In::Open(Request::Check)), vec![Act::Check]);
+        assert_eq!(m.screen, Screen::Checking);
+    }
+
+    #[test]
     fn cancel_mid_download_aborts_then_closes() {
         let mut m = avail();
         m.on(In::Click(Btn::Update));
         m.on(In::Progress(500, Some(4000)));
         assert_eq!(m.on(In::Click(Btn::Cancel)), vec![Act::Cancel]);
         assert!(matches!(m.screen, Screen::Cancelling(_)));
-        // Stale progress and a second cancel change nothing.
+        // Stale progress changes nothing.
         assert_eq!(m.on(In::Progress(600, Some(4000))), vec![]);
-        assert_eq!(m.on(In::Click(Btn::Cancel)), vec![]);
-        assert_eq!(m.on(In::Dismiss), vec![]);
+        assert!(matches!(m.screen, Screen::Cancelling(_)));
         // The worker stops (deleting the partial file) and reports it.
-        assert_eq!(m.on(In::Fetched(Err(update::CANCELLED.into()))), vec![Act::Close]);
+        assert_eq!(m.clone().on(In::Fetched(Err(update::CANCELLED.into()))), vec![Act::Close]);
+        // Close / Esc while cancelling: the window goes at once (the worker
+        // finishes its cleanup alone).
+        assert_eq!(m.clone().on(In::Dismiss), vec![Act::Close]);
+        assert_eq!(m.clone().on(In::Click(Btn::Close)), vec![Act::Close]);
+        assert!(m.enabled(), "Close is clickable while cancelling");
         // The close button during a download cancels too.
         let mut m = avail();
         m.on(In::Click(Btn::Update));
@@ -785,10 +1011,24 @@ mod tests {
         m.on(In::Click(Btn::Update));
         m.on(In::Progress(4000, Some(4000)));
         assert_eq!(m.on(In::Click(Btn::Cancel)), vec![Act::Cancel]);
-        // Verified before the worker saw the flag: the install goes ahead.
+        // Committed before the worker saw the flag: the install goes ahead.
         m.on(In::Fetched(Ok(())));
         assert!(matches!(m.screen, Screen::Installing(_)));
-        assert_eq!(m.on(In::Installed(Ok(Applied::RestartingNow))), vec![Act::QuitDaemon, Act::Close]);
+        assert_eq!(m.on(In::Installed(Ok(Applied::RestartingNow))), vec![Act::Close]);
+    }
+
+    #[test]
+    fn worker_phase_decides_cancel_or_install() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut d = Dialog::new(avail(), crate::theme::DARK, tx, rx);
+        d.phase = Arc::new(AtomicU8::new(RUNNING));
+        d.perform(Act::Cancel);
+        assert_eq!(d.phase.load(Ordering::SeqCst), CANCELLED);
+        // Committed first: a later cancel (or the window closing) can't undo it.
+        d.phase.store(COMMITTED, Ordering::SeqCst);
+        d.perform(Act::Cancel);
+        d.on_quit();
+        assert_eq!(d.phase.load(Ordering::SeqCst), COMMITTED);
     }
 
     #[test]
@@ -803,12 +1043,64 @@ mod tests {
         assert_eq!(m.on(In::Click(Btn::Close)), vec![Act::Close]);
     }
 
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rustshot-dlg-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The driver runs `Act::Skip` against its config file and closes.
     #[test]
-    fn skip_action_writes_skip_version() {
-        // What the driver does for Act::Skip, on a scratch config text.
-        let text = crate::config::to_toml(&crate::config::Config::default());
-        let out = crate::config::with_skip_version(&text, "9.9.9");
-        assert_eq!(crate::config::parse_config(&out).unwrap().skip_version, "9.9.9");
+    fn driver_skip_writes_the_config_and_closes() {
+        let dir = scratch("skip");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut d = Dialog::new(avail(), crate::theme::DARK, tx, rx);
+        d.config = dir.join("config.toml");
+        std::fs::write(&d.config, "# keep me\ntheme = \"light\"\n").unwrap();
+        d.queue.push_back(In::Click(Btn::Skip));
+        assert!(d.process());
+        assert!(d.closing);
+        let text = std::fs::read_to_string(&d.config).unwrap();
+        assert_eq!(text, "# keep me\ntheme = \"light\"\nskip_version = \"9.9.9\"\n");
+        // Unwritable (a directory): the error is shown, the window stays.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut d = Dialog::new(avail(), crate::theme::DARK, tx, rx);
+        d.config = dir.clone();
+        d.queue.push_back(In::Click(Btn::Skip));
+        d.process();
+        assert!(!d.closing);
+        assert!(matches!(&d.m.screen, Screen::SaveFailed(e) if e.starts_with(&dir.display().to_string())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enter_waits_out_the_grace_after_changes() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut d = Dialog::new(Machine::new(DialogState::UpToDate), crate::theme::DARK, tx, rx);
+        let t0 = d.changed_at;
+        assert!(!d.enter_ready(t0 + Duration::from_millis(100)));
+        assert!(d.enter_ready(t0 + ENTER_GRACE));
+        // New content restarts the grace.
+        std::thread::sleep(Duration::from_millis(5));
+        d.queue.push_back(In::Open(Request::Show(DialogState::Available(rel("9.9.9")))));
+        d.process();
+        assert!(d.changed_at > t0);
+        assert!(!d.enter_ready(t0 + ENTER_GRACE));
+        // So does a screen change (Retry → Checking → result).
+        let t1 = d.changed_at;
+        std::thread::sleep(Duration::from_millis(5));
+        d.m = Machine::start(Request::Check).0;
+        d.queue.push_back(In::Checked(Ok(None)));
+        d.process();
+        assert!(d.changed_at > t1);
+        // Progress within a screen does not.
+        d.m = avail();
+        d.m.on(In::Click(Btn::Update));
+        let t2 = d.changed_at;
+        d.queue.push_back(In::Progress(10, Some(100)));
+        d.process();
+        assert_eq!(d.changed_at, t2);
     }
 
     #[test]
@@ -858,12 +1150,12 @@ mod tests {
     }
 
     #[test]
-    fn show_replaces_content_unless_busy() {
+    fn open_replaces_content_unless_busy() {
         let mut m = Machine::new(DialogState::UpToDate);
-        m.on(In::Show(DialogState::Available(rel("9.9.9"))));
+        m.on(In::Open(Request::Show(DialogState::Available(rel("9.9.9")))));
         assert_eq!(m.screen, Screen::Available(rel("9.9.9")));
         m.on(In::Click(Btn::Update));
-        m.on(In::Show(DialogState::Error("x".into())));
+        m.on(In::Open(Request::Show(DialogState::Error("x".into()))));
         assert!(matches!(m.screen, Screen::Downloading { .. }));
     }
 
@@ -878,62 +1170,114 @@ mod tests {
 
     /// Render `m` two frames (focus order, then the picture); returns the
     /// image and the button clicked by `input` on the second frame.
-    fn render(m: &Machine, th: &Theme, k: f32, h: u32, input: &Input) -> (PixBuf, Option<Btn>) {
+    fn render(m: &Machine, th: &Theme, k: f32, input: &Input) -> (PixBuf, Option<Btn>) {
         let mut focus = FocusState::default();
         let mut v = View::default();
-        preview::render(W, h, k, th, &Input::default(), &mut focus, |ui| {
+        preview::render(W, H, k, th, &Input::default(), &mut focus, |ui| {
             paint(ui, m, &mut v);
         });
         let mut clicked = None;
-        let img = preview::render(W, h, k, th, input, &mut focus, |ui| clicked = paint(ui, m, &mut v));
+        let img = preview::render(W, H, k, th, input, &mut focus, |ui| clicked = paint(ui, m, &mut v));
         (img, clicked)
     }
 
-    fn screens() -> Vec<(&'static str, Machine, u32)> {
+    fn screens() -> Vec<(&'static str, Machine)> {
         let r = rel("0.1.2");
-        let at = |s: Screen| Machine { screen: s };
+        let at = |s: Screen| Machine { screen: s, unsolicited: false };
         vec![
-            ("available", at(Screen::Available(r.clone())), H_FULL),
-            ("downloading", at(Screen::Downloading { rel: r.clone(), got: 1_234_567, total: Some(3_400_000) }), H_FULL),
-            ("verifying", at(Screen::Verifying(r.clone())), H_FULL),
-            ("cancelling", at(Screen::Cancelling(r.clone())), H_FULL),
-            ("installing", at(Screen::Installing(r.clone())), H_FULL),
+            ("available", at(Screen::Available(r.clone()))),
+            ("downloading", at(Screen::Downloading { rel: r.clone(), got: 1_234_567, total: Some(3_400_000) })),
+            ("verifying", at(Screen::Verifying(r.clone()))),
+            ("cancelling", at(Screen::Cancelling(r.clone()))),
+            ("installing", at(Screen::Installing(r.clone()))),
             (
                 "install-failed",
                 at(Screen::InstallFailed {
                     rel: r.clone(),
-                    msg: "rustshot-0.1.2-setup.exe failed its SHA-256 check; refusing to install".into(),
+                    msg: "Download failed: rustshot-0.1.2-setup.exe failed its SHA-256 check; refusing to install".into(),
                 }),
-                H_FULL,
             ),
-            ("uptodate", at(Screen::UpToDate), H_SHORT),
-            ("managed", at(Screen::Managed("Microsoft Store")), H_SHORT),
+            ("uptodate", at(Screen::UpToDate)),
+            ("managed", at(Screen::Managed("Microsoft Store"))),
             (
                 "error",
                 at(Screen::CheckFailed(
                     "WinHttpSendRequest: The server name or address could not be resolved (0x80072EE7)".into(),
                 )),
-                H_SHORT,
             ),
-            ("checking", at(Screen::Checking), H_SHORT),
-            ("save-failed", at(Screen::SaveFailed(r"C:\Users\denis\AppData\Roaming\rustshot\config.toml: Access is denied. (os error 5)".into())), H_SHORT),
+            ("checking", at(Screen::Checking)),
+            ("save-failed", at(Screen::SaveFailed(r"C:\Users\denis\AppData\Roaming\rustshot\config.toml: Access is denied. (os error 5)".into()))),
         ]
     }
 
     #[test]
     fn preview_dialog_pngs() {
         for (tname, th) in [("dark", &crate::theme::DARK), ("light", &crate::theme::LIGHT)] {
-            for (name, m, h) in screens() {
-                let (img, _) = render(&m, th, 1.0, h, &Input::default());
+            for (name, m) in screens() {
+                let (img, _) = render(&m, th, 1.0, &Input::default());
                 // Something besides the background was drawn.
                 let bg = th.surface;
                 assert!(img.as_raw().as_chunks::<4>().0.iter().any(|p| p[..3] != [bg.r, bg.g, bg.b]), "{name}");
                 preview::save(&format!("update-{name}-{tname}.png"), &img);
             }
         }
-        let (name, m, h) = screens().remove(0);
-        let (img, _) = render(&m, &crate::theme::DARK, 1.5, h, &Input::default());
-        preview::save(&format!("update-{name}-dark-150.png"), &img);
+        for (name, m) in screens().into_iter().filter(|(n, _)| ["available", "install-failed", "error"].contains(n)) {
+            let (img, _) = render(&m, &crate::theme::DARK, 1.5, &Input::default());
+            preview::save(&format!("update-{name}-dark-150.png"), &img);
+        }
+    }
+
+    fn overlap(a: FRect, b: FRect) -> bool {
+        a.x < b.x1() && b.x < a.x1() && a.y < b.y1() && b.y < a.y1()
+    }
+
+    /// No part of any screen overlaps another or leaves the window, with
+    /// short and very long messages, at 100 % and 150 %.
+    #[test]
+    fn layout_parts_never_overlap() {
+        let long = "word ".repeat(80);
+        let mut cases = screens();
+        let r = rel("0.1.2");
+        let at = |s: Screen| Machine { screen: s, unsolicited: false };
+        cases.push(("long-error", at(Screen::CheckFailed(long.clone()))));
+        cases.push(("long-install-failed", at(Screen::InstallFailed { rel: r.clone(), msg: long.clone() })));
+        cases.push(("short-install-failed", at(Screen::InstallFailed { rel: r, msg: "x".into() })));
+        for k in [1.0f32, 1.5] {
+            for (name, m) in &cases {
+                let mut lay = None;
+                let mut has_text = false;
+                let mut focus = FocusState::default();
+                preview::render(W, H, k, &crate::theme::DARK, &Input::default(), &mut focus, |ui| {
+                    let c = content(m, ui.theme);
+                    has_text = c.text.is_some();
+                    lay = Some(layout(ui, &c));
+                });
+                let lay = lay.unwrap();
+                let parts: Vec<(&str, FRect)> = [("title", Some(lay.title)), ("text", lay.text), ("notes", lay.notes)]
+                    .into_iter()
+                    .chain([("progress", lay.progress), ("buttons", Some(lay.buttons))])
+                    .filter_map(|(n, r)| r.map(|r| (n, r)))
+                    .collect();
+                let win = FRect { x: 0.0, y: 0.0, w: W as f32, h: H as f32 };
+                for (i, &(a, ra)) in parts.iter().enumerate() {
+                    assert!(ra.x >= PAD - 0.01 && ra.x1() <= win.x1() - PAD + 0.01, "{name} {a} {ra:?}");
+                    assert!(ra.y >= PAD - 0.01 && ra.y1() <= win.y1() - PAD + 0.01, "{name} {a} {ra:?}");
+                    for &(b, rb) in &parts[i + 1..] {
+                        assert!(!overlap(ra, rb), "{name} k={k}: {a} {ra:?} overlaps {b} {rb:?}");
+                    }
+                }
+                assert_eq!(lay.text.is_some(), has_text, "{name}");
+                if let Some(t) = lay.text {
+                    assert!(t.h >= 20.0, "{name}: at least one line of message");
+                }
+                if let Some(n) = lay.notes {
+                    assert!(n.h >= 40.0, "{name}: notes box keeps some height");
+                }
+                if name.contains("install-failed") {
+                    assert!(lay.notes.is_some(), "{name}: the notes stay visible");
+                }
+            }
+        }
     }
 
     /// Clicking where each button is drawn reports it (layout and hit
@@ -943,13 +1287,13 @@ mod tests {
         for k in [1.0f32, 1.5] {
             let m = avail();
             // Right-aligned row: Cancel is rightmost, ending at W - PAD.
-            let y = ((H_FULL as f32 - PAD - 16.0) * k) as i32;
+            let y = ((H as f32 - PAD - 16.0) * k) as i32;
             let x = ((W as f32 - PAD - 20.0) * k) as i32;
             let mut input = Input::default();
             for e in [Ev::Move { x, y }, Ev::Down { x, y }, Ev::Up { x, y }] {
                 input.feed(&e);
             }
-            let (_, clicked) = render(&m, &crate::theme::DARK, k, H_FULL, &input);
+            let (_, clicked) = render(&m, &crate::theme::DARK, k, &input);
             assert_eq!(clicked, Some(Btn::Cancel), "k={k}");
         }
     }
@@ -958,9 +1302,13 @@ mod tests {
     fn notes_are_the_excerpt() {
         let mut v = View::default();
         let r = rel("9.9.9");
-        let n = v.notes(&r).to_string();
-        assert!(n.starts_with("Highlights\n\n- Save straight"));
-        assert!(n.lines().count() <= NOTES_LINES);
+        let n = v.notes(&r).to_vec();
+        assert_eq!(n[0], ("Highlights".to_string(), true));
+        assert!(n[1].0.starts_with("- Save straight") && !n[1].1);
+        assert!(n.len() <= NOTES_LINES);
+        // The run of blank lines before "Fixes" is one blank line.
+        let fixes = n.iter().position(|l| l.0 == "Fixes").unwrap();
+        assert!(n[fixes].1 && n[fixes - 1].0.is_empty() && !n[fixes - 2].0.is_empty());
         v.scroll = 30.0;
         v.notes(&r);
         assert_eq!(v.scroll, 30.0, "same release keeps the scroll");

@@ -48,16 +48,13 @@ pub fn open_path(path: &Path) {
     let _ = cmd.spawn();
 }
 
-/// Tray "Check for updates": check on a worker thread, then show the
-/// result in the update dialog (store installs: who updates them).
+/// Tray "Check for updates": the update dialog opens at once and shows
+/// the result of the check (store installs: who updates them).
 pub fn check_updates() {
-    std::thread::spawn(|| {
-        let state = match crate::update::managed_install() {
-            Some(store) => DialogState::Managed(store),
-            None => DialogState::from_check(crate::update::check_now()),
-        };
-        crate::update_ui::show(state);
-    });
+    match crate::update::managed_install() {
+        Some(store) => crate::update_ui::show(DialogState::Managed(store)),
+        None => crate::update_ui::check(),
+    }
 }
 
 /// Flip "Start at login"; returns the new state.

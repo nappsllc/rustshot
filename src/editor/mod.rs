@@ -183,6 +183,7 @@ pub fn run(
         upload_slot,
         updates,
         update_pending: None,
+        restart_pending: false,
         font,
         ui_font,
         notice: None,
@@ -230,6 +231,9 @@ struct App {
     updates: Option<Receiver<crate::update::Release>>,
     /// A newer release found; shown in the update dialog once no capture is up.
     update_pending: Option<crate::update::Release>,
+    /// An installed update asked us to quit (`HotEvent::Restart`); done
+    /// once no capture is open.
+    restart_pending: bool,
     font: Option<AnnotFont>,
     ui_font: Option<&'static UiFont>,
     notice: Option<Toast>,
@@ -257,7 +261,9 @@ impl App {
                 self.request_exit(0);
                 return;
             }
-            Some(HotEvent::Capture) if matches!(self.st, State::Hidden) => {
+            Some(HotEvent::Restart) => self.restart_pending = true,
+            // No new capture once the update restarts us.
+            Some(HotEvent::Capture) if matches!(self.st, State::Hidden) && !self.restart_pending => {
                 self.pending = Some(Pending::editor());
             }
             _ => {}
@@ -273,7 +279,7 @@ impl App {
             && self.pending.is_none()
             && let Some(r) = self.update_pending.take()
         {
-            crate::update_ui::show(crate::update_ui::DialogState::Available(r));
+            crate::update_ui::offer(crate::update_ui::DialogState::Available(r));
         }
         if self.notice.as_ref().is_some_and(|t| t.expired(Instant::now())) {
             self.notice = None;
@@ -310,6 +316,21 @@ impl App {
                 }
             }
         }
+        // An update is restarting us: quit as soon as no capture is open
+        // (never under the user's open capture or export).
+        if self.restart_due() {
+            self.request_exit(0);
+        }
+    }
+
+    /// A pending restart may happen now: no capture is open or about to
+    /// open. Clears the request when it says yes.
+    fn restart_due(&mut self) -> bool {
+        let due = self.restart_pending && matches!(self.st, State::Hidden) && self.pending.is_none();
+        if due {
+            self.restart_pending = false;
+        }
+        due
     }
 
     /// Timer tick: poll, then report whether the screen needs a new frame
@@ -1901,6 +1922,23 @@ mod tests {
         preview_app_with(th, sel, synthetic_shot())
     }
 
+    /// An update's restart never quits under an open capture: it waits
+    /// until the editor is hidden again.
+    #[test]
+    fn restart_waits_for_the_open_capture() {
+        let mut app = preview_app(theme::DARK, None);
+        assert!(!app.restart_due(), "nothing asked");
+        app.restart_pending = true;
+        assert!(!app.restart_due(), "capture open");
+        assert!(app.restart_pending);
+        app.st = State::Hidden;
+        app.pending = Some(Pending::editor());
+        assert!(!app.restart_due(), "capture about to open");
+        app.pending = None;
+        assert!(app.restart_due(), "idle: quit now");
+        assert!(!app.restart_pending && !app.restart_due(), "once");
+    }
+
     fn preview_app_with(th: Theme, sel: Option<FRect>, shot: Shot) -> App {
         let theme_name = if th == theme::DARK { "dark" } else { "light" };
         let cfg = Config { theme: theme_name.into(), ..Config::default() };
@@ -1961,6 +1999,7 @@ mod tests {
             upload_slot: Arc::new(Mutex::new(None)),
             updates: None,
             update_pending: None,
+            restart_pending: false,
             font,
             ui_font,
             notice: None,

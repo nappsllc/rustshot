@@ -361,9 +361,17 @@ fn strip_inline(s: &str) -> String {
 /// The first `max_lines` lines of release notes as plain text: headings,
 /// bullets, quotes, links, emphasis, code fences and HTML comments stripped;
 /// runs of blank lines collapsed.
-#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no dialog yet (main-thread windows)
+#[cfg(test)]
 pub fn notes_excerpt(body: &str, max_lines: usize) -> String {
-    let mut out: Vec<String> = Vec::new();
+    let lines: Vec<String> = notes_lines(body, max_lines).into_iter().map(|(l, _)| l).collect();
+    lines.join("\n")
+}
+
+/// [`notes_excerpt`] line by line, each with whether it was a markdown
+/// heading (the dialog draws those stronger; no blank line under them).
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no dialog yet (main-thread windows)
+pub fn notes_lines(body: &str, max_lines: usize) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = Vec::new();
     let mut in_comment = false;
     for raw in body.lines() {
         // Drop <!-- ... --> (possibly spanning lines).
@@ -403,9 +411,11 @@ pub fn notes_excerpt(body: &str, max_lines: usize) -> String {
             t = r.trim_start();
         }
         let mut prefix = "";
+        let mut heading = false;
         let hashes = t.len() - t.trim_start_matches('#').len();
         if (1..=6).contains(&hashes) && t[hashes..].starts_with([' ', '\t']) {
             t = t[hashes..].trim_start();
+            heading = true;
         } else if let Some(r) = t.strip_prefix(['-', '*', '+']).filter(|r| r.starts_with(' ')) {
             prefix = "- ";
             t = r.trim_start();
@@ -413,21 +423,22 @@ pub fn notes_excerpt(body: &str, max_lines: usize) -> String {
         let text = strip_inline(t);
         let text = text.trim();
         if text.is_empty() {
-            if out.last().is_some_and(|l| !l.is_empty()) {
-                out.push(String::new());
+            // One blank between paragraphs; none right under a heading.
+            if out.last().is_some_and(|l| !l.0.is_empty() && !l.1) {
+                out.push((String::new(), false));
             }
         } else {
-            out.push(format!("{prefix}{text}"));
+            out.push((format!("{prefix}{text}"), heading));
         }
     }
-    while out.last().is_some_and(|l| l.is_empty()) {
+    while out.last().is_some_and(|l| l.0.is_empty()) {
         out.pop();
     }
     out.truncate(max_lines);
-    while out.last().is_some_and(|l| l.is_empty()) {
+    while out.last().is_some_and(|l| l.0.is_empty()) {
         out.pop();
     }
-    out.join("\n")
+    out
 }
 
 // --- Install kind and asset choice ------------------------------------------
@@ -1204,6 +1215,23 @@ mod tests {
         assert_eq!(notes_excerpt("a\n\nb", 2), "a");
         assert_eq!(notes_excerpt("", 12), "");
         assert_eq!(notes_excerpt("<!-- multi\nline -->\n#nohash\nok", 12), "#nohash\nok");
+    }
+
+    #[test]
+    fn notes_lines_mark_headings_and_collapse_blanks() {
+        let body = "\n\n## Highlights\n\n \n\t\n<!-- x -->\n- one\n\n\n---\n\n### Fixes\n- two\n#nohash\n\n";
+        let l = |s: &str, h: bool| (s.to_string(), h);
+        assert_eq!(
+            notes_lines(body, 12),
+            vec![
+                l("Highlights", true),
+                l("- one", false),
+                l("", false),
+                l("Fixes", true),
+                l("- two", false),
+                l("#nohash", false),
+            ]
+        );
     }
 
     fn rel_with(names: &[&str]) -> Release {

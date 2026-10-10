@@ -164,19 +164,21 @@ pub fn load() -> Config {
     }
 }
 
-/// "Skip this version": set `skip_version` in `config.toml`, editing only
-/// that line (comments, unknown keys and even an invalid rest of the file
-/// stay as they are; a missing file is created with defaults). Written
-/// atomically.
-pub fn save_skip_version(version: &str) -> std::io::Result<()> {
-    let path = config_path();
-    let text = match std::fs::read_to_string(&path) {
+/// "Skip this version": set `skip_version` in the config file at `path`
+/// (normally [`config_path`]), editing only that line (comments, unknown
+/// keys and even an invalid rest of the file stay as they are; a missing
+/// file is created with defaults). Written atomically.
+#[cfg_attr(target_os = "macos", allow(dead_code))] // macOS: no update dialog yet
+pub fn save_skip_version_at(path: &std::path::Path, version: &str) -> std::io::Result<()> {
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => to_toml(&Config::default()),
         Err(e) => return Err(e),
     };
-    std::fs::create_dir_all(config_dir())?;
-    write_atomic(&path, with_skip_version(&text, version).as_bytes())
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    write_atomic(path, with_skip_version(&text, version).as_bytes())
 }
 
 /// `text` with its top-level `skip_version` line replaced by `version`
@@ -218,19 +220,35 @@ pub fn with_skip_version(text: &str, version: &str) -> String {
     out
 }
 
-/// Replace `path` with `bytes` via a sibling temp file and a rename, so a
-/// crash never leaves a half-written file.
+/// Replace `path` with `bytes` via a uniquely named temp file in the same
+/// directory and a rename, so a crash never leaves a half-written file. A
+/// symlinked `path` is written through to its target (the link stays); on
+/// Unix the file keeps its permission bits.
 pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let path = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path).or_else(|_| {
+            // Dangling link: its target, relative to the link's directory.
+            let t = std::fs::read_link(path)?;
+            Ok::<_, std::io::Error>(path.parent().map_or(t.clone(), |d| d.join(&t)))
+        })?,
+        _ => path.to_path_buf(),
+    };
+    let name = path.file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned());
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{name}.{}.{seq}.tmp", std::process::id()));
     let r = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        #[cfg(unix)]
+        if let Ok(m) = std::fs::metadata(&path) {
+            f.set_permissions(m.permissions())?;
+        }
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, &path)
     })();
     if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -632,15 +650,103 @@ mod tests {
         assert_eq!(d, "# skip_version = \"0\"\nskip_version = \"3.0.0\"\n");
     }
 
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rustshot-cfg-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Only the target file is in `dir` (no temp file left behind).
+    fn only(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> =
+            std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
     #[test]
     fn write_atomic_replaces_the_file() {
-        let dir = std::env::temp_dir().join(format!("rustshot-atomic-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("atomic");
         let p = dir.join("config.toml");
         std::fs::write(&p, "old").unwrap();
         write_atomic(&p, b"new").unwrap();
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "new");
-        assert!(!dir.join("config.toml.tmp").exists());
+        write_atomic(&p, b"newer").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "newer");
+        assert_eq!(only(&dir), ["config.toml"]);
+        // A missing file is created.
+        write_atomic(&dir.join("fresh.toml"), b"x").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("fresh.toml")).unwrap(), "x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_keeps_mode_and_writes_through_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("atomic-unix");
+        let real = dir.join("real.toml");
+        std::fs::write(&real, "old").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("config.toml");
+        std::os::unix::fs::symlink("real.toml", &link).unwrap();
+        write_atomic(&link, b"new").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link stays");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(only(&dir), ["config.toml", "real.toml"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_atomic_writes_through_symlinks() {
+        let dir = scratch("atomic-link");
+        let real = dir.join("real.toml");
+        std::fs::write(&real, "old").unwrap();
+        let link = dir.join("config.toml");
+        // Needs Developer Mode or admin rights; skip when not allowed.
+        if std::os::windows::fs::symlink_file(&real, &link).is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        write_atomic(&link, b"new").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link stays");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        assert_eq!(only(&dir), ["config.toml", "real.toml"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_skip_version_edits_the_file_in_place() {
+        let dir = scratch("skip");
+        let p = dir.join("config.toml");
+        std::fs::write(&p, "# mine
+theme = \"dark\"
+skip_version = \"0.1.0\"
+bogus = 1
+").unwrap();
+        save_skip_version_at(&p, "9.9.9").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "# mine
+theme = \"dark\"
+skip_version = \"9.9.9\"
+bogus = 1
+");
+        assert_eq!(only(&dir), ["config.toml"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_skip_version_creates_a_missing_file() {
+        let dir = scratch("skip-missing");
+        let p = dir.join("sub").join("config.toml");
+        save_skip_version_at(&p, "9.9.9").unwrap();
+        let cfg = parse_config(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(cfg.skip_version, "9.9.9");
+        assert_eq!(cfg.save_format, Config::default().save_format, "the rest are defaults");
+        assert_eq!(only(&dir.join("sub")), ["config.toml"]);
+        // A path that cannot be a file reports the error.
+        assert!(save_skip_version_at(&dir, "1.0.0").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

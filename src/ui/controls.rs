@@ -798,22 +798,40 @@ impl Ui<'_> {
         }
     }
 
+    /// Height `paragraph` takes for `s` at width `w` (logical px).
+    pub fn paragraph_height(&self, s: &str, w: f32) -> f32 {
+        wrap(s, w, |t| tw(self, text_size(), t)).len() as f32 * LINE_H
+    }
+
     /// Bordered, read-only box of wrapped text (release notes) that
     /// scrolls by wheel, and by Up/Down/PageUp/PageDown/Home/End while
     /// focused. Fills the width; height = `height(..)` or 120. `scroll` is
     /// the offset in logical px, clamped here.
+    #[cfg_attr(not(test), allow(dead_code))] // the dialog uses text_view_styled
     pub fn text_view(&mut self, id: &str, s: &str, scroll: &mut f32) {
+        let src: Vec<(&str, bool)> = s.split('\n').map(|l| (l, false)).collect();
+        self.text_view_styled(id, &src, scroll);
+    }
+
+    /// [`Ui::text_view`] over source lines, each `(text, muted)`: muted
+    /// lines use the secondary text colour (body text under headings).
+    pub fn text_view_styled(&mut self, id: &str, src: &[(&str, bool)], scroll: &mut f32) {
         let r = self.alloc(None, 120.0);
         let id = id_of(id);
         let focused = self.focusable(id);
         let pad = 12.0;
         let inner_w = r.w / self.k - 2.0 * pad;
-        let mut lines = wrap(s, inner_w, |t| tw(self, text_size(), t));
+        let wrap_all = |ui: &Self, w: f32| -> Vec<(String, bool)> {
+            (src.iter())
+                .flat_map(|&(l, m)| wrap(l, w, |t| tw(ui, text_size(), t)).into_iter().map(move |l| (l, m)))
+                .collect()
+        };
+        let mut lines = wrap_all(self, inner_w);
         let view_h = r.h / self.k - 2.0 * 8.0;
         let mut max = (lines.len() as f32 * LINE_H - view_h).max(0.0);
         if max > 0.0 {
             // Leave room for the scroll thumb.
-            lines = wrap(s, inner_w - 8.0, |t| tw(self, text_size(), t));
+            lines = wrap_all(self, inner_w - 8.0);
             max = (lines.len() as f32 * LINE_H - view_h).max(0.0);
         }
         if self.pressed_in(r) {
@@ -850,13 +868,13 @@ impl Ui<'_> {
         let lh = self.px(LINE_H);
         let off = self.px(*scroll);
         let x = (r.x + self.px(pad)).round();
-        let c = th.text.fade(k);
+        let (c, cm) = (th.text.fade(k), th.text_muted.fade(k));
         let first = (off / lh).floor() as usize;
         let shown = (body.h / lh).ceil() as usize + 1;
         super::clipped(&mut self.fb, body, |fb| {
-            for (i, l) in lines.iter().enumerate().skip(first).take(shown) {
+            for (i, (l, m)) in lines.iter().enumerate().skip(first).take(shown) {
                 let cy = body.y + (i as f32 + 0.5) * lh - off;
-                fb.draw_text(font, px, l, x, (cy - text_height(font, px) / 2.0).round(), c);
+                fb.draw_text(font, px, l, x, (cy - text_height(font, px) / 2.0).round(), if *m { cm } else { c });
             }
         });
         if max > 0.0 {

@@ -14,7 +14,6 @@
 //! Coordinates: layout values are logical px; the frame buffer and mouse
 //! positions are physical px; `Ui::k` is physical px per logical px.
 
-
 pub mod controls;
 pub mod folder_dialog;
 pub mod layout;

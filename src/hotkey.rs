@@ -6,6 +6,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 pub enum HotEvent {
     Capture,
     Quit,
+    /// An installed update is starting: quit once no capture is open.
+    Restart,
 }
 
 /// Global hotkeys backed by Win32 `RegisterHotKey` (replaces the
