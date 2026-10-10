@@ -31,16 +31,16 @@ impl Ui<'_> {
 pub const ALL_LAYERS: [usize; 4] = [0, 1, 2, 3];
 pub const SMALL_LAYERS: [usize; 2] = [0, 2];
 
-fn round(r: FRect) -> FRect {
+pub(crate) fn round(r: FRect) -> FRect {
     FRect { x: r.x.round(), y: r.y.round(), w: r.w.round(), h: r.h.round() }
 }
 
-fn fill(f: &mut Fb, r: FRect, radius: f32, c: C4) {
+pub(crate) fn fill(f: &mut Fb, r: FRect, radius: f32, c: C4) {
     f.fill_rounded(r.x as i32, r.y as i32, r.w as i32, r.h as i32, radius, c);
 }
 
 /// Inner 1 px ring along the edge of `r`.
-fn ring(f: &mut Fb, ui: &Ui, r: FRect, radius: f32, c: C4) {
+pub(crate) fn ring(f: &mut Fb, ui: &Ui, r: FRect, radius: f32, c: C4) {
     let lw = ui.line();
     let inset = FRect { x: r.x + lw / 2.0, y: r.y + lw / 2.0, w: r.w - lw, h: r.h - lw };
     f.stroke_rounded(inset, radius - lw / 2.0, lw, c);
@@ -315,7 +315,7 @@ const META: &str = "⌘";
 const META: &str = "Win";
 
 /// Key caps for a chord: modifiers, then the key.
-fn chord_caps(c: &Chord) -> Vec<String> {
+pub(crate) fn chord_caps(c: &Chord) -> Vec<String> {
     let mut out: Vec<String> = [(c.ctrl, MOD), (c.alt, ALT), (c.shift, "⇧"), (c.meta, META)]
         .iter()
         .filter(|(on, _)| *on)

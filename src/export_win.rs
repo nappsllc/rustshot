@@ -117,6 +117,31 @@ pub fn copy_text_to_clipboard(text: &str) -> Result<()> {
     })
 }
 
+/// The clipboard's text (CF_UNICODETEXT), if any.
+pub fn clipboard_text() -> Option<String> {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{GetClipboardData, IsClipboardFormatAvailable};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+    let fmt = CF_UNICODETEXT.0 as u32;
+    unsafe { IsClipboardFormatAvailable(fmt) }.ok()?;
+    with_clipboard(|| unsafe {
+        let h = GetClipboardData(fmt).context("GetClipboardData")?;
+        let hg = HGLOBAL(h.0);
+        let ptr = GlobalLock(hg) as *const u16;
+        if ptr.is_null() {
+            return Err(anyhow!("GlobalLock failed"));
+        }
+        let max = GlobalSize(hg) / 2;
+        let units = std::slice::from_raw_parts(ptr, max);
+        let len = units.iter().position(|&u| u == 0).unwrap_or(max);
+        let s = String::from_utf16_lossy(&units[..len]);
+        let _ = GlobalUnlock(hg);
+        Ok(s)
+    })
+    .ok()
+}
+
 /// Native save dialog via the classic GetSaveFileNameW (replaces rfd).
 pub fn save_dialog(dir: &Path, suggested: &str) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStrExt;

@@ -101,6 +101,27 @@ pub fn copy_text_to_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// The pasteboard's plain text, if any.
+pub fn clipboard_text() -> Option<String> {
+    let _pool = Pool::new();
+    unsafe {
+        let cls = objc_cls(c"NSPasteboard");
+        if cls.is_null() {
+            return None;
+        }
+        let pb: *mut c_void = msg0(cls, objc_sel(c"generalPasteboard"));
+        if pb.is_null() {
+            return None;
+        }
+        let s: *mut c_void = msg1(pb, objc_sel(c"stringForType:"), ns_string("public.utf8-plain-text"));
+        if s.is_null() {
+            return None;
+        }
+        let p: *const c_char = msg0(s, objc_sel(c"UTF8String"));
+        (!p.is_null()).then(|| CStr::from_ptr(p).to_string_lossy().into_owned())
+    }
+}
+
 /// Native save dialog via `NSSavePanel` (the GetSaveFileNameW equivalent);
 /// cancel/error returns None like the Win32 dialog does.
 pub fn save_dialog(dir: &Path, suggested: &str) -> Option<PathBuf> {

@@ -23,6 +23,7 @@ mod theme;
 mod tray;
 #[cfg(windows)]
 mod tray_win;
+mod ui;
 mod uifb;
 mod update;
 mod update_install;

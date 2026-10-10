@@ -24,6 +24,12 @@ use std::time::{Duration, Instant};
 mod toolbar;
 mod chrome;
 mod compose;
+
+/// Chrome styling shared with the window control kit (`crate::ui`).
+pub(crate) mod style {
+    pub(crate) use super::chrome::{chord_caps, fill, ring, round, surface, Ui, ALL_LAYERS};
+    pub(crate) use super::toolbar::BTN;
+}
 #[cfg(windows)]
 mod gdi;
 /// Linux/macOS: no GDI backend (`Edit::gdi` is always `None`).
