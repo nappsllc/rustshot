@@ -90,13 +90,15 @@ rustshot --help
 
 | Action | Keys |
 |---|---|
-| Pencil / Line / Arrow | <kbd>P</kbd> / <kbd>L</kbd> (or <kbd>D</kbd>) / <kbd>A</kbd> |
+| Pencil / Line / Arrow | <kbd>P</kbd> / <kbd>D</kbd> / <kbd>A</kbd> |
 | Rectangle / Ellipse / Marker | <kbd>R</kbd> / <kbd>C</kbd> / <kbd>M</kbd> |
 | Text / Pixelate / Invert | <kbd>T</kbd> / <kbd>B</kbd> / <kbd>I</kbd> |
 | Stroke size | mouse wheel, or the − / + buttons |
 | Undo / Redo | <kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> (or <kbd>Ctrl</kbd>+<kbd>Y</kbd>) |
 | Copy / Save / Upload | <kbd>Ctrl</kbd>+<kbd>C</kbd> / <kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>U</kbd> |
 | Save As (always asks) | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> |
+| Select the whole screen | <kbd>Ctrl</kbd>+<kbd>A</kbd> |
+| Toggle the color palette | <kbd>Space</kbd> |
 | Accept (save, or run the `--clip`/`--path` tasks) | <kbd>Enter</kbd> |
 | Drop the current tool / cancel | <kbd>Esc</kbd> |
 | Move / resize the selection | arrow keys / <kbd>Shift</kbd>+arrows |
@@ -104,6 +106,19 @@ rustshot --help
 | Keep aspect ratio while resizing | hold <kbd>Ctrl</kbd> |
 
 On macOS, <kbd>⌘</kbd> works wherever <kbd>Ctrl</kbd> is listed.
+
+The keys above (except arrows, the mouse wheel and hold-while-drawing modifiers) can be
+remapped in a `[shortcuts]` table at the end of `config.toml` (one or more
+chords separated by commas, `""` unbinds; `rustshot config --check` reports
+unknown actions and chords bound twice, where the first action listed wins):
+
+```toml
+[shortcuts]
+tool_pencil = "P"         # tool_line, tool_arrow, tool_rectangle, tool_circle,
+                          # tool_marker, tool_text, tool_pixelate, tool_invert
+save_as = "Ctrl+Shift+S"  # copy, save, upload, undo, select_all, toggle_palette,
+redo = "Ctrl+Shift+Z, Ctrl+Y"  # accept (Enter), cancel (Esc)
+```
 
 ## Configuration
 

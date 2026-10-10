@@ -4,6 +4,7 @@ use crate::config::{self, Config};
 use crate::export::{self, Task};
 use crate::fonts;
 use crate::hotkey::{HotEvent, Hotkeys};
+use crate::keymap::{Action, Keymap};
 use crate::objects::{FRect, Obj, Pt};
 use crate::pixbuf::PixBuf;
 use crate::theme::{self, Theme};
@@ -400,6 +401,7 @@ impl App {
             text: None,
             tasks,
             accept_on_select,
+            keys: Keymap::from_config(&cfg.shortcuts).0,
             cfg,
             toolbar: None,
             palette_open: false,
@@ -577,58 +579,7 @@ impl App {
             return;
         }
 
-        if escape {
-            if matches!(edit.interact, Interact::None)
-                && edit.draft.is_none()
-                && !edit.palette_open
-                && edit.tool.is_none()
-            {
-                edit.cancelled = true;
-                edit.done = true;
-            } else {
-                edit.interact = Interact::None;
-                edit.draft = None;
-                edit.stroke_pts.clear();
-                edit.palette_open = false;
-                edit.tool = None;
-            }
-            return;
-        }
-
-        if mods.ctrl && !mods.alt {
-            if vk == 'Z' as u32 {
-                if mods.shift {
-                    edit.redo();
-                } else {
-                    edit.undo();
-                }
-                return;
-            }
-            if vk == 'Y' as u32 {
-                edit.redo();
-                return;
-            }
-            if vk == 'C' as u32 {
-                self.apply_act(edit, Act::Copy);
-                return;
-            }
-            if vk == 'S' as u32 {
-                if mods.shift {
-                    // Save As: always ask, seeded with the auto-save path.
-                    edit.tasks = vec![Task::Save { path: None, ask: true }];
-                    edit.done = true;
-                } else {
-                    self.apply_act(edit, Act::Save);
-                }
-                return;
-            }
-            if vk == 'U' as u32 {
-                self.apply_act(edit, Act::Upload);
-                return;
-            }
-        }
-
-        // Arrow keys nudge / resize the selection.
+        // Arrow keys nudge / resize the selection (built in, not remappable).
         if is_arrow && edit.sel.is_some() && !mods.ctrl && !mods.alt {
             let step = edit.shot.scale.round().max(1.0);
             let dir = if left {
@@ -664,35 +615,20 @@ impl App {
             return;
         }
 
-        if enter {
-            if edit.sel.is_none() {
-                edit.sel = Some(FRect {
-                    x: 0.0,
-                    y: 0.0,
-                    w: edit.shot.size.0 as f32,
-                    h: edit.shot.size.1 as f32,
-                });
-                if edit.accept_on_select {
-                    edit.done = true;
-                    edit.cancelled = false;
-                    return;
+        let Some(action) = edit.keys.resolve(vk, mods) else { return };
+        match action {
+            Action::Cancel => cancel_key(edit),
+            Action::Accept => accept_key(edit),
+            Action::SelectAll => {
+                edit.sel = Some(FRect { x: 0.0, y: 0.0, w: edit.shot.size.0 as f32, h: edit.shot.size.1 as f32 });
+                edit.interact = Interact::None;
+            }
+            // The palette popover hangs off the toolbar, which needs a selection.
+            Action::TogglePalette if edit.sel.is_none() => {}
+            a => {
+                if let Some(act) = act_of(a) {
+                    self.apply_act(edit, act);
                 }
-            }
-            if edit.tasks.is_empty() {
-                edit.tasks = vec![Task::Save { path: None, ask: edit.cfg.save_dialog }];
-            }
-            edit.done = true;
-            edit.cancelled = false;
-            return;
-        }
-
-        // Tool shortcuts (plain letters, Flameshot-style).
-        if !mods.ctrl && !mods.alt && !mods.shift {
-            let tool = tool_for_key(vk);
-            if let Some(t) = tool {
-                edit.tool = if edit.tool == Some(t) { None } else { Some(t) };
-                edit.draft = None;
-                edit.stroke_pts.clear();
             }
         }
     }
@@ -959,6 +895,11 @@ impl App {
                 edit.tasks = vec![Task::Save { path: None, ask: edit.cfg.save_dialog }];
                 edit.done = true;
             }
+            Act::SaveAs => {
+                // Always ask, seeded with the auto-save path.
+                edit.tasks = vec![Task::Save { path: None, ask: true }];
+                edit.done = true;
+            }
             Act::Upload => {
                 edit.tasks = vec![Task::Upload];
                 edit.done = true;
@@ -1134,19 +1075,72 @@ fn grab(cfg: &Config, th: &Theme, screen: Option<u32>) -> anyhow::Result<(Shot, 
     Ok((capture::grab_edit(screen, cfg.capture_active_monitor)?, None))
 }
 
-/// Plain-letter tool shortcuts (Flameshot-style).
-fn tool_for_key(vk: u32) -> Option<Tool> {
-    match char::from_u32(vk)? {
-        'P' => Some(Tool::Path),
-        'D' | 'L' => Some(Tool::Line),
-        'A' => Some(Tool::Arrow),
-        'R' => Some(Tool::Rect),
-        'C' => Some(Tool::Ellipse),
-        'M' => Some(Tool::Marker),
-        'T' => Some(Tool::Text),
-        'B' => Some(Tool::Pixelate),
-        'I' => Some(Tool::Invert),
-        _ => None,
+/// Esc: drop the current tool / draft / palette, or cancel the capture.
+fn cancel_key(edit: &mut Edit) {
+    if matches!(edit.interact, Interact::None)
+        && edit.draft.is_none()
+        && !edit.palette_open
+        && edit.tool.is_none()
+    {
+        edit.cancelled = true;
+        edit.done = true;
+    } else {
+        edit.interact = Interact::None;
+        edit.draft = None;
+        edit.stroke_pts.clear();
+        edit.palette_open = false;
+        edit.tool = None;
+    }
+}
+
+/// Enter: select everything if nothing is selected, then run the given
+/// tasks (or save).
+fn accept_key(edit: &mut Edit) {
+    if edit.sel.is_none() {
+        edit.sel = Some(FRect { x: 0.0, y: 0.0, w: edit.shot.size.0 as f32, h: edit.shot.size.1 as f32 });
+        if edit.accept_on_select {
+            edit.done = true;
+            edit.cancelled = false;
+            return;
+        }
+    }
+    if edit.tasks.is_empty() {
+        edit.tasks = vec![Task::Save { path: None, ask: edit.cfg.save_dialog }];
+    }
+    edit.done = true;
+    edit.cancelled = false;
+}
+
+/// The toolbar act a keymap action triggers (`None`: handled in
+/// `handle_key` itself).
+fn act_of(a: Action) -> Option<Act> {
+    Some(match a {
+        Action::ToolPencil => Act::Tool(Tool::Path),
+        Action::ToolLine => Act::Tool(Tool::Line),
+        Action::ToolArrow => Act::Tool(Tool::Arrow),
+        Action::ToolRectangle => Act::Tool(Tool::Rect),
+        Action::ToolCircle => Act::Tool(Tool::Ellipse),
+        Action::ToolMarker => Act::Tool(Tool::Marker),
+        Action::ToolText => Act::Tool(Tool::Text),
+        Action::ToolPixelate => Act::Tool(Tool::Pixelate),
+        Action::ToolInvert => Act::Tool(Tool::Invert),
+        Action::Copy => Act::Copy,
+        Action::Save => Act::Save,
+        Action::SaveAs => Act::SaveAs,
+        Action::Upload => Act::Upload,
+        Action::Undo => Act::Undo,
+        Action::Redo => Act::Redo,
+        Action::TogglePalette => Act::Palette,
+        Action::SelectAll | Action::Accept | Action::Cancel => return None,
+    })
+}
+
+/// The keymap action whose chord a toolbar button's tooltip shows.
+fn action_of(a: Act) -> Option<Action> {
+    match a {
+        Act::Exit => Some(Action::Cancel),
+        Act::Accept => Some(Action::Accept),
+        _ => Action::ALL.into_iter().find(|x| act_of(*x) == Some(a)),
     }
 }
 
@@ -1276,6 +1270,8 @@ struct Edit {
     tasks: Vec<Task>,
     accept_on_select: bool,
     cfg: Config,
+    /// Editor shortcuts (`cfg.shortcuts` over the defaults).
+    keys: Keymap,
     toolbar: Option<Toolbar>,
     palette_open: bool,
     done: bool,
@@ -1932,6 +1928,7 @@ mod tests {
             text: None,
             tasks: Vec::new(),
             accept_on_select: false,
+            keys: Keymap::defaults(),
             cfg: cfg.clone(),
             toolbar: None,
             palette_open: false,
@@ -1972,6 +1969,51 @@ mod tests {
             State::Edit(e) => e,
             _ => unreachable!(),
         }
+    }
+
+    /// Press `vk` without finishing the capture (no export runs).
+    fn press(app: &mut App, vk: u32, mods: Mods) -> Edit {
+        let State::Edit(e) = std::mem::replace(&mut app.st, State::Hidden) else { unreachable!() };
+        let mut e = *e;
+        app.handle_key(&mut e, vk, false, mods);
+        e
+    }
+
+    const CTRL: Mods = Mods { ctrl: true, shift: false, alt: false };
+    const CTRL_SHIFT: Mods = Mods { ctrl: true, shift: true, alt: false };
+
+    #[test]
+    fn keymap_drives_handle_key() {
+        let sel = FRect { x: 10.0, y: 10.0, w: 50.0, h: 40.0 };
+        let mut app = preview_app(theme::DARK, Some(sel));
+        let e = press(&mut app, 'S' as u32, CTRL_SHIFT);
+        assert!(e.done && matches!(e.tasks[..], [Task::Save { path: None, ask: true }]), "Save As asks");
+        let mut app = preview_app(theme::DARK, Some(sel));
+        let e = press(&mut app, 'S' as u32, CTRL);
+        assert!(e.done && matches!(e.tasks[..], [Task::Save { path: None, ask: false }]));
+
+        let mut app = preview_app(theme::DARK, Some(sel));
+        let e = press(&mut app, 'A' as u32, CTRL);
+        assert_eq!(e.sel, Some(FRect { x: 0.0, y: 0.0, w: e.shot.size.0 as f32, h: e.shot.size.1 as f32 }));
+        assert!(!e.done);
+
+        let mut app = preview_app(theme::DARK, Some(sel));
+        assert_eq!(press(&mut app, 'D' as u32, Mods::default()).tool, Some(Tool::Line));
+        let mut app = preview_app(theme::DARK, Some(sel));
+        assert_eq!(press(&mut app, 'D' as u32, Mods { shift: true, ..Mods::default() }).tool, None);
+        let mut app = preview_app(theme::DARK, Some(sel));
+        assert!(press(&mut app, wind::key::SPACE, Mods::default()).palette_open);
+
+        // Remapped: Pencil on K, Cancel unbound from Esc.
+        let mut app = preview_app(theme::DARK, Some(sel));
+        let km = [("tool_pencil", "K"), ("cancel", "")].map(|(a, b)| (a.to_string(), b.to_string()));
+        edit_of(&mut app).keys = Keymap::from_config(&km.into_iter().collect()).0;
+        let mut e = press(&mut app, 'K' as u32, Mods::default());
+        assert_eq!(e.tool, Some(Tool::Path));
+        app.handle_key(&mut e, 'P' as u32, false, Mods::default());
+        assert_eq!(e.tool, Some(Tool::Path), "P no longer bound");
+        app.handle_key(&mut e, wind::key::ESCAPE, false, Mods::default());
+        assert!(e.tool.is_some() && !e.done, "Esc unbound");
     }
 
     /// Selection with the Arrow tool, a Rect and an Arrow object inside it.

@@ -4,6 +4,7 @@
 use super::Tool;
 use super::toolbar::{label_rect, Act, Item, Kind, Toolbar};
 use crate::icon_path::draw_icon;
+use crate::keymap::{Chord, Keymap};
 use crate::objects::FRect;
 use crate::theme::{rgba, Theme, SHADOW};
 use crate::uifb::{text_height, text_width, Fb, C4};
@@ -92,7 +93,7 @@ pub fn act_icon(a: Act) -> &'static str {
         Act::Size(d) if d < 0 => "minus",
         Act::Size(_) => "plus",
         Act::Copy => "copy",
-        Act::Save => "save",
+        Act::Save | Act::SaveAs => "save",
         Act::Upload => "cloud",
         Act::Exit => "x",
         Act::Accept => "check",
@@ -304,34 +305,60 @@ const MOD: &str = "⌘";
 #[cfg(not(target_os = "macos"))]
 const MOD: &str = "Ctrl";
 
-/// Tooltip label and key caps (keys reflect `tool_for_key` / `handle_key`).
-pub fn act_tip(a: Act) -> (&'static str, &'static [&'static str]) {
-    match a {
-        Act::Tool(Tool::Path) => ("Pencil", &["P"]),
-        Act::Tool(Tool::Line) => ("Line", &["L"]),
-        Act::Tool(Tool::Arrow) => ("Arrow", &["A"]),
-        Act::Tool(Tool::Rect) => ("Rectangle", &["R"]),
-        Act::Tool(Tool::Ellipse) => ("Ellipse", &["C"]),
-        Act::Tool(Tool::Marker) => ("Marker", &["M"]),
-        Act::Tool(Tool::Text) => ("Text", &["T"]),
-        Act::Tool(Tool::Pixelate) => ("Pixelate", &["B"]),
-        Act::Tool(Tool::Invert) => ("Invert", &["I"]),
-        Act::Undo => ("Undo", &[MOD, "Z"]),
-        Act::Redo => ("Redo", &[MOD, "⇧", "Z"]),
-        Act::Size(d) if d < 0 => ("Smaller", &["Wheel"]),
-        Act::Size(_) => ("Larger", &["Wheel"]),
-        Act::Palette => ("Color", &[]),
-        Act::Color(_) => ("Use color", &[]),
-        Act::Copy => ("Copy", &[MOD, "C"]),
-        Act::Save => ("Save", &[MOD, "S"]),
-        Act::Upload => ("Upload", &[MOD, "U"]),
-        Act::Exit => ("Close", &["Esc"]),
-        Act::Accept => ("Accept", &["Enter"]),
-    }
+#[cfg(target_os = "macos")]
+const ALT: &str = "⌥";
+#[cfg(not(target_os = "macos"))]
+const ALT: &str = "Alt";
+#[cfg(target_os = "macos")]
+const META: &str = "⌘";
+#[cfg(not(target_os = "macos"))]
+const META: &str = "Win";
+
+/// Key caps for a chord: modifiers, then the key.
+fn chord_caps(c: &Chord) -> Vec<String> {
+    let mut out: Vec<String> = [(c.ctrl, MOD), (c.alt, ALT), (c.shift, "⇧"), (c.meta, META)]
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, s)| s.to_string())
+        .collect();
+    out.push(c.key());
+    out
+}
+
+/// Tooltip label and key caps (the first chord bound in `km`).
+pub fn act_tip(a: Act, km: &Keymap) -> (&'static str, Vec<String>) {
+    let label = match a {
+        Act::Tool(Tool::Path) => "Pencil",
+        Act::Tool(Tool::Line) => "Line",
+        Act::Tool(Tool::Arrow) => "Arrow",
+        Act::Tool(Tool::Rect) => "Rectangle",
+        Act::Tool(Tool::Ellipse) => "Ellipse",
+        Act::Tool(Tool::Marker) => "Marker",
+        Act::Tool(Tool::Text) => "Text",
+        Act::Tool(Tool::Pixelate) => "Pixelate",
+        Act::Tool(Tool::Invert) => "Invert",
+        Act::Undo => "Undo",
+        Act::Redo => "Redo",
+        Act::Size(d) if d < 0 => "Smaller",
+        Act::Size(_) => "Larger",
+        Act::Palette => "Color",
+        Act::Color(_) => "Use color",
+        Act::Copy => "Copy",
+        Act::Save => "Save",
+        Act::SaveAs => "Save as",
+        Act::Upload => "Upload",
+        Act::Exit => "Close",
+        Act::Accept => "Accept",
+    };
+    let keys = match a {
+        Act::Size(_) => vec!["Wheel".to_string()],
+        _ => super::action_of(a).and_then(|x| km.chords(x).first()).map(chord_caps).unwrap_or_default(),
+    };
+    (label, keys)
 }
 
 /// Dark label + key caps, 8 above `anchor` (below if no room).
-pub fn tooltip(f: &mut Fb, ui: &Ui, anchor: FRect, label: &str, keys: &[&str], area: FRect, k: f32) {
+pub fn tooltip(f: &mut Fb, ui: &Ui, anchor: FRect, label: &str, keys: &[String], area: FRect, k: f32) {
     let th = ui.th;
     let (h, gap, kgap) = (ui.px(26.0), ui.px(8.0), ui.px(4.0));
     let r = tooltip_rect(ui, anchor, label, keys, area);
@@ -350,7 +377,7 @@ pub fn tooltip(f: &mut Fb, ui: &Ui, anchor: FRect, label: &str, keys: &[&str], a
 }
 
 /// Where `tooltip` puts its panel.
-fn tooltip_rect(ui: &Ui, anchor: FRect, label: &str, keys: &[&str], area: FRect) -> FRect {
+fn tooltip_rect(ui: &Ui, anchor: FRect, label: &str, keys: &[String], area: FRect) -> FRect {
     let (h, gap, kgap) = (ui.px(26.0), ui.px(8.0), ui.px(4.0));
     let keys_w: f32 = keys.iter().map(|s| key_w(ui, s)).sum::<f32>() + kgap * keys.len().saturating_sub(1) as f32;
     let mut w = ui.px(9.0) + tw(ui, 12.0, label) + ui.px(if keys.is_empty() { 9.0 } else { 6.0 });
@@ -464,7 +491,7 @@ pub fn toolbar_bounds(ui: &Ui, tb: &Toolbar) -> FRect {
     tb.pop.map_or(b, |p| union(b, surface_bounds(ui, p)))
 }
 
-pub fn tooltip_bounds(ui: &Ui, anchor: FRect, label: &str, keys: &[&str], area: FRect) -> FRect {
+pub fn tooltip_bounds(ui: &Ui, anchor: FRect, label: &str, keys: &[String], area: FRect) -> FRect {
     surface_bounds(ui, tooltip_rect(ui, anchor, label, keys, area))
 }
 
@@ -597,10 +624,19 @@ mod tests {
 
     #[test]
     fn tool_tooltips_match_real_shortcuts() {
+        let km = Keymap::defaults();
         for t in super::super::toolbar::TOOL_ORDER {
-            let (_, keys) = act_tip(Act::Tool(t));
+            let (_, keys) = act_tip(Act::Tool(t), &km);
             let vk = keys[0].as_bytes()[0] as u32;
-            assert_eq!(super::super::tool_for_key(vk), Some(t), "{t:?}");
+            let a = km.resolve(vk, Default::default()).and_then(super::super::act_of);
+            assert_eq!(a, Some(Act::Tool(t)), "{t:?}");
         }
+        assert_eq!(act_tip(Act::Redo, &km).1, [MOD, "⇧", "Z"]);
+        assert_eq!(act_tip(Act::Save, &km).1, [MOD, "S"]);
+        assert_eq!(act_tip(Act::Exit, &km).1, ["Esc"]);
+        let (km, _) = Keymap::from_config(&[("save".to_string(), "Alt+F2".to_string())].into_iter().collect());
+        assert_eq!(act_tip(Act::Save, &km).1, [ALT, "F2"]);
+        let (km, _) = Keymap::from_config(&[("upload".to_string(), String::new())].into_iter().collect());
+        assert!(act_tip(Act::Upload, &km).1.is_empty());
     }
 }

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Settings, mirroring Flameshot's key names where they apply.
@@ -52,6 +53,9 @@ pub struct Config {
     /// only changed rects repainted; the default) or "software" (whole
     /// frame composed in memory). Linux/macOS always use software.
     pub renderer: String,
+    /// Editor shortcut overrides from the `[shortcuts]` table
+    /// (`action id -> "Ctrl+Shift+S"`; see `keymap`).
+    pub shortcuts: BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -87,6 +91,7 @@ impl Default for Config {
             capture_active_monitor: false,
             check_updates: true,
             renderer: "gdi".into(),
+            shortcuts: BTreeMap::new(),
         }
     }
 }
@@ -173,7 +178,26 @@ pub fn check() -> Result<()> {
     if let Some(w) = renderer_warning(&cfg.renderer) {
         println!("warning: {w}");
     }
+    for w in shortcut_warnings(&cfg) {
+        println!("warning: {w}");
+    }
     Ok(())
+}
+
+/// `[shortcuts]` problems: unknown actions, bad chords, and chords bound
+/// to several actions (the first in table order wins).
+pub fn shortcut_warnings(cfg: &Config) -> Vec<String> {
+    let (km, mut out) = crate::keymap::Keymap::from_config(&cfg.shortcuts);
+    for (c, acts) in km.conflicts() {
+        let ids: Vec<&str> = acts.iter().map(|a| a.id()).collect();
+        out.push(format!(
+            "[shortcuts] {} is bound to {}; {} wins",
+            c.display(),
+            ids.join(", "),
+            ids[0]
+        ));
+    }
+    out
 }
 
 /// A warning for a `renderer` value other than "gdi" / "software" (the
@@ -188,9 +212,15 @@ pub fn renderer_warning(v: &str) -> Option<String> {
 /// uses: quoted strings, numbers, booleans, and arrays of strings.
 pub fn parse_config(text: &str) -> Result<Config, String> {
     let mut cfg = Config::default();
+    // Current `[table]`: "" = top level; keys of other tables are ignored.
+    let mut table = String::new();
     for (idx, raw) in text.lines().enumerate() {
         let line = strip_comment(raw).trim();
         if line.is_empty() {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            table = name.trim().to_string();
             continue;
         }
         let Some((key, val)) = line.split_once('=') else {
@@ -199,6 +229,15 @@ pub fn parse_config(text: &str) -> Result<Config, String> {
         let key = key.trim();
         let val = val.trim();
         let bad = |kind: &str, v: &str| format!("line {}: invalid {kind} for '{key}': {v}", idx + 1);
+        if table == "shortcuts" {
+            let key = key.trim_matches('"');
+            let v = as_string(val).map_err(|e| bad("string", &e))?;
+            cfg.shortcuts.insert(key.to_string(), v);
+            continue;
+        }
+        if !table.is_empty() {
+            continue;
+        }
         match key {
             "save_path" => cfg.save_path = as_string(val).map_err(|e| bad("string", &e))?,
             "filename_pattern" => {
@@ -275,7 +314,7 @@ pub fn to_toml(c: &Config) -> String {
         format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     }
     let colors: Vec<String> = c.user_colors.iter().map(|s| q(s)).collect();
-    format!(
+    let mut out = format!(
         "save_path = {}\n\
          save_subfolder = {}\n\
          subfolder_pattern = {}\n\
@@ -324,7 +363,17 @@ pub fn to_toml(c: &Config) -> String {
         c.capture_active_monitor,
         c.check_updates,
         q(&c.renderer),
-    )
+    );
+    if !c.shortcuts.is_empty() {
+        out.push_str("
+[shortcuts]
+");
+        for (k, v) in &c.shortcuts {
+            out.push_str(&format!("{k} = {}
+", q(v)));
+        }
+    }
+    out
 }
 
 /// Cut a trailing `# comment`, respecting quotes.
@@ -473,6 +522,28 @@ mod tests {
         assert_eq!(parse_color("#f00"), Some((255, 0, 0, 255)));
         assert_eq!(parse_color("#10203040"), Some((16, 32, 48, 64)));
         assert_eq!(parse_color("red"), None);
+    }
+
+    #[test]
+    fn shortcuts_table() {
+        let text = "theme = \"dark\"\n[shortcuts]\nsave_as = \"Ctrl+Alt+S\"\ncopy = \"\" # unbound\nbogus = \"N\"\n[other]\ntheme = \"light\"\n";
+        let cfg = parse_config(text).unwrap();
+        assert_eq!(cfg.theme, "dark", "keys of other tables are ignored");
+        assert_eq!(cfg.shortcuts.len(), 3);
+        assert_eq!(cfg.shortcuts["save_as"], "Ctrl+Alt+S");
+        assert_eq!(cfg.shortcuts["copy"], "");
+        let back = parse_config(&to_toml(&cfg)).unwrap();
+        assert_eq!(back.shortcuts, cfg.shortcuts);
+        assert!(!to_toml(&Config::default()).contains("[shortcuts]"));
+        let w = shortcut_warnings(&cfg);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("bogus"));
+        let clash = Config {
+            shortcuts: [("cancel".to_string(), "P".to_string())].into_iter().collect(),
+            ..Config::default()
+        };
+        let w = shortcut_warnings(&clash);
+        assert_eq!(w, ["[shortcuts] P is bound to tool_pencil, cancel; tool_pencil wins"]);
     }
 
     #[test]

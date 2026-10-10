@@ -49,6 +49,8 @@ pub enum Act {
     Palette,
     Copy,
     Save,
+    /// Keyboard only (not on the toolbar): Save As dialog.
+    SaveAs,
     Upload,
     Exit,
     Accept,

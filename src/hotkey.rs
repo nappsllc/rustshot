@@ -79,11 +79,16 @@ pub fn parse_hotkey(spec: &str) -> Option<(u32, u32)> {
             }
             _ => {}
         }
+        if vk.is_some() {
+            return None; // two non-modifier keys ("A+B")
+        }
         vk = Some(key_vk(&lower)?);
     }
     Some((mods, vk?))
 }
 
+/// Key name (lowercase) → virtual-key code; the one key table shared by
+/// global hotkeys and the editor keymap.
 fn key_vk(lower: &str) -> Option<u32> {
     if lower.len() == 1 {
         let c = lower.chars().next().unwrap();
@@ -108,7 +113,7 @@ fn key_vk(lower: &str) -> Option<u32> {
         "esc" | "escape" => key::ESCAPE,
         "tab" => key::TAB,
         "backspace" => key::BACK,
-        "delete" => key::DELETE,
+        "delete" | "del" => key::DELETE,
         "insert" => key::INSERT,
         "home" => key::HOME,
         "end" => key::END,
@@ -122,6 +127,37 @@ fn key_vk(lower: &str) -> Option<u32> {
         _ => return None,
     };
     Some(vk)
+}
+
+/// Display name of a virtual key in the chord syntax `parse_hotkey`
+/// accepts ("S", "5", "F5", "Del", "Space", ...).
+pub fn key_name(vk: u32) -> Option<String> {
+    if (0x41..=0x5A).contains(&vk) || (0x30..=0x39).contains(&vk) {
+        return Some(char::from_u32(vk)?.to_string());
+    }
+    if (0x70..=0x7B).contains(&vk) {
+        return Some(format!("F{}", vk - 0x70 + 1));
+    }
+    let name = match vk {
+        key::SPACE => "Space",
+        key::RETURN => "Enter",
+        key::ESCAPE => "Esc",
+        key::TAB => "Tab",
+        key::BACK => "Backspace",
+        key::DELETE => "Del",
+        key::INSERT => "Insert",
+        key::HOME => "Home",
+        key::END => "End",
+        key::PAGEUP => "PageUp",
+        key::PAGEDOWN => "PageDown",
+        key::UP => "Up",
+        key::DOWN => "Down",
+        key::LEFT => "Left",
+        key::RIGHT => "Right",
+        key::PRINTSCREEN => "PrintScreen",
+        _ => return None,
+    };
+    Some(name.into())
 }
 
 #[cfg(test)]
@@ -139,5 +175,19 @@ mod tests {
         assert_eq!(parse_hotkey("F5"), Some((0, 0x74)));
         assert_eq!(parse_hotkey("bogus+key"), None);
         assert_eq!(parse_hotkey(""), None);
+        assert_eq!(parse_hotkey("A+B"), None);
+        assert_eq!(parse_hotkey("Shift"), None);
+    }
+
+    #[test]
+    fn key_names_round_trip() {
+        for vk in (0x30..=0x39).chain(0x41..=0x5A).chain(0x70..=0x7B) {
+            let n = key_name(vk).unwrap();
+            assert_eq!(key_vk(&n.to_ascii_lowercase()), Some(vk), "{n}");
+        }
+        for vk in [key::SPACE, key::RETURN, key::ESCAPE, key::DELETE, key::PRINTSCREEN, key::LEFT] {
+            let n = key_name(vk).unwrap();
+            assert_eq!(key_vk(&n.to_ascii_lowercase()), Some(vk), "{n}");
+        }
     }
 }

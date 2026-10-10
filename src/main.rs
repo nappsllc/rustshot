@@ -11,6 +11,7 @@ mod fonts;
 mod hotkey;
 mod icon_path;
 mod instance;
+mod keymap;
 mod objects;
 mod pixbuf;
 mod raster;

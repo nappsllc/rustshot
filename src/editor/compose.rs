@@ -204,6 +204,9 @@ pub struct BarUi {
 pub struct TipUi {
     pub anchor: FRect,
     pub act: Act,
+    pub label: &'static str,
+    /// Key caps of the first chord bound to `act`.
+    pub keys: Vec<String>,
     pub area: FRect,
     pub k: f32,
 }
@@ -539,7 +542,8 @@ impl Edit {
                 && let Some(it) = self.hover.and_then(|i| tb.items.get(i))
                 && let toolbar::Kind::Btn(act) = it.kind
             {
-                tip = Some(TipUi { anchor: it.r, act, area, k: anim::ease_out(shown_ms / 80.0) });
+                let (label, keys) = chrome::act_tip(act, &self.keys);
+                tip = Some(TipUi { anchor: it.r, act, label, keys, area, k: anim::ease_out(shown_ms / 80.0) });
             }
             BarUi {
                 tb: tb.scaled(0.96 + 0.04 * kb),
@@ -613,8 +617,7 @@ impl Edit {
             El::Toast => sc.toast.as_ref().map_or(Vec::new(), |t| one(chrome::toast_bounds(&ui, &t.text, t.area, t.k))),
             El::Bar => sc.bar.as_ref().map_or(Vec::new(), |b| one(chrome::toolbar_bounds(&ui, &b.tb))),
             El::Tip => sc.tip.as_ref().map_or(Vec::new(), |t| {
-                let (label, keys) = chrome::act_tip(t.act);
-                one(chrome::tooltip_bounds(&ui, t.anchor, label, keys, t.area))
+                one(chrome::tooltip_bounds(&ui, t.anchor, t.label, &t.keys, t.area))
             }),
             El::Hint => sc.hint.map_or(Vec::new(), |(area, _)| one(chrome::hint_bounds(&ui, area))),
         }
@@ -724,8 +727,7 @@ impl Edit {
         if let Some(t) = &sc.tip
             && hits(El::Tip)
         {
-            let (label, keys) = chrome::act_tip(t.act);
-            chrome::tooltip(&mut f, &ui, t.anchor, label, keys, t.area, t.k);
+            chrome::tooltip(&mut f, &ui, t.anchor, t.label, &t.keys, t.area, t.k);
         }
         if let Some((area, kh)) = sc.hint
             && hits(El::Hint)
