@@ -134,6 +134,8 @@ pub fn retime(hwnd: HWND, ms: u64) {
     if hwnd.is_invalid() {
         return;
     }
+    #[cfg(test)]
+    tests::RETIMES.lock().unwrap_or_else(|e| e.into_inner()).push((hwnd.0 as isize, ms));
     unsafe {
         let _ = SetTimer(Some(hwnd), 1, ms as u32, None);
     }
@@ -157,8 +159,8 @@ unsafe extern "system" fn wndproc(
         }
         let drv = &mut **slot;
         if msg == WM_DESTROY {
-            forget_tick(hwnd);
             drv.on_quit();
+            forget_tick(hwnd);
             PostQuitMessage(0);
             return LRESULT(0);
         }
@@ -365,7 +367,7 @@ pub fn run(driver: &mut dyn Driver) -> i32 {
         match hwnd {
             Ok(hwnd) => {
                 driver.on_create(hwnd);
-                let _ = SetTimer(Some(hwnd), 1, SLOW_TICK_MS as u32, None);
+                let _ = SetTimer(Some(hwnd), 1, tick_ms(hwnd) as u32, None);
                 let mut msg = MSG::default();
                 let mut code = 0;
                 loop {
@@ -540,8 +542,8 @@ unsafe extern "system" fn wndproc_window(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
             WM_SETCURSOR if (lp.0 & 0xffff) as u32 != HTCLIENT => DefWindowProcW(hwnd, msg, wp, lp),
             WM_DESTROY => {
                 st.done.set(true);
-                forget_tick(hwnd);
                 drv.on_quit();
+                forget_tick(hwnd);
                 LRESULT(0)
             }
             _ => common(hwnd, msg, wp, lp, drv).unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp)),
@@ -720,8 +722,19 @@ mod tests {
         }
     }
 
-    /// Outer sizes the resize helper cycles through (all above the minimum).
-    const RESIZES: [(i32, i32); 3] = [(560, 430), (480, 370), (640, 480)];
+    /// Every `(hwnd, ms)` the backend's `retime` was asked for.
+    pub(super) static RETIMES: std::sync::Mutex<Vec<(isize, u64)>> = std::sync::Mutex::new(Vec::new());
+
+    /// Serialises the window-creating tests (object counts, timers).
+    static WINDOWS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn windows_lock() -> std::sync::MutexGuard<'static, ()> {
+        WINDOWS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Resize factors applied to the initial outer rect (pairwise distinct,
+    /// DPI independent: `min` is 1x1 in the test spec).
+    const RESIZES: [f32; 3] = [1.1, 1.25, 0.9];
 
     /// Records what `run_window` delivers; ignores the first close request
     /// (the window must stay open) and closes on the second. On the first
@@ -733,6 +746,8 @@ mod tests {
         fb: PixBuf,
         created: bool,
         first: Option<&'static str>,
+        first_size: Option<(u32, u32)>,
+        dpi: u32,
         size: (u32, u32),
         resizes: u32,
         closes: u32,
@@ -746,6 +761,7 @@ mod tests {
             self.hwnd = hwnd;
             self.created = true;
             unsafe {
+                self.dpi = GetDpiForWindow(hwnd);
                 let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
             }
         }
@@ -757,6 +773,7 @@ mod tests {
             match ev {
                 Ev::Resize(w, h) => {
                     self.resizes += 1;
+                    self.first_size.get_or_insert((w, h));
                     self.size = (w, h);
                     self.fb = PixBuf::new(w, h);
                 }
@@ -767,7 +784,11 @@ mod tests {
                         self.helper = Some(std::thread::spawn(move || unsafe {
                             use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_INVALIDATE, RDW_UPDATENOW};
                             let hwnd = HWND(raw as *mut core::ffi::c_void);
-                            for (w, h) in RESIZES {
+                            let mut r = RECT::default();
+                            let _ = GetWindowRect(hwnd, &mut r);
+                            let (ow, oh) = ((r.right - r.left) as f32, (r.bottom - r.top) as f32);
+                            for f in RESIZES {
+                                let (w, h) = ((ow * f).round() as i32, (oh * f).round() as i32);
                                 let _ = SetWindowPos(hwnd, None, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
                                 let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW);
                             }
@@ -800,6 +821,8 @@ mod tests {
             fb: PixBuf::new(1, 1),
             created: false,
             first: None,
+            first_size: None,
+            dpi: 0,
             size: (0, 0),
             resizes: 0,
             closes: 0,
@@ -812,7 +835,7 @@ mod tests {
             w: 400,
             h: 300,
             resizable: true,
-            min: (200, 150),
+            min: (1, 1),
         };
         run_window(spec, &mut d).expect("window loop");
         if let Some(h) = d.helper.take() {
@@ -830,11 +853,17 @@ mod tests {
         use windows::Win32::System::Threading::{
             GetGuiResources, OpenProcess, GR_GDIOBJECTS, GR_USEROBJECTS, PROCESS_QUERY_INFORMATION,
         };
+        let _guard = windows_lock();
         std::thread::spawn(|| {
             let d = run_closer();
             assert!(d.created);
             assert_eq!(d.first, Some("resize"), "first event is the initial size");
-            assert!(d.size.0 >= 400 && d.size.1 >= 300, "client {:?} at scale >= 1", d.size);
+            let first = d.first_size.expect("initial Resize");
+            let s = d.dpi.max(96) as f32 / 96.0;
+            assert!(
+                first.0 as f32 >= (400.0 * s).floor() && first.1 as f32 >= (300.0 * s).floor(),
+                "initial client {first:?} at scale {s}"
+            );
             assert_eq!(d.closes, 2, "the first close was ignored");
             assert_eq!(d.resizes, 1 + RESIZES.len() as u32, "initial size plus each SetWindowPos");
             assert!(d.quit, "on_quit ran");
@@ -868,13 +897,16 @@ mod tests {
     /// cadence (the dialog going idle must not slow the other window).
     #[test]
     fn run_window_cadence_is_per_window() {
-        use std::sync::{Arc, Barrier};
+        use std::sync::mpsc;
         use std::time::{Duration, Instant};
+        let _guard = windows_lock();
+        RETIMES.lock().unwrap_or_else(|e| e.into_inner()).clear();
         struct Ticker {
             hwnd: HWND,
             fb: PixBuf,
             idle_again: bool,
-            barrier: Arc<Barrier>,
+            ready: mpsc::Sender<()>,
+            go: mpsc::Receiver<()>,
             cadence: u64,
             start: Option<Instant>,
             ticks: u32,
@@ -886,8 +918,10 @@ mod tests {
                 if self.idle_again {
                     set_fast_timer(hwnd, false);
                 }
-                // Both windows have toggled once everyone is past here.
-                self.barrier.wait();
+                // Both windows have toggled once the main thread says go;
+                // a window that never reports makes the test fail, not hang.
+                let _ = self.ready.send(());
+                let _ = self.go.recv_timeout(Duration::from_secs(5));
                 self.cadence = tick_ms(hwnd);
                 self.start = Some(Instant::now());
             }
@@ -907,15 +941,20 @@ mod tests {
                 Cursor::Arrow
             }
         }
-        let barrier = Arc::new(Barrier::new(2));
-        let spawn = |idle_again: bool| {
-            let barrier = barrier.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let mut gos = Vec::new();
+        let (hw_tx, hw_rx) = mpsc::channel();
+        let mut spawn = |idle_again: bool| {
+            let (go_tx, go_rx) = mpsc::channel();
+            gos.push(go_tx);
+            let (ready, hw_tx) = (ready_tx.clone(), hw_tx.clone());
             std::thread::spawn(move || {
                 let mut d = Ticker {
                     hwnd: HWND::default(),
                     fb: PixBuf::new(1, 1),
                     idle_again,
-                    barrier,
+                    ready,
+                    go: go_rx,
                     cadence: 0,
                     start: None,
                     ticks: 0,
@@ -923,16 +962,29 @@ mod tests {
                 let title = if idle_again { "rustshot dialog" } else { "rustshot animating" };
                 let spec = WindowSpec { title: title.into(), w: 200, h: 150, resizable: false, min: (0, 0) };
                 run_window(spec, &mut d).expect("window loop");
+                let _ = hw_tx.send((idle_again, d.hwnd.0 as isize));
                 (d.cadence, d.ticks, tick_ms(d.hwnd))
             })
         };
         let (fast, dialog) = (spawn(false), spawn(true));
+        drop(hw_tx);
+        for i in 0..2 {
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| panic!("window {i} never became ready"));
+        }
+        for g in &gos {
+            let _ = g.send(());
+        }
         let (fast, dialog) = (fast.join().expect("fast window"), dialog.join().expect("dialog"));
+        let hwnds: std::collections::HashMap<bool, isize> = hw_rx.try_iter().collect();
+        let log = RETIMES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let of = |h: isize| log.iter().filter(|r| r.0 == h).map(|r| r.1).collect::<Vec<_>>();
+        assert_eq!(of(hwnds[&true]), [FAST_TICK_MS, SLOW_TICK_MS], "dialog retimed fast then slow");
+        assert_eq!(of(hwnds[&false]), [FAST_TICK_MS], "the animating window was retimed once, never slowed");
+        assert!(log.iter().all(|r| r.0 == hwnds[&true] || r.0 == hwnds[&false]), "no other window retimed: {log:?}");
         println!("(cadence, ticks in 450 ms, cadence after destroy): animating {fast:?}, dialog {dialog:?}");
         assert_eq!(fast.0, FAST_TICK_MS, "the dialog going idle left the other window fast");
         assert_eq!(dialog.0, SLOW_TICK_MS);
-        assert!(fast.1 >= 10, "fast window ticked {} times", fast.1);
-        assert!(dialog.1 <= 4, "idle dialog ticked {} times", dialog.1);
+        assert!(fast.1 >= dialog.1 + 2, "fast window ticked {} times, dialog {}", fast.1, dialog.1);
         assert_eq!((fast.2, dialog.2), (SLOW_TICK_MS, SLOW_TICK_MS), "destroyed windows are forgotten");
     }
 
