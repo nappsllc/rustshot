@@ -291,10 +291,7 @@ impl App {
     /// (an animation runs, the caret blinked, a toast came or went, the
     /// state switched). Idle ticks cost no frame.
     fn tick(&mut self) -> bool {
-        let sig = |a: &App| {
-            let edit_notice = matches!(&a.st, State::Edit(e) if e.notice.is_some());
-            (std::mem::discriminant(&a.st), edit_notice, a.notice.is_some())
-        };
+        let sig = |a: &App| std::mem::discriminant(&a.st);
         let before = sig(self);
         self.pump();
         let changed = sig(self) != before;
@@ -372,6 +369,7 @@ impl App {
             composed,
             frame: PixBuf::default(),
             caret_drawn: None,
+            toast_drawn: None,
             area_drawn: None,
             objects: Vec::new(),
             hist: vec![Vec::new()],
@@ -999,8 +997,9 @@ impl Driver for App {
             Ev::Timer => return self.tick(),
         }
         self.pump();
-        // Moves call `invalidate` themselves, only when something changed.
-        !matches!(ev, Ev::Move { .. })
+        // Only `Ev::Timer` consults this value (returned from `tick`);
+        // moves call `invalidate` themselves, only when something changed.
+        true
     }
 
     fn frame(&mut self) -> Option<&PixBuf> {
@@ -1121,7 +1120,7 @@ impl Driver for App {
                 pop_k: edit.mo.pop.value(now),
             };
             chrome::toolbar(&mut f, &ui, &tbz, &st, kb);
-            let shown_ms = edit.hover_at.elapsed().as_secs_f32() * 1000.0 - 400.0;
+            let shown_ms = now.saturating_duration_since(edit.hover_at).as_secs_f32() * 1000.0 - 400.0;
             if !interacting
                 && shown_ms >= 0.0
                 && let Some(it) = edit.hover.and_then(|i| tb.items.get(i))
@@ -1137,6 +1136,7 @@ impl Driver for App {
             chrome::hint(&mut f, &ui, area, kh);
         }
         edit.caret_drawn = edit.text.as_ref().map(caret_on);
+        edit.toast_drawn = edit.notice.as_ref().or(self.notice.as_ref()).map(|t| t.at);
         wind::set_fast_timer(self.hwnd, animating(edit, self.notice.as_ref(), now));
         edit.frame = img;
         Some(&edit.frame)
@@ -1281,6 +1281,8 @@ struct Edit {
     frame: PixBuf,
     /// Caret blink phase in the last frame (None: no text draft).
     caret_drawn: Option<bool>,
+    /// `at` of the toast drawn in the last frame (None: no toast).
+    toast_drawn: Option<Instant>,
     /// Monitor area chrome was placed in by the last frame.
     area_drawn: Option<FRect>,
     objects: Vec<Obj>,
@@ -1654,15 +1656,19 @@ fn next_boundary(s: &str, i: usize) -> usize {
 /// Something on screen moves by itself: a tween, the pending tooltip,
 /// a toast fading in or out.
 fn animating(edit: &Edit, app_notice: Option<&Toast>, now: Instant) -> bool {
-    let tip_pending = edit.hover.is_some() && edit.hover_at.elapsed() < Duration::from_millis(500);
+    let tip_pending = edit.hover.is_some() && now.saturating_duration_since(edit.hover_at) < Duration::from_millis(500);
     let toast_moving = edit.notice.as_ref().or(app_notice).is_some_and(|t| t.animating(now));
     edit.mo.active(now) || tip_pending || toast_moving
 }
 
-/// The last frame no longer matches: something animates or the caret
-/// blink phase flipped since it was drawn.
+/// The last frame no longer matches: something animates, the caret
+/// blink phase flipped, or the toast that would be drawn now differs
+/// from the one drawn (set, cleared or replaced between frames).
 fn stale(edit: &Edit, app_notice: Option<&Toast>, now: Instant) -> bool {
-    animating(edit, app_notice, now) || edit.text.as_ref().map(caret_on) != edit.caret_drawn
+    let toast_now = edit.notice.as_ref().or(app_notice).map(|t| t.at);
+    animating(edit, app_notice, now)
+        || edit.text.as_ref().map(caret_on) != edit.caret_drawn
+        || toast_now != edit.toast_drawn
 }
 
 /// Caret blink phase: shown 530 ms, hidden 530 ms.
@@ -1745,6 +1751,7 @@ impl Dimmer {
 /// of `dst` is written and it can be reused frame to frame.
 fn compose_dimmed(dst: &mut PixBuf, src: &PixBuf, rects: &[(f32, f32, f32, f32)], c: C4) {
     debug_assert_eq!(dst.dimensions(), src.dimensions());
+    debug_assert!(rects.len() <= 4);
     let (bw, bh) = (src.width() as i32, src.height() as i32);
     let mut spans = [(0i32, 0i32, 0i32, 0i32); 4];
     let mut n = 0;
@@ -1941,6 +1948,7 @@ mod tests {
             base,
             frame: PixBuf::default(),
             caret_drawn: None,
+            toast_drawn: None,
             area_drawn: None,
             objects: Vec::new(),
             hist: vec![Vec::new()],
@@ -2244,13 +2252,39 @@ mod tests {
         let mut toast = Toast::new("x", ToastKind::Info);
         assert!(stale(e, Some(&toast), now), "toast fading in");
         toast.at = now - Duration::from_millis(500);
+        e.toast_drawn = Some(toast.at);
         assert!(!stale(e, Some(&toast), now), "toast steady");
+        e.toast_drawn = None;
         e.text = Some(TextDraft { pos: Pt::new(0.0, 0.0), text: String::new(), caret: 0, at: now });
         assert!(stale(e, None, now), "caret never drawn");
         e.caret_drawn = Some(true);
         assert!(!stale(e, None, now), "same blink phase");
         e.text.as_mut().unwrap().at = now - Duration::from_millis(600);
         assert!(stale(e, None, now), "blink phase flipped");
+    }
+
+    #[test]
+    fn toast_set_or_cleared_between_frames_is_stale() {
+        let now = Instant::now();
+        let mut app = preview_app(theme::DARK, Some(FRect { x: 10.0, y: 10.0, w: 200.0, h: 100.0 }));
+        let e = edit_of(&mut app);
+        for t in [&mut e.mo.dim, &mut e.mo.bar, &mut e.mo.pop, &mut e.mo.hint, &mut e.mo.hover] {
+            t.snap(t.target());
+        }
+        assert!(!stale(e, None, now), "settled");
+        let mut toast = Toast::new("Uploaded", ToastKind::Success);
+        toast.at = now - Duration::from_millis(500);
+        assert!(stale(e, Some(&toast), now), "set between frames, age > 120 ms");
+        e.toast_drawn = Some(toast.at);
+        assert!(!stale(e, Some(&toast), now), "drawn");
+        assert!(stale(e, None, now), "cleared between frames");
+        e.toast_drawn = None;
+        e.notice = Some(toast);
+        assert!(stale(e, None, now), "edit toast set between frames");
+        let mut newer = Toast::new("Failed", ToastKind::Error);
+        newer.at = now - Duration::from_millis(300);
+        e.toast_drawn = Some(newer.at);
+        assert!(stale(e, None, now), "replaced by another toast");
     }
 
     /// The former per-pixel float dim, kept as the reference.
