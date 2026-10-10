@@ -2,3 +2,4 @@ target/
 _flameshot/
 *.pdb
 dist/
+target-*/
