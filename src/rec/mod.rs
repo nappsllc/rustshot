@@ -14,6 +14,8 @@
 
 pub mod gif;
 pub mod mix;
+#[cfg(windows)]
+pub mod win;
 
 pub use mix::Mixer;
 
